@@ -71,6 +71,32 @@ pub fn run_idwt97_components(
     })
 }
 
+pub fn run_idwt97_float_components(
+    shader_path: &str,
+    components: &[&ComponentFloatSubbandPlanes],
+    target_resolution: u8,
+) -> Result<Idwt97ComponentsResult, VulkanError> {
+    let spirv = read_spirv(shader_path)?;
+    with_compute_device(|device, summary, queue_family_index| {
+        let mut planes = Vec::with_capacity(components.len());
+        for component in components {
+            planes.push(run_idwt97_float_component_on_device(
+                device,
+                queue_family_index,
+                &spirv,
+                component,
+                target_resolution,
+            )?);
+        }
+        device.wait_idle()?;
+        Ok(Idwt97ComponentsResult {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            planes,
+        })
+    })
+}
+
 fn run_idwt53_component_on_device(
     device: &VulkanDevice,
     queue_family_index: u32,
@@ -256,6 +282,139 @@ fn run_idwt97_component_on_device(
         let hl_buffer = create_f32_buffer_from_i32(device, &hl.coefficients)?;
         let lh_buffer = create_f32_buffer_from_i32(device, &lh.coefficients)?;
         let hh_buffer = create_f32_buffer_from_i32(device, &hh.coefficients)?;
+        let low_rows_buffer = create_f32_buffer(device, &low_rows)?;
+        let high_rows_buffer = create_f32_buffer(device, &high_rows)?;
+        let output_buffer = create_f32_buffer(device, &output_seed)?;
+
+        dispatch_idwt_lines(
+            device,
+            queue_family_index,
+            spirv,
+            &current_buffer,
+            &lh_buffer,
+            &low_rows_buffer,
+            Idwt53PushConstants {
+                low_count: current_height,
+                high_count: lh.height,
+                line_count: current_width,
+                low_line_stride: 1,
+                low_sample_stride: current_width,
+                high_line_stride: 1,
+                high_sample_stride: lh.width,
+                output_line_stride: 1,
+                output_sample_stride: current_width,
+            },
+        )?;
+        dispatch_idwt_lines(
+            device,
+            queue_family_index,
+            spirv,
+            &hl_buffer,
+            &hh_buffer,
+            &high_rows_buffer,
+            Idwt53PushConstants {
+                low_count: current_height,
+                high_count: hh.height,
+                line_count: hl.width,
+                low_line_stride: 1,
+                low_sample_stride: hl.width,
+                high_line_stride: 1,
+                high_sample_stride: hh.width,
+                output_line_stride: 1,
+                output_sample_stride: hl.width,
+            },
+        )?;
+        dispatch_idwt_lines(
+            device,
+            queue_family_index,
+            spirv,
+            &low_rows_buffer,
+            &high_rows_buffer,
+            &output_buffer,
+            Idwt53PushConstants {
+                low_count: current_width,
+                high_count: hl.width,
+                line_count: output_height,
+                low_line_stride: current_width,
+                low_sample_stride: 1,
+                high_line_stride: hl.width,
+                high_sample_stride: 1,
+                output_line_stride: output_width,
+                output_sample_stride: 1,
+            },
+        )?;
+
+        current_width = output_width;
+        current_height = output_height;
+        current_buffer = output_buffer;
+    }
+
+    Ok(crate::dwt::PlaneF32 {
+        width: current_width,
+        height: current_height,
+        samples: current_buffer.read_vec::<f32>(checked_plane_len(current_width, current_height)?)?,
+    })
+}
+
+fn run_idwt97_float_component_on_device(
+    device: &VulkanDevice,
+    queue_family_index: u32,
+    spirv: &[u32],
+    component: &ComponentFloatSubbandPlanes,
+    target_resolution: u8,
+) -> Result<crate::dwt::PlaneF32, VulkanError> {
+    let ll = component
+        .plane(0, SubbandKind::Ll)
+        .ok_or_else(|| VulkanError::new("GPU IDWT 9/7 missing resolution 0 float LL plane"))?;
+    let mut current_width = ll.width;
+    let mut current_height = ll.height;
+    let mut current_buffer = create_f32_buffer(device, &ll.samples)?;
+
+    if target_resolution == 0 {
+        return Ok(crate::dwt::PlaneF32 {
+            width: current_width,
+            height: current_height,
+            samples: current_buffer.read_vec::<f32>(ll.samples.len())?,
+        });
+    }
+
+    for resolution in 1..=target_resolution {
+        let hl = component.plane(resolution, SubbandKind::Hl).ok_or_else(|| {
+            VulkanError::new(format!(
+                "GPU IDWT 9/7 missing r{resolution} float HL plane"
+            ))
+        })?;
+        let lh = component.plane(resolution, SubbandKind::Lh).ok_or_else(|| {
+            VulkanError::new(format!(
+                "GPU IDWT 9/7 missing r{resolution} float LH plane"
+            ))
+        })?;
+        let hh = component.plane(resolution, SubbandKind::Hh).ok_or_else(|| {
+            VulkanError::new(format!(
+                "GPU IDWT 9/7 missing r{resolution} float HH plane"
+            ))
+        })?;
+        if lh.width != current_width || hl.height != current_height {
+            return Err(VulkanError::new(format!(
+                "GPU IDWT 9/7 r{resolution} float low/high dimensions do not match current {}x{}: HL {}x{}, LH {}x{}",
+                current_width, current_height, hl.width, hl.height, lh.width, lh.height
+            )));
+        }
+        if hh.width != hl.width || hh.height != lh.height {
+            return Err(VulkanError::new(format!(
+                "GPU IDWT 9/7 r{resolution} float HH dimensions {}x{} do not match HL/LH high extents {}x{}",
+                hh.width, hh.height, hl.width, lh.height
+            )));
+        }
+
+        let output_width = current_width + hl.width;
+        let output_height = current_height + lh.height;
+        let low_rows = vec![0.0f32; checked_plane_len(current_width, output_height)?];
+        let high_rows = vec![0.0f32; checked_plane_len(hl.width, output_height)?];
+        let output_seed = vec![0.0f32; checked_plane_len(output_width, output_height)?];
+        let hl_buffer = create_f32_buffer(device, &hl.samples)?;
+        let lh_buffer = create_f32_buffer(device, &lh.samples)?;
+        let hh_buffer = create_f32_buffer(device, &hh.samples)?;
         let low_rows_buffer = create_f32_buffer(device, &low_rows)?;
         let high_rows_buffer = create_f32_buffer(device, &high_rows)?;
         let output_buffer = create_f32_buffer(device, &output_seed)?;

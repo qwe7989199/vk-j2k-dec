@@ -878,14 +878,26 @@ pub fn run_irreversible_smoke(
             scaled_idwt97_smoke_component(2)?,
             scaled_idwt97_smoke_component(-1)?,
         ];
+        let float_components = components
+            .iter()
+            .enumerate()
+            .map(|(component_index, component)| {
+                ComponentFloatSubbandPlanes::from_component_with_scales(
+                    component,
+                    |resolution, subband| {
+                        irreversible_smoke_subband_scale(component_index, resolution, subband)
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
 
-        let mut cpu_planes = Vec::with_capacity(components.len());
-        let mut gpu_planes = Vec::with_capacity(components.len());
-        for component in &components {
+        let mut cpu_planes = Vec::with_capacity(float_components.len());
+        let mut gpu_planes = Vec::with_capacity(float_components.len());
+        for component in &float_components {
             cpu_planes.push(component.inverse_9_7().map_err(|err| {
                 VulkanError::new(format!("CPU irreversible smoke IDWT failed: {err}"))
             })?);
-            gpu_planes.push(run_idwt97_component_on_device(
+            gpu_planes.push(run_idwt97_float_component_on_device(
                 device,
                 queue_family_index,
                 &idwt97_spirv,
@@ -944,6 +956,22 @@ fn scaled_idwt97_smoke_component(scale: i32) -> Result<ComponentSubbandPlanes, V
         }
     }
     Ok(component)
+}
+
+fn irreversible_smoke_subband_scale(
+    component_index: usize,
+    resolution: u8,
+    subband: SubbandKind,
+) -> f32 {
+    let component_scale = [1.0, 0.5, 1.5][component_index];
+    let subband_scale = match (resolution, subband) {
+        (0, SubbandKind::Ll) => 1.0,
+        (_, SubbandKind::Hl) => 0.75,
+        (_, SubbandKind::Lh) => 1.25,
+        (_, SubbandKind::Hh) => 0.5,
+        _ => 1.0,
+    };
+    component_scale * subband_scale
 }
 
 fn compare_f32_slices(

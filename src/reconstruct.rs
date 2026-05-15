@@ -233,6 +233,133 @@ pub struct ResolutionSubbandPlane {
     pub plane: SubbandCoefficientPlane,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComponentFloatSubbandPlanes {
+    pub component: u16,
+    pub planes: Vec<ResolutionFloatSubbandPlane>,
+}
+
+impl ComponentFloatSubbandPlanes {
+    pub fn from_component_with_scales(
+        component: &ComponentSubbandPlanes,
+        mut scale_for: impl FnMut(u8, SubbandKind) -> f32,
+    ) -> Self {
+        let planes = component
+            .planes
+            .iter()
+            .map(|plane| {
+                let scale = scale_for(plane.resolution, plane.layout.kind);
+                ResolutionFloatSubbandPlane {
+                    resolution: plane.resolution,
+                    layout: plane.layout.clone(),
+                    plane: FloatSubbandPlane {
+                        kind: plane.layout.kind,
+                        width: plane.plane.width,
+                        height: plane.plane.height,
+                        samples: plane
+                            .plane
+                            .coefficients
+                            .iter()
+                            .map(|coefficient| *coefficient as f32 * scale)
+                            .collect(),
+                    },
+                }
+            })
+            .collect();
+
+        Self {
+            component: component.component,
+            planes,
+        }
+    }
+
+    pub fn plane(&self, resolution: u8, subband: SubbandKind) -> Option<&FloatSubbandPlane> {
+        self.planes
+            .iter()
+            .find(|plane| plane.resolution == resolution && plane.layout.kind == subband)
+            .map(|plane| &plane.plane)
+    }
+
+    pub fn inverse_9_7(&self) -> Result<PlaneF32, Tier1DecodeError> {
+        let max_resolution = self
+            .planes
+            .iter()
+            .map(|plane| plane.resolution)
+            .max()
+            .unwrap_or(0);
+        self.inverse_9_7_until(max_resolution)
+    }
+
+    pub fn inverse_9_7_until(&self, max_resolution: u8) -> Result<PlaneF32, Tier1DecodeError> {
+        let ll = self
+            .plane(0, SubbandKind::Ll)
+            .ok_or_else(|| Tier1DecodeError::new("missing resolution 0 LL plane"))?;
+        let mut current = PlaneF32 {
+            width: ll.width,
+            height: ll.height,
+            samples: ll.samples.clone(),
+        };
+        let available_max_resolution = self
+            .planes
+            .iter()
+            .map(|plane| plane.resolution)
+            .max()
+            .unwrap_or(0);
+        if max_resolution > available_max_resolution {
+            return Err(Tier1DecodeError::new(format!(
+                "requested resolution {max_resolution}, but component only has {available_max_resolution}"
+            )));
+        }
+
+        for resolution in 1..=max_resolution {
+            let hl = self.require_plane(resolution, SubbandKind::Hl)?;
+            let lh = self.require_plane(resolution, SubbandKind::Lh)?;
+            let hh = self.require_plane(resolution, SubbandKind::Hh)?;
+            current = inverse_9_7_level(
+                Band2DF32 {
+                    width: current.width,
+                    height: current.height,
+                    samples: &current.samples,
+                },
+                float_band(hl),
+                float_band(lh),
+                float_band(hh),
+            )
+            .map_err(|err| Tier1DecodeError::new(err.message))?;
+        }
+
+        Ok(current)
+    }
+
+    fn require_plane(
+        &self,
+        resolution: u8,
+        subband: SubbandKind,
+    ) -> Result<&FloatSubbandPlane, Tier1DecodeError> {
+        self.plane(resolution, subband).ok_or_else(|| {
+            Tier1DecodeError::new(format!(
+                "missing component {} resolution {} {} float plane",
+                self.component, resolution, subband
+            ))
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolutionFloatSubbandPlane {
+    pub resolution: u8,
+    pub layout: SubbandLayout,
+    pub plane: FloatSubbandPlane,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloatSubbandPlane {
+    pub kind: SubbandKind,
+    pub width: u32,
+    pub height: u32,
+    pub samples: Vec<f32>,
+}
+
 fn plane_to_i32(plane: &SubbandCoefficientPlane) -> PlaneI32 {
     PlaneI32 {
         width: plane.width,
@@ -262,6 +389,14 @@ fn band(plane: &SubbandCoefficientPlane) -> Band2D<'_> {
 }
 
 fn band_f32(plane: &PlaneF32) -> Band2DF32<'_> {
+    Band2DF32 {
+        width: plane.width,
+        height: plane.height,
+        samples: &plane.samples,
+    }
+}
+
+fn float_band(plane: &FloatSubbandPlane) -> Band2DF32<'_> {
     Band2DF32 {
         width: plane.width,
         height: plane.height,
@@ -547,6 +682,74 @@ mod tests {
             .expect_err("resolution must be unavailable");
 
         assert!(err.message.contains("requested resolution 2"));
+    }
+
+    #[test]
+    fn float_subband_component_applies_plane_scales_before_9_7() {
+        let mut component = one_level_component();
+
+        set_plane(&mut component, 0, SubbandKind::Ll, vec![4, -3, 12, 1, 5, 9]);
+        set_plane(&mut component, 1, SubbandKind::Hl, vec![7, -5, 2, 3]);
+        set_plane(
+            &mut component,
+            1,
+            SubbandKind::Lh,
+            vec![6, 8, -4, 0, 11, -7],
+        );
+        set_plane(&mut component, 1, SubbandKind::Hh, vec![1, -2, 4, -3]);
+
+        let float_component =
+            ComponentFloatSubbandPlanes::from_component_with_scales(&component, |_, subband| {
+                match subband {
+                    SubbandKind::Ll => 1.0,
+                    SubbandKind::Hl => 0.5,
+                    SubbandKind::Lh => 2.0,
+                    SubbandKind::Hh => -1.0,
+                }
+            });
+
+        assert_eq!(
+            float_component
+                .plane(1, SubbandKind::Hl)
+                .expect("HL")
+                .samples,
+            vec![3.5, -2.5, 1.0, 1.5]
+        );
+        assert_eq!(
+            float_component
+                .plane(1, SubbandKind::Hh)
+                .expect("HH")
+                .samples,
+            vec![-1.0, 2.0, -4.0, 3.0]
+        );
+
+        let reconstructed = float_component.inverse_9_7().expect("inverse");
+
+        assert_eq!(reconstructed.width, 5);
+        assert_eq!(reconstructed.height, 4);
+        assert_eq!(reconstructed.samples.len(), 20);
+    }
+
+    #[test]
+    fn unit_scaled_float_subband_component_matches_integer_9_7_path() {
+        let mut component = one_level_component();
+
+        set_plane(&mut component, 0, SubbandKind::Ll, vec![4, -3, 12, 1, 5, 9]);
+        set_plane(&mut component, 1, SubbandKind::Hl, vec![7, -5, 2, 3]);
+        set_plane(
+            &mut component,
+            1,
+            SubbandKind::Lh,
+            vec![6, 8, -4, 0, 11, -7],
+        );
+        set_plane(&mut component, 1, SubbandKind::Hh, vec![1, -2, 4, -3]);
+
+        let float_component =
+            ComponentFloatSubbandPlanes::from_component_with_scales(&component, |_, _| 1.0);
+        let expected = component.inverse_9_7().expect("integer inverse");
+        let reconstructed = float_component.inverse_9_7().expect("float inverse");
+
+        assert_f32_slices_close(&reconstructed.samples, &expected.samples);
     }
 
     fn one_level_component() -> ComponentSubbandPlanes {

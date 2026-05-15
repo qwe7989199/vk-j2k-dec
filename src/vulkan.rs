@@ -13,7 +13,7 @@ use crate::dwt::{
     Band2D, Band2DF32, PlaneF32, inverse_5_3_1d, inverse_5_3_level, inverse_9_7_1d,
     inverse_9_7_level,
 };
-use crate::reconstruct::ComponentSubbandPlanes;
+use crate::reconstruct::{ComponentFloatSubbandPlanes, ComponentSubbandPlanes};
 
 include!("vulkan/ffi.rs");
 include!("vulkan/api.rs");

@@ -64,6 +64,34 @@ impl GpuPipelinePlan {
                 .collect(),
         })
     }
+
+    pub fn qcd_step_for(
+        &self,
+        resolution: u8,
+        subband: crate::codestream::SubbandKind,
+    ) -> Result<&GpuQuantizationStep, GpuPlanError> {
+        let index = qcd_step_index(resolution, subband).ok_or_else(|| {
+            GpuPlanError::new(format!(
+                "resolution {resolution} subband {subband} has no QCD step index"
+            ))
+        })?;
+        self.qcd_steps.get(index).ok_or_else(|| {
+            GpuPlanError::new(format!(
+                "QCD has {} step(s), missing index {index} for R{resolution} {subband}",
+                self.qcd_steps.len()
+            ))
+        })
+    }
+}
+
+fn qcd_step_index(resolution: u8, subband: crate::codestream::SubbandKind) -> Option<usize> {
+    match (resolution, subband) {
+        (0, crate::codestream::SubbandKind::Ll) => Some(0),
+        (1.., crate::codestream::SubbandKind::Hl) => Some(1 + (usize::from(resolution) - 1) * 3),
+        (1.., crate::codestream::SubbandKind::Lh) => Some(2 + (usize::from(resolution) - 1) * 3),
+        (1.., crate::codestream::SubbandKind::Hh) => Some(3 + (usize::from(resolution) - 1) * 3),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,6 +390,7 @@ mod tests {
     use super::*;
     use crate::codestream::{
         CodSegment, ComponentSpec, ProgressionOrder, QcdSegment, QuantizationStyle, SizSegment,
+        SubbandKind,
     };
 
     #[test]
@@ -421,6 +450,11 @@ mod tests {
         assert_eq!(plan.level_shift, 2048.0);
         assert_eq!(plan.qcd_steps.len(), 16);
         assert_eq!(plan.qcd_steps[0].exponent, 5);
+        assert_eq!(plan.qcd_step_for(0, SubbandKind::Ll).unwrap().raw, 0x28);
+        assert_eq!(plan.qcd_step_for(1, SubbandKind::Hl).unwrap().raw, 0x28);
+        assert_eq!(plan.qcd_step_for(1, SubbandKind::Lh).unwrap().raw, 0x28);
+        assert_eq!(plan.qcd_step_for(1, SubbandKind::Hh).unwrap().raw, 0x28);
+        assert!(plan.qcd_step_for(0, SubbandKind::Hl).is_err());
         assert_eq!(dwt_plan.transform, WaveletTransform::Reversible53);
         assert_eq!(dwt_plan.tile_count, 1);
         assert_eq!(dwt_plan.component_count, 3);
@@ -483,6 +517,7 @@ mod tests {
         assert_eq!(plan.color_transform.shader_value(), 2);
         assert_eq!(plan.qcd_steps.len(), 1);
         assert_eq!(plan.qcd_steps[0].raw, 0x1234);
+        assert!(plan.qcd_step_for(1, SubbandKind::Hl).is_err());
     }
 
     fn reversible_rgb12_codestream() -> Codestream {

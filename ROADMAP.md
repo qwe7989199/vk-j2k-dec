@@ -55,7 +55,8 @@ The repository can start as one crate while the data model is still changing. Sp
 - Implement dequantization compute shaders. Initial storage-buffer smoke is working.
 - Implement color conversion compute shaders. No-transform, RCT, and ICT smoke paths are working.
 - Add float component-plane packing for irreversible paths. CPU and GPU helpers are covered by local tests/smoke.
-- Add a synthetic irreversible GPU pipeline check. Done for 9/7 component reconstruction plus ICT/RGB48 packing.
+- Add dequantized float subband staging for irreversible paths. Synthetic scaling is modeled; QCD/QCC-derived scale calculation is still pending.
+- Add a synthetic irreversible GPU pipeline check. Done for scaled float subbands, 9/7 component reconstruction, and ICT/RGB48 packing.
 - Keep readback simple and explicit.
 
 ### v0.4: Vulkan inverse DWT

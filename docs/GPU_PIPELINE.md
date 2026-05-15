@@ -115,15 +115,17 @@ shape against `idwt97_1d.comp.spv`, using float buffers and validating against
 the CPU `inverse_9_7_1d` and `inverse_9_7_level` references.
 
 The Vulkan backend now also exposes a component-level 9/7 reconstruction helper
-that mirrors the 5/3 backend shape and returns float component planes. CPU and
-GPU color packing both have float component-plane helpers for the no-transform
-and ICT cases. Real irreversible-frame decode still needs dequantized float
-subband planes and a validated sample before it should be treated as an
-end-to-end path.
+that mirrors the 5/3 backend shape and returns float component planes.
+`ComponentFloatSubbandPlanes` models dequantized float subbands before 9/7
+lifting. CPU and GPU color packing both have float component-plane helpers for
+the no-transform and ICT cases. Real irreversible-frame decode still needs a
+QCD/QCC-derived scale path and a validated sample before it should be treated as
+an end-to-end path.
 
 `vk-j2k-dec vk-irreversible-smoke` chains the synthetic irreversible pieces:
-three component-level 9/7 reconstructions feed GPU ICT/color packing, and the
-result is compared against CPU 9/7 plus CPU float RGB48 packing.
+synthetically scaled float subbands feed three component-level 9/7
+reconstructions, then GPU ICT/color packing, and the result is compared against
+CPU 9/7 plus CPU float RGB48 packing.
 
 `vk-j2k-dec dump <input.j2k>` also prints a DWT dispatch plan for supported
 5/3 and 9/7 codestreams. The current RGB12 5/3 sample produces 45 planned IDWT stages:
