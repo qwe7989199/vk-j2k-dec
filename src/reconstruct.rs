@@ -1,4 +1,7 @@
-use crate::codestream::{SubbandKind, SubbandLayout, TileComponentLayout};
+use crate::codestream::{
+    QcdSegment, QuantizationStep, QuantizationStyle, SubbandKind, SubbandLayout,
+    TileComponentLayout,
+};
 use crate::dwt::{Band2D, Band2DF32, PlaneF32, PlaneI32, inverse_5_3_level, inverse_9_7_level};
 use crate::tier1::{
     DecodedCodeblock, SubbandCoefficientPlane, Tier1BoundWorkPlan, Tier1DecodeError,
@@ -273,6 +276,39 @@ impl ComponentFloatSubbandPlanes {
         }
     }
 
+    pub fn from_component_with_qcd(
+        component: &ComponentSubbandPlanes,
+        qcd: &QcdSegment,
+        precision: u8,
+        decomposition_levels: u8,
+    ) -> Result<Self, Tier1DecodeError> {
+        let scale_map = QcdScaleMap::new(qcd, precision, decomposition_levels)?;
+        let mut planes = Vec::with_capacity(component.planes.len());
+        for plane in &component.planes {
+            let scale = scale_map.scale_for(plane.resolution, plane.layout.kind)?;
+            planes.push(ResolutionFloatSubbandPlane {
+                resolution: plane.resolution,
+                layout: plane.layout.clone(),
+                plane: FloatSubbandPlane {
+                    kind: plane.layout.kind,
+                    width: plane.plane.width,
+                    height: plane.plane.height,
+                    samples: plane
+                        .plane
+                        .coefficients
+                        .iter()
+                        .map(|coefficient| *coefficient as f32 * scale)
+                        .collect(),
+                },
+            });
+        }
+
+        Ok(Self {
+            component: component.component,
+            planes,
+        })
+    }
+
     pub fn plane(&self, resolution: u8, subband: SubbandKind) -> Option<&FloatSubbandPlane> {
         self.planes
             .iter()
@@ -358,6 +394,133 @@ pub struct FloatSubbandPlane {
     pub width: u32,
     pub height: u32,
     pub samples: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QcdScaleMap {
+    style: QuantizationStyle,
+    steps: Vec<QuantizationStep>,
+    precision: u8,
+    decomposition_levels: u8,
+}
+
+impl QcdScaleMap {
+    fn new(
+        qcd: &QcdSegment,
+        precision: u8,
+        decomposition_levels: u8,
+    ) -> Result<Self, Tier1DecodeError> {
+        if precision == 0 || precision > 31 {
+            return Err(Tier1DecodeError::new(format!(
+                "cannot build QCD dequantization scales for precision {precision}"
+            )));
+        }
+        Ok(Self {
+            style: qcd.style,
+            steps: qcd
+                .steps()
+                .map_err(|err| Tier1DecodeError::new(format!("QCD step parse failed: {err}")))?,
+            precision,
+            decomposition_levels,
+        })
+    }
+
+    fn scale_for(&self, resolution: u8, subband: SubbandKind) -> Result<f32, Tier1DecodeError> {
+        match self.style {
+            QuantizationStyle::NoQuantization => Ok(1.0),
+            QuantizationStyle::ScalarExpounded => {
+                let step = self.expounded_step(resolution, subband)?;
+                Ok(quantization_step_scale(step, self.precision, subband))
+            }
+            QuantizationStyle::ScalarDerived => {
+                let step = self.derived_step(resolution, subband)?;
+                Ok(quantization_step_scale(step, self.precision, subband))
+            }
+            QuantizationStyle::Unknown(value) => Err(Tier1DecodeError::new(format!(
+                "unsupported QCD quantization style {value}"
+            ))),
+        }
+    }
+
+    fn expounded_step(
+        &self,
+        resolution: u8,
+        subband: SubbandKind,
+    ) -> Result<QuantizationStep, Tier1DecodeError> {
+        let index = qcd_step_index(resolution, subband).ok_or_else(|| {
+            Tier1DecodeError::new(format!(
+                "resolution {resolution} subband {subband} has no QCD step index"
+            ))
+        })?;
+        self.steps.get(index).copied().ok_or_else(|| {
+            Tier1DecodeError::new(format!(
+                "QCD has {} step(s), missing index {index} for R{resolution} {subband} with {} decomposition level(s)",
+                self.steps.len(),
+                self.decomposition_levels
+            ))
+        })
+    }
+
+    fn derived_step(
+        &self,
+        resolution: u8,
+        subband: SubbandKind,
+    ) -> Result<QuantizationStep, Tier1DecodeError> {
+        let base = self.steps.first().copied().ok_or_else(|| {
+            Tier1DecodeError::new("scalar derived QCD has no LL quantization step")
+        })?;
+        let subband_decomposition_levels = match (resolution, subband) {
+            (0, SubbandKind::Ll) => self.decomposition_levels,
+            (1.., SubbandKind::Hl | SubbandKind::Lh | SubbandKind::Hh)
+                if resolution <= self.decomposition_levels =>
+            {
+                self.decomposition_levels - resolution + 1
+            }
+            _ => {
+                return Err(Tier1DecodeError::new(format!(
+                    "resolution {resolution} subband {subband} cannot derive a QCD step for {} decomposition level(s)",
+                    self.decomposition_levels
+                )));
+            }
+        };
+        let exponent = i32::from(base.exponent) + i32::from(subband_decomposition_levels)
+            - i32::from(self.decomposition_levels);
+        if !(0..=31).contains(&exponent) {
+            return Err(Tier1DecodeError::new(format!(
+                "derived QCD exponent {exponent} is outside the 5-bit range for R{resolution} {subband}"
+            )));
+        }
+
+        Ok(QuantizationStep {
+            exponent: exponent as u8,
+            mantissa: base.mantissa,
+            raw: 0,
+        })
+    }
+}
+
+fn qcd_step_index(resolution: u8, subband: SubbandKind) -> Option<usize> {
+    match (resolution, subband) {
+        (0, SubbandKind::Ll) => Some(0),
+        (1.., SubbandKind::Hl) => Some(1 + (usize::from(resolution) - 1) * 3),
+        (1.., SubbandKind::Lh) => Some(2 + (usize::from(resolution) - 1) * 3),
+        (1.., SubbandKind::Hh) => Some(3 + (usize::from(resolution) - 1) * 3),
+        _ => None,
+    }
+}
+
+fn quantization_step_scale(step: QuantizationStep, precision: u8, subband: SubbandKind) -> f32 {
+    let nominal_range_bits = i32::from(precision) + subband_gain_bits(subband);
+    2.0f32.powi(nominal_range_bits - i32::from(step.exponent))
+        * (1.0 + f32::from(step.mantissa) / 2048.0)
+}
+
+fn subband_gain_bits(subband: SubbandKind) -> i32 {
+    match subband {
+        SubbandKind::Ll => 0,
+        SubbandKind::Hl | SubbandKind::Lh => 1,
+        SubbandKind::Hh => 2,
+    }
 }
 
 fn plane_to_i32(plane: &SubbandCoefficientPlane) -> PlaneI32 {
@@ -752,6 +915,113 @@ mod tests {
         assert_f32_slices_close(&reconstructed.samples, &expected.samples);
     }
 
+    #[test]
+    fn qcd_scaled_float_subband_component_applies_expounded_steps() {
+        let mut component = one_level_component();
+
+        set_plane(&mut component, 0, SubbandKind::Ll, vec![4, -3, 12, 1, 5, 9]);
+        set_plane(&mut component, 1, SubbandKind::Hl, vec![7, -5, 2, 3]);
+        set_plane(
+            &mut component,
+            1,
+            SubbandKind::Lh,
+            vec![6, 8, -4, 0, 11, -7],
+        );
+        set_plane(&mut component, 1, SubbandKind::Hh, vec![1, -2, 4, -3]);
+        let qcd = qcd_expounded(&[
+            step_raw(12, 0),
+            step_raw(13, 1024),
+            step_raw(14, 0),
+            step_raw(14, 0),
+        ]);
+
+        let float_component =
+            ComponentFloatSubbandPlanes::from_component_with_qcd(&component, &qcd, 12, 1)
+                .expect("QCD scales");
+
+        assert_eq!(
+            float_component
+                .plane(0, SubbandKind::Ll)
+                .expect("LL")
+                .samples,
+            vec![4.0, -3.0, 12.0, 1.0, 5.0, 9.0]
+        );
+        assert_eq!(
+            float_component
+                .plane(1, SubbandKind::Hl)
+                .expect("HL")
+                .samples,
+            vec![10.5, -7.5, 3.0, 4.5]
+        );
+        assert_eq!(
+            float_component
+                .plane(1, SubbandKind::Lh)
+                .expect("LH")
+                .samples,
+            vec![3.0, 4.0, -2.0, 0.0, 5.5, -3.5]
+        );
+        assert_eq!(
+            float_component
+                .plane(1, SubbandKind::Hh)
+                .expect("HH")
+                .samples,
+            vec![1.0, -2.0, 4.0, -3.0]
+        );
+    }
+
+    #[test]
+    fn qcd_scaled_float_subband_component_rejects_missing_expounded_step() {
+        let component = one_level_component();
+        let qcd = qcd_expounded(&[step_raw(12, 0)]);
+
+        let err = ComponentFloatSubbandPlanes::from_component_with_qcd(&component, &qcd, 12, 1)
+            .expect_err("missing steps must fail");
+
+        assert!(err.message.contains("missing index 1"));
+    }
+
+    #[test]
+    fn qcd_scaled_float_subband_component_derives_steps_from_ll() {
+        let mut component = one_level_component();
+
+        set_plane(&mut component, 0, SubbandKind::Ll, vec![4, -3, 12, 1, 5, 9]);
+        set_plane(&mut component, 1, SubbandKind::Hl, vec![7, -5, 2, 3]);
+        set_plane(
+            &mut component,
+            1,
+            SubbandKind::Lh,
+            vec![6, 8, -4, 0, 11, -7],
+        );
+        set_plane(&mut component, 1, SubbandKind::Hh, vec![1, -2, 4, -3]);
+        let qcd = qcd_derived(step_raw(12, 1024));
+
+        let float_component =
+            ComponentFloatSubbandPlanes::from_component_with_qcd(&component, &qcd, 12, 1)
+                .expect("QCD scales");
+
+        assert_eq!(
+            float_component
+                .plane(0, SubbandKind::Ll)
+                .expect("LL")
+                .samples,
+            vec![6.0, -4.5, 18.0, 1.5, 7.5, 13.5]
+        );
+        assert_eq!(
+            float_component
+                .plane(1, SubbandKind::Hl)
+                .expect("HL")
+                .samples,
+            vec![21.0, -15.0, 6.0, 9.0]
+        );
+        assert_eq!(
+            float_component
+                .plane(1, SubbandKind::Hh)
+                .expect("HH")
+                .samples,
+            vec![6.0, -12.0, 24.0, -18.0]
+        );
+    }
+
     fn one_level_component() -> ComponentSubbandPlanes {
         let component_layout = TileComponentLayout {
             width: 5,
@@ -827,6 +1097,29 @@ mod tests {
             .expect("plane")
             .plane
             .coefficients = coefficients;
+    }
+
+    fn qcd_expounded(steps: &[u16]) -> QcdSegment {
+        QcdSegment {
+            guard_bits: 2,
+            style: QuantizationStyle::ScalarExpounded,
+            raw_steps: steps
+                .iter()
+                .flat_map(|step| step.to_be_bytes())
+                .collect::<Vec<_>>(),
+        }
+    }
+
+    fn qcd_derived(step: u16) -> QcdSegment {
+        QcdSegment {
+            guard_bits: 2,
+            style: QuantizationStyle::ScalarDerived,
+            raw_steps: step.to_be_bytes().to_vec(),
+        }
+    }
+
+    fn step_raw(exponent: u8, mantissa: u16) -> u16 {
+        (u16::from(exponent) << 11) | (mantissa & 0x07ff)
     }
 
     fn assert_f32_slices_close(actual: &[f32], expected: &[f32]) {

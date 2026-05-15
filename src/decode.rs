@@ -1,13 +1,18 @@
-use crate::codestream::{Codestream, WaveletTransform};
+use crate::codestream::{Codestream, QcdSegment, WaveletTransform};
 use crate::color::{
     ColorError, inverse_ict_sample, inverse_rct_sample, level_shift_and_clamp,
     level_shift_and_clamp_float,
 };
 use crate::dwt::{PlaneF32, PlaneI32};
 use crate::packet::parse_lrcp_tile_packets;
-use crate::reconstruct::{ComponentSubbandPlanes, TileCoefficientPlanes};
+use crate::reconstruct::{
+    ComponentFloatSubbandPlanes, ComponentSubbandPlanes, TileCoefficientPlanes,
+};
 use crate::tier1::Tier1WorkPlan;
-use crate::vulkan::{run_color_components, run_idwt53_components};
+use crate::vulkan::{
+    run_color_components, run_color_float_components, run_idwt53_components,
+    run_idwt97_float_components,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedRgb48 {
@@ -132,9 +137,12 @@ fn decode_rgb48_with_backends(
             "rgb48 output does not support signed components yet",
         ));
     }
-    if cod.transform != WaveletTransform::Reversible53 {
+    if !matches!(
+        cod.transform,
+        WaveletTransform::Reversible53 | WaveletTransform::Irreversible97
+    ) {
         return Err(DecodeError::new(format!(
-            "rgb48 output only supports reversible 5/3 for now, got {}",
+            "rgb48 output only supports reversible 5/3 and irreversible 9/7 for now, got {}",
             cod.transform
         )));
     }
@@ -179,7 +187,6 @@ fn decode_rgb48_with_backends(
     )
     .map_err(|err| DecodeError::new(err.to_string()))?;
 
-    let target_resolution = cod.decomposition_levels - discard_levels;
     let components = (0..3)
         .map(|component| {
             coefficient_planes
@@ -187,18 +194,6 @@ fn decode_rgb48_with_backends(
                 .ok_or_else(|| DecodeError::new(format!("missing component {component}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let component_planes = reconstruct_components(&components, target_resolution, dwt_backend)?;
-    for (component, plane) in component_planes.iter().enumerate() {
-        let expected_width = discard_extent(siz.width, discard_levels);
-        let expected_height = discard_extent(siz.height, discard_levels);
-        if plane.width != expected_width || plane.height != expected_height {
-            return Err(DecodeError::new(format!(
-                "component {component} reconstructed as {}x{}, expected {}x{}",
-                plane.width, plane.height, expected_width, expected_height
-            )));
-        }
-    }
-
     let precision = siz.components[0].precision;
     if siz
         .components
@@ -210,15 +205,56 @@ fn decode_rgb48_with_backends(
         ));
     }
 
-    let width = component_planes[0].width;
-    let height = component_planes[0].height;
-    let samples = pack_rgb48_samples(
-        &component_planes,
-        precision,
-        cod.multiple_component_transform,
-        cod.transform,
-        color_backend,
-    )?;
+    let target_resolution = cod.decomposition_levels - discard_levels;
+    let expected_width = discard_extent(siz.width, discard_levels);
+    let expected_height = discard_extent(siz.height, discard_levels);
+    let (width, height, samples) = match cod.transform {
+        WaveletTransform::Reversible53 => {
+            let component_planes =
+                reconstruct_components(&components, target_resolution, dwt_backend)?;
+            validate_component_planes_i32(&component_planes, expected_width, expected_height)?;
+            let samples = pack_rgb48_samples(
+                &component_planes,
+                precision,
+                cod.multiple_component_transform,
+                cod.transform,
+                color_backend,
+            )?;
+            (
+                component_planes[0].width,
+                component_planes[0].height,
+                samples,
+            )
+        }
+        WaveletTransform::Irreversible97 => {
+            let qcd = codestream
+                .qcd
+                .as_ref()
+                .ok_or_else(|| DecodeError::new("irreversible 9/7 output requires QCD marker"))?;
+            let component_planes = reconstruct_float_components(
+                &components,
+                target_resolution,
+                dwt_backend,
+                qcd,
+                precision,
+                cod.decomposition_levels,
+            )?;
+            validate_component_planes_f32(&component_planes, expected_width, expected_height)?;
+            let samples = pack_rgb48_float_samples(
+                &component_planes,
+                precision,
+                cod.multiple_component_transform,
+                cod.transform,
+                color_backend,
+            )?;
+            (
+                component_planes[0].width,
+                component_planes[0].height,
+                samples,
+            )
+        }
+        WaveletTransform::Unknown(_) => unreachable!("unsupported transform checked above"),
+    };
 
     Ok(DecodedRgb48 {
         width,
@@ -250,6 +286,44 @@ fn reconstruct_components(
     }
 }
 
+fn reconstruct_float_components(
+    components: &[&ComponentSubbandPlanes],
+    target_resolution: u8,
+    dwt_backend: DwtBackend<'_>,
+    qcd: &QcdSegment,
+    precision: u8,
+    decomposition_levels: u8,
+) -> Result<Vec<PlaneF32>, DecodeError> {
+    let float_components = components
+        .iter()
+        .map(|component| {
+            ComponentFloatSubbandPlanes::from_component_with_qcd(
+                component,
+                qcd,
+                precision,
+                decomposition_levels,
+            )
+            .map_err(|err| DecodeError::new(err.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    match dwt_backend {
+        DwtBackend::Cpu => float_components
+            .iter()
+            .map(|component| {
+                component
+                    .inverse_9_7_until(target_resolution)
+                    .map_err(|err| DecodeError::new(err.to_string()))
+            })
+            .collect(),
+        DwtBackend::Gpu { idwt53_shader_path } => {
+            let component_refs = float_components.iter().collect::<Vec<_>>();
+            run_idwt97_float_components(idwt53_shader_path, &component_refs, target_resolution)
+                .map(|result| result.planes)
+                .map_err(|err| DecodeError::new(format!("GPU inverse 9/7 failed: {err}")))
+        }
+    }
+}
+
 fn pack_rgb48_samples(
     component_planes: &[PlaneI32],
     precision: u8,
@@ -272,6 +346,35 @@ fn pack_rgb48_samples(
             )
             .map(|result| result.samples)
             .map_err(|err| DecodeError::new(format!("GPU color conversion failed: {err}")))
+        }
+    }
+}
+
+fn pack_rgb48_float_samples(
+    component_planes: &[PlaneF32],
+    precision: u8,
+    multiple_component_transform: u8,
+    transform: WaveletTransform,
+    color_backend: ColorBackend<'_>,
+) -> Result<Vec<u16>, DecodeError> {
+    match color_backend {
+        ColorBackend::Cpu => pack_rgb48_float_samples_cpu(
+            component_planes,
+            precision,
+            multiple_component_transform,
+            transform,
+        ),
+        ColorBackend::Gpu { color_shader_path } => {
+            let color_transform =
+                gpu_color_transform_value(multiple_component_transform, transform)?;
+            run_color_float_components(
+                color_shader_path,
+                component_planes,
+                color_transform,
+                precision,
+            )
+            .map(|result| result.samples)
+            .map_err(|err| DecodeError::new(format!("GPU float color conversion failed: {err}")))
         }
     }
 }
@@ -387,6 +490,38 @@ fn validate_float_component_planes(component_planes: &[PlaneF32]) -> Result<(), 
                 plane.samples.len(),
                 width,
                 height
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_component_planes_i32(
+    component_planes: &[PlaneI32],
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<(), DecodeError> {
+    for (component, plane) in component_planes.iter().enumerate() {
+        if plane.width != expected_width || plane.height != expected_height {
+            return Err(DecodeError::new(format!(
+                "component {component} reconstructed as {}x{}, expected {}x{}",
+                plane.width, plane.height, expected_width, expected_height
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_component_planes_f32(
+    component_planes: &[PlaneF32],
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<(), DecodeError> {
+    for (component, plane) in component_planes.iter().enumerate() {
+        if plane.width != expected_width || plane.height != expected_height {
+            return Err(DecodeError::new(format!(
+                "float component {component} reconstructed as {}x{}, expected {}x{}",
+                plane.width, plane.height, expected_width, expected_height
             )));
         }
     }

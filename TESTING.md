@@ -176,6 +176,13 @@ diff-rgb48: samples 6120, differing 1298, max_abs 16 at sample 34, mean_abs 3.39
 
 This is a live correctness baseline, not a pass condition yet.
 
+Irreversible 9/7 codestreams now have a high-level CPU decode route for QCD
+scalar-expounded and scalar-derived quantization: steps are converted to float
+subband scales, then fed through CPU 9/7 reconstruction and float RGB48 packing.
+This is covered by unit tests but still needs a real irreversible sample and an
+OpenJPEG/FFmpeg diff before it becomes a local corpus baseline. QCC component
+overrides remain pending.
+
 The real-frame GPU DWT path is exposed through:
 
 ```text

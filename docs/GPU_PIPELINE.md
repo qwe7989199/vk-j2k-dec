@@ -15,7 +15,9 @@ The shader contracts are intentionally simple while the Rust Vulkan host grows
 toward a reusable pipeline. The CPU side should precompute values that are
 awkward or profile-specific:
 
-- per-subband dequant scale from QCD/QCC;
+- per-subband dequant scale from QCD/QCC; QCD scalar-expounded and
+  scalar-derived scales are now available on the CPU staging path, while QCC
+  still needs wiring;
 - level-shift value from component precision;
 - output clamp range;
 - per-sample subband-to-step lookup, or a cheaper per-dispatch variant later.
@@ -118,9 +120,11 @@ The Vulkan backend now also exposes a component-level 9/7 reconstruction helper
 that mirrors the 5/3 backend shape and returns float component planes.
 `ComponentFloatSubbandPlanes` models dequantized float subbands before 9/7
 lifting. CPU and GPU color packing both have float component-plane helpers for
-the no-transform and ICT cases. Real irreversible-frame decode still needs a
-QCD/QCC-derived scale path and a validated sample before it should be treated as
-an end-to-end path.
+the no-transform and ICT cases. The high-level CPU decode path can now route
+irreversible 9/7 codestreams through QCD scalar-expounded or scalar-derived
+dequantization, CPU 9/7 reconstruction, and float RGB48 packing. Real
+irreversible-frame validation still needs a representative sample and QCC
+overrides.
 
 `vk-j2k-dec vk-irreversible-smoke` chains the synthetic irreversible pieces:
 synthetically scaled float subbands feed three component-level 9/7

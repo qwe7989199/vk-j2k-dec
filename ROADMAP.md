@@ -55,7 +55,7 @@ The repository can start as one crate while the data model is still changing. Sp
 - Implement dequantization compute shaders. Initial storage-buffer smoke is working.
 - Implement color conversion compute shaders. No-transform, RCT, and ICT smoke paths are working.
 - Add float component-plane packing for irreversible paths. CPU and GPU helpers are covered by local tests/smoke.
-- Add dequantized float subband staging for irreversible paths. Synthetic scaling is modeled; QCD/QCC-derived scale calculation is still pending.
+- Add dequantized float subband staging for irreversible paths. Synthetic scaling plus QCD scalar-expounded and scalar-derived scales are modeled; QCC overrides are still pending.
 - Add a synthetic irreversible GPU pipeline check. Done for scaled float subbands, 9/7 component reconstruction, and ICT/RGB48 packing.
 - Keep readback simple and explicit.
 
@@ -104,6 +104,7 @@ DCP-o-matic is a promising downstream target because JPEG 2000 decode performanc
 - Continue CPU Tier-1: implement significance propagation, cleanup, magnitude refinement, and sign contexts on top of the MQ decoder.
 - Build coefficient planes from decoded codeblocks and feed the CPU/GPU reconstruction path.
 - Add irreversible 9/7 CPU reference and Vulkan smoke shader. Done.
+- Wire irreversible 9/7 into the high-level CPU decode path. Done for QCD scalar-expounded and scalar-derived codestreams; QCC overrides and corpus validation still need implementation.
 - Turn the Vulkan smoke helpers into a reusable reconstruction backend with persistent pipelines and buffers. Component-level 5/3 and 9/7 helpers exist; persistent pipeline reuse is still pending.
 - Add a frame-level compare path against FFmpeg/OpenJPEG output once Tier-1 is producing coefficients.
 - Build a `dump` CLI for codestream headers. Done.
