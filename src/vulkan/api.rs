@@ -209,6 +209,7 @@ pub struct ColorSmokeResult {
     pub none_output: Vec<u32>,
     pub rct_output: Vec<u32>,
     pub ict_output: Vec<u32>,
+    pub float_component_output: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +219,24 @@ pub struct Idwt53SmokeResult {
     pub row_output: Vec<i32>,
     pub column_output: Vec<i32>,
     pub level_output: Vec<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Idwt97SmokeResult {
+    pub device_name: String,
+    pub queue_family_index: u32,
+    pub row_output: Vec<f32>,
+    pub column_output: Vec<f32>,
+    pub level_output: Vec<f32>,
+    pub component_output: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrreversibleSmokeResult {
+    pub device_name: String,
+    pub queue_family_index: u32,
+    pub cpu_samples: Vec<u16>,
+    pub gpu_samples: Vec<u16>,
 }
 
 pub fn run_idwt53_smoke(shader_path: &str) -> Result<Idwt53SmokeResult, VulkanError> {
@@ -463,6 +482,493 @@ pub fn run_idwt53_smoke(shader_path: &str) -> Result<Idwt53SmokeResult, VulkanEr
     })
 }
 
+pub fn run_idwt97_smoke(shader_path: &str) -> Result<Idwt97SmokeResult, VulkanError> {
+    let spirv = read_spirv(shader_path)?;
+    with_compute_device(|device, summary, queue_family_index| {
+        let low_count = 3usize;
+        let high_count = 2usize;
+        let output_stride = low_count + high_count;
+        let line_count = 2usize;
+        let low = vec![4.25f32, -3.5, 12.75, 1.0, 5.5, 9.25];
+        let high = vec![7.5f32, -5.25, 2.125, 3.75];
+        let expected_line0 = inverse_9_7_1d(&low[..low_count], &high[..high_count])
+            .map_err(|err| VulkanError::new(format!("CPU inverse 9/7 failed: {err}")))?;
+        let expected_line1 = inverse_9_7_1d(&low[low_count..], &high[high_count..])
+            .map_err(|err| VulkanError::new(format!("CPU inverse 9/7 failed: {err}")))?;
+        let expected = expected_line0
+            .into_iter()
+            .chain(expected_line1)
+            .collect::<Vec<_>>();
+        let output_seed = vec![0.0f32; expected.len()];
+        let push = Idwt53PushConstants {
+            low_count: low_count as u32,
+            high_count: high_count as u32,
+            line_count: line_count as u32,
+            low_line_stride: low_count as u32,
+            low_sample_stride: 1,
+            high_line_stride: high_count as u32,
+            high_sample_stride: 1,
+            output_line_stride: output_stride as u32,
+            output_sample_stride: 1,
+        };
+
+        let low_buffer = device.create_host_buffer(bytes_len::<f32>(low.len())?)?;
+        let high_buffer = device.create_host_buffer(bytes_len::<f32>(high.len())?)?;
+        let output_buffer = device.create_host_buffer(bytes_len::<f32>(output_seed.len())?)?;
+        low_buffer.write_slice(&low)?;
+        high_buffer.write_slice(&high)?;
+        output_buffer.write_slice(&output_seed)?;
+        dispatch_storage_shader(
+            device,
+            queue_family_index,
+            &spirv,
+            &[
+                low_buffer.descriptor_info(),
+                high_buffer.descriptor_info(),
+                output_buffer.descriptor_info(),
+            ],
+            bytes_of(&push),
+            (output_stride as u32).div_ceil(16),
+            (line_count as u32).div_ceil(16),
+        )?;
+
+        let row_output = output_buffer.read_vec::<f32>(output_seed.len())?;
+        compare_f32_slices("idwt97 row smoke", &row_output, &expected, 0.0001)?;
+
+        let vertical_width = 2usize;
+        let low_vertical = vec![4.25f32, 1.0, -3.5, 5.5, 12.75, 9.25];
+        let high_vertical = vec![7.5f32, 2.125, -5.25, 3.75];
+        let column_expected0 = inverse_9_7_1d(&[4.25, -3.5, 12.75], &[7.5, -5.25])
+            .map_err(|err| VulkanError::new(format!("CPU inverse 9/7 column failed: {err}")))?;
+        let column_expected1 = inverse_9_7_1d(&[1.0, 5.5, 9.25], &[2.125, 3.75])
+            .map_err(|err| VulkanError::new(format!("CPU inverse 9/7 column failed: {err}")))?;
+        let mut column_expected = vec![0.0f32; output_stride * vertical_width];
+        for (y, value) in column_expected0.into_iter().enumerate() {
+            column_expected[y * vertical_width] = value;
+        }
+        for (y, value) in column_expected1.into_iter().enumerate() {
+            column_expected[y * vertical_width + 1] = value;
+        }
+        let column_seed = vec![0.0f32; column_expected.len()];
+        let column_push = Idwt53PushConstants {
+            low_count: low_count as u32,
+            high_count: high_count as u32,
+            line_count: vertical_width as u32,
+            low_line_stride: 1,
+            low_sample_stride: vertical_width as u32,
+            high_line_stride: 1,
+            high_sample_stride: vertical_width as u32,
+            output_line_stride: 1,
+            output_sample_stride: vertical_width as u32,
+        };
+        let low_vertical_buffer =
+            device.create_host_buffer(bytes_len::<f32>(low_vertical.len())?)?;
+        let high_vertical_buffer =
+            device.create_host_buffer(bytes_len::<f32>(high_vertical.len())?)?;
+        let column_output_buffer =
+            device.create_host_buffer(bytes_len::<f32>(column_seed.len())?)?;
+        low_vertical_buffer.write_slice(&low_vertical)?;
+        high_vertical_buffer.write_slice(&high_vertical)?;
+        column_output_buffer.write_slice(&column_seed)?;
+        dispatch_storage_shader(
+            device,
+            queue_family_index,
+            &spirv,
+            &[
+                low_vertical_buffer.descriptor_info(),
+                high_vertical_buffer.descriptor_info(),
+                column_output_buffer.descriptor_info(),
+            ],
+            bytes_of(&column_push),
+            (output_stride as u32).div_ceil(16),
+            (vertical_width as u32).div_ceil(16),
+        )?;
+
+        let column_output = column_output_buffer.read_vec::<f32>(column_seed.len())?;
+        compare_f32_slices(
+            "idwt97 column smoke",
+            &column_output,
+            &column_expected,
+            0.0001,
+        )?;
+
+        let ll = vec![4.25f32, -3.5, 12.75, 1.0, 5.5, 9.25];
+        let hl = vec![7.5f32, -5.25, 2.125, 3.75];
+        let lh = vec![6.5f32, 8.25, -4.75, 0.5, 11.0, -7.125];
+        let hh = vec![1.25f32, -2.5, 4.5, -3.25];
+        let expected_level = inverse_9_7_level(
+            Band2DF32 {
+                width: 3,
+                height: 2,
+                samples: &ll,
+            },
+            Band2DF32 {
+                width: 2,
+                height: 2,
+                samples: &hl,
+            },
+            Band2DF32 {
+                width: 3,
+                height: 2,
+                samples: &lh,
+            },
+            Band2DF32 {
+                width: 2,
+                height: 2,
+                samples: &hh,
+            },
+        )
+        .map_err(|err| VulkanError::new(format!("CPU inverse 9/7 level failed: {err}")))?;
+
+        let low_rows_seed = vec![0.0f32; 3 * 4];
+        let high_rows_seed = vec![0.0f32; 2 * 4];
+        let level_seed = vec![0.0f32; expected_level.samples.len()];
+        let ll_buffer = device.create_host_buffer(bytes_len::<f32>(ll.len())?)?;
+        let hl_buffer = device.create_host_buffer(bytes_len::<f32>(hl.len())?)?;
+        let lh_buffer = device.create_host_buffer(bytes_len::<f32>(lh.len())?)?;
+        let hh_buffer = device.create_host_buffer(bytes_len::<f32>(hh.len())?)?;
+        let low_rows_buffer = device.create_host_buffer(bytes_len::<f32>(low_rows_seed.len())?)?;
+        let high_rows_buffer = device.create_host_buffer(bytes_len::<f32>(high_rows_seed.len())?)?;
+        let level_output_buffer = device.create_host_buffer(bytes_len::<f32>(level_seed.len())?)?;
+        ll_buffer.write_slice(&ll)?;
+        hl_buffer.write_slice(&hl)?;
+        lh_buffer.write_slice(&lh)?;
+        hh_buffer.write_slice(&hh)?;
+        low_rows_buffer.write_slice(&low_rows_seed)?;
+        high_rows_buffer.write_slice(&high_rows_seed)?;
+        level_output_buffer.write_slice(&level_seed)?;
+
+        let vertical_low_push = Idwt53PushConstants {
+            low_count: 2,
+            high_count: 2,
+            line_count: 3,
+            low_line_stride: 1,
+            low_sample_stride: 3,
+            high_line_stride: 1,
+            high_sample_stride: 3,
+            output_line_stride: 1,
+            output_sample_stride: 3,
+        };
+        dispatch_storage_shader(
+            device,
+            queue_family_index,
+            &spirv,
+            &[
+                ll_buffer.descriptor_info(),
+                lh_buffer.descriptor_info(),
+                low_rows_buffer.descriptor_info(),
+            ],
+            bytes_of(&vertical_low_push),
+            1,
+            1,
+        )?;
+
+        let vertical_high_push = Idwt53PushConstants {
+            low_count: 2,
+            high_count: 2,
+            line_count: 2,
+            low_line_stride: 1,
+            low_sample_stride: 2,
+            high_line_stride: 1,
+            high_sample_stride: 2,
+            output_line_stride: 1,
+            output_sample_stride: 2,
+        };
+        dispatch_storage_shader(
+            device,
+            queue_family_index,
+            &spirv,
+            &[
+                hl_buffer.descriptor_info(),
+                hh_buffer.descriptor_info(),
+                high_rows_buffer.descriptor_info(),
+            ],
+            bytes_of(&vertical_high_push),
+            1,
+            1,
+        )?;
+
+        let horizontal_push = Idwt53PushConstants {
+            low_count: 3,
+            high_count: 2,
+            line_count: 4,
+            low_line_stride: 3,
+            low_sample_stride: 1,
+            high_line_stride: 2,
+            high_sample_stride: 1,
+            output_line_stride: 5,
+            output_sample_stride: 1,
+        };
+        dispatch_storage_shader(
+            device,
+            queue_family_index,
+            &spirv,
+            &[
+                low_rows_buffer.descriptor_info(),
+                high_rows_buffer.descriptor_info(),
+                level_output_buffer.descriptor_info(),
+            ],
+            bytes_of(&horizontal_push),
+            1,
+            1,
+        )?;
+
+        let level_output = level_output_buffer.read_vec::<f32>(level_seed.len())?;
+        compare_f32_slices(
+            "idwt97 level smoke",
+            &level_output,
+            &expected_level.samples,
+            0.0002,
+        )?;
+
+        let component = idwt97_smoke_component()?;
+        let component_output_plane =
+            run_idwt97_component_on_device(device, queue_family_index, &spirv, &component, 1)?;
+        let component_ll = vec![4.0f32, -3.0, 12.0, 1.0, 5.0, 9.0];
+        let component_hl = vec![7.0f32, -5.0, 2.0, 3.0];
+        let component_lh = vec![6.0f32, 8.0, -4.0, 0.0, 11.0, -7.0];
+        let component_hh = vec![1.0f32, -2.0, 4.0, -3.0];
+        let expected_component = inverse_9_7_level(
+            Band2DF32 {
+                width: 3,
+                height: 2,
+                samples: &component_ll,
+            },
+            Band2DF32 {
+                width: 2,
+                height: 2,
+                samples: &component_hl,
+            },
+            Band2DF32 {
+                width: 3,
+                height: 2,
+                samples: &component_lh,
+            },
+            Band2DF32 {
+                width: 2,
+                height: 2,
+                samples: &component_hh,
+            },
+        )
+        .map_err(|err| {
+            VulkanError::new(format!("CPU inverse 9/7 component smoke failed: {err}"))
+        })?;
+        compare_f32_slices(
+            "idwt97 component smoke",
+            &component_output_plane.samples,
+            &expected_component.samples,
+            0.0002,
+        )?;
+        device.wait_idle()?;
+
+        Ok(Idwt97SmokeResult {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            row_output,
+            column_output,
+            level_output,
+            component_output: component_output_plane.samples,
+        })
+    })
+}
+
+fn idwt97_smoke_component() -> Result<ComponentSubbandPlanes, VulkanError> {
+    let component_layout = TileComponentLayout {
+        width: 5,
+        height: 4,
+        resolutions: vec![
+            ResolutionLayout {
+                level: 0,
+                width: 3,
+                height: 2,
+                precincts_x: 1,
+                precincts_y: 1,
+                subbands: vec![SubbandLayout {
+                    kind: SubbandKind::Ll,
+                    width: 3,
+                    height: 2,
+                    codeblock_width: 3,
+                    codeblock_height: 2,
+                    codeblocks_x: 1,
+                    codeblocks_y: 1,
+                }],
+            },
+            ResolutionLayout {
+                level: 1,
+                width: 5,
+                height: 4,
+                precincts_x: 1,
+                precincts_y: 1,
+                subbands: vec![
+                    SubbandLayout {
+                        kind: SubbandKind::Hl,
+                        width: 2,
+                        height: 2,
+                        codeblock_width: 2,
+                        codeblock_height: 2,
+                        codeblocks_x: 1,
+                        codeblocks_y: 1,
+                    },
+                    SubbandLayout {
+                        kind: SubbandKind::Lh,
+                        width: 3,
+                        height: 2,
+                        codeblock_width: 3,
+                        codeblock_height: 2,
+                        codeblocks_x: 1,
+                        codeblocks_y: 1,
+                    },
+                    SubbandLayout {
+                        kind: SubbandKind::Hh,
+                        width: 2,
+                        height: 2,
+                        codeblock_width: 2,
+                        codeblock_height: 2,
+                        codeblocks_x: 1,
+                        codeblocks_y: 1,
+                    },
+                ],
+            },
+        ],
+    };
+    let mut component = ComponentSubbandPlanes::new(0, &component_layout)
+        .map_err(|err| VulkanError::new(format!("IDWT 9/7 smoke component build failed: {err}")))?;
+    set_component_plane(&mut component, 0, SubbandKind::Ll, vec![4, -3, 12, 1, 5, 9])?;
+    set_component_plane(&mut component, 1, SubbandKind::Hl, vec![7, -5, 2, 3])?;
+    set_component_plane(&mut component, 1, SubbandKind::Lh, vec![6, 8, -4, 0, 11, -7])?;
+    set_component_plane(&mut component, 1, SubbandKind::Hh, vec![1, -2, 4, -3])?;
+    Ok(component)
+}
+
+fn set_component_plane(
+    component: &mut ComponentSubbandPlanes,
+    resolution: u8,
+    subband: SubbandKind,
+    coefficients: Vec<i32>,
+) -> Result<(), VulkanError> {
+    let plane = component
+        .planes
+        .iter_mut()
+        .find(|plane| plane.resolution == resolution && plane.layout.kind == subband)
+        .ok_or_else(|| {
+            VulkanError::new(format!(
+                "IDWT 9/7 smoke missing component plane r{resolution} {subband}"
+            ))
+        })?;
+    if plane.plane.coefficients.len() != coefficients.len() {
+        return Err(VulkanError::new(format!(
+            "IDWT 9/7 smoke r{resolution} {subband} has {} samples, expected {}",
+            coefficients.len(),
+            plane.plane.coefficients.len()
+        )));
+    }
+    plane.plane.coefficients = coefficients;
+    Ok(())
+}
+
+pub fn run_irreversible_smoke(
+    idwt97_shader_path: &str,
+    color_shader_path: &str,
+) -> Result<IrreversibleSmokeResult, VulkanError> {
+    let idwt97_spirv = read_spirv(idwt97_shader_path)?;
+    let color_spirv = read_spirv(color_shader_path)?;
+    with_compute_device(|device, summary, queue_family_index| {
+        let components = vec![
+            scaled_idwt97_smoke_component(1)?,
+            scaled_idwt97_smoke_component(2)?,
+            scaled_idwt97_smoke_component(-1)?,
+        ];
+
+        let mut cpu_planes = Vec::with_capacity(components.len());
+        let mut gpu_planes = Vec::with_capacity(components.len());
+        for component in &components {
+            cpu_planes.push(component.inverse_9_7().map_err(|err| {
+                VulkanError::new(format!("CPU irreversible smoke IDWT failed: {err}"))
+            })?);
+            gpu_planes.push(run_idwt97_component_on_device(
+                device,
+                queue_family_index,
+                &idwt97_spirv,
+                component,
+                1,
+            )?);
+        }
+
+        for (component_index, (gpu, cpu)) in gpu_planes.iter().zip(&cpu_planes).enumerate() {
+            compare_f32_slices(
+                &format!("irreversible smoke component {component_index} IDWT"),
+                &gpu.samples,
+                &cpu.samples,
+                0.0002,
+            )?;
+        }
+
+        let cpu_samples =
+            pack_rgb48_float_samples_cpu(&cpu_planes, 12, 1, WaveletTransform::Irreversible97)
+                .map_err(|err| {
+                    VulkanError::new(format!("CPU irreversible smoke color pack failed: {err}"))
+                })?;
+        let gpu_samples = run_color_float_components_on_device(
+            device,
+            queue_family_index,
+            &color_spirv,
+            &gpu_planes,
+            2,
+            12,
+        )?;
+        if gpu_samples != cpu_samples {
+            return Err(VulkanError::new(format!(
+                "irreversible smoke RGB48 mismatch: got {gpu_samples:?}, expected {cpu_samples:?}"
+            )));
+        }
+        device.wait_idle()?;
+
+        Ok(IrreversibleSmokeResult {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            cpu_samples,
+            gpu_samples,
+        })
+    })
+}
+
+fn scaled_idwt97_smoke_component(scale: i32) -> Result<ComponentSubbandPlanes, VulkanError> {
+    let mut component = idwt97_smoke_component()?;
+    for plane in &mut component.planes {
+        for coefficient in &mut plane.plane.coefficients {
+            *coefficient = coefficient.checked_mul(scale).ok_or_else(|| {
+                VulkanError::new(format!(
+                    "IDWT 9/7 smoke coefficient {coefficient} overflows scale {scale}"
+                ))
+            })?;
+        }
+    }
+    Ok(component)
+}
+
+fn compare_f32_slices(
+    label: &str,
+    actual: &[f32],
+    expected: &[f32],
+    epsilon: f32,
+) -> Result<(), VulkanError> {
+    if actual.len() != expected.len() {
+        return Err(VulkanError::new(format!(
+            "{label} length mismatch: got {}, expected {}",
+            actual.len(),
+            expected.len()
+        )));
+    }
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        if (actual - expected).abs() > epsilon {
+            return Err(VulkanError::new(format!(
+                "{label} output mismatch at {index}: got {actual}, expected {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Idwt53PushConstants {
@@ -605,6 +1111,37 @@ pub fn run_color_smoke(shader_path: &str) -> Result<ColorSmokeResult, VulkanErro
                 "color ICT smoke output mismatch: got {ict_output:?}, expected {ict_expected:?}"
             )));
         }
+        let float_component_planes = [
+            PlaneF32 {
+                width: 2,
+                height: 1,
+                samples: vec![-1.0, 0.4],
+            },
+            PlaneF32 {
+                width: 2,
+                height: 1,
+                samples: vec![2.0, -2048.0],
+            },
+            PlaneF32 {
+                width: 2,
+                height: 1,
+                samples: vec![5.0, 2048.0],
+            },
+        ];
+        let float_component_output = run_color_float_components_on_device(
+            device,
+            queue_family_index,
+            &spirv,
+            &float_component_planes,
+            0,
+            12,
+        )?;
+        let float_component_expected = vec![2047, 2050, 2053, 2048, 0, 4095];
+        if float_component_output != float_component_expected {
+            return Err(VulkanError::new(format!(
+                "color float component smoke output mismatch: got {float_component_output:?}, expected {float_component_expected:?}"
+            )));
+        }
         device.wait_idle()?;
 
         Ok(ColorSmokeResult {
@@ -613,6 +1150,7 @@ pub fn run_color_smoke(shader_path: &str) -> Result<ColorSmokeResult, VulkanErro
             none_output,
             rct_output,
             ict_output,
+            float_component_output,
         })
     })
 }

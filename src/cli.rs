@@ -142,6 +142,19 @@ pub fn run() -> ExitCode {
                 .as_deref()
                 .unwrap_or("target\\shaders\\idwt53_1d.comp.spv"),
         ),
+        (Some("vk-idwt97-smoke"), shader_path) => vulkan::run_vulkan_idwt97_smoke(
+            shader_path
+                .as_deref()
+                .unwrap_or("target\\shaders\\idwt97_1d.comp.spv"),
+        ),
+        (Some("vk-irreversible-smoke"), idwt97_shader_path) => {
+            let idwt97_shader_path = idwt97_shader_path
+                .unwrap_or_else(|| "target\\shaders\\idwt97_1d.comp.spv".to_string());
+            let color_shader_path = args
+                .next()
+                .unwrap_or_else(|| "target\\shaders\\color_convert.comp.spv".to_string());
+            vulkan::run_vulkan_irreversible_smoke(&idwt97_shader_path, &color_shader_path)
+        }
         _ => {
             eprintln!("usage:");
             eprintln!("  {program} dump <input.j2k>");
@@ -165,6 +178,10 @@ pub fn run() -> ExitCode {
             eprintln!("  {program} vk-smoke [dequant.comp.spv]");
             eprintln!("  {program} vk-color-smoke [color_convert.comp.spv]");
             eprintln!("  {program} vk-idwt53-smoke [idwt53_1d.comp.spv]");
+            eprintln!("  {program} vk-idwt97-smoke [idwt97_1d.comp.spv]");
+            eprintln!(
+                "  {program} vk-irreversible-smoke [idwt97_1d.comp.spv] [color_convert.comp.spv]"
+            );
             ExitCode::FAILURE
         }
     }
@@ -547,7 +564,8 @@ fn dump_codestream(path: &str) -> ExitCode {
     match GpuDwtDispatchPlan::from_codestream(&codestream) {
         Ok(plan) => {
             println!(
-                "gpu dwt plan: {} tiles, {} components, {} stages, {} workgroups, {} output samples touched",
+                "gpu dwt plan: {}, {} tiles, {} components, {} stages, {} workgroups, {} output samples touched",
+                plan.transform,
                 plan.tile_count,
                 plan.component_count,
                 plan.stages.len(),

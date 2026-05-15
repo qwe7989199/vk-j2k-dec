@@ -9,3 +9,5 @@ $ErrorActionPreference = "Stop"
 & cargo run -- vk-smoke
 & cargo run -- vk-color-smoke
 & cargo run -- vk-idwt53-smoke
+& cargo run -- vk-idwt97-smoke
+& cargo run -- vk-irreversible-smoke

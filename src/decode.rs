@@ -1,6 +1,9 @@
 use crate::codestream::{Codestream, WaveletTransform};
-use crate::color::{ColorError, inverse_rct_sample, level_shift_and_clamp};
-use crate::dwt::PlaneI32;
+use crate::color::{
+    ColorError, inverse_ict_sample, inverse_rct_sample, level_shift_and_clamp,
+    level_shift_and_clamp_float,
+};
+use crate::dwt::{PlaneF32, PlaneI32};
 use crate::packet::parse_lrcp_tile_packets;
 use crate::reconstruct::{ComponentSubbandPlanes, TileCoefficientPlanes};
 use crate::tier1::Tier1WorkPlan;
@@ -318,6 +321,78 @@ fn pack_rgb48_samples_cpu(
     Ok(samples)
 }
 
+pub fn pack_rgb48_float_samples_cpu(
+    component_planes: &[PlaneF32],
+    precision: u8,
+    multiple_component_transform: u8,
+    transform: WaveletTransform,
+) -> Result<Vec<u16>, DecodeError> {
+    validate_float_component_planes(component_planes)?;
+    let pixel_count = component_planes[0].samples.len();
+    let mut samples = Vec::with_capacity(pixel_count * 3);
+    match (multiple_component_transform, transform) {
+        (0, _) => {
+            for index in 0..pixel_count {
+                samples.push(level_shift_and_clamp_float(
+                    component_planes[0].samples[index],
+                    precision,
+                )?);
+                samples.push(level_shift_and_clamp_float(
+                    component_planes[1].samples[index],
+                    precision,
+                )?);
+                samples.push(level_shift_and_clamp_float(
+                    component_planes[2].samples[index],
+                    precision,
+                )?);
+            }
+        }
+        (1, WaveletTransform::Irreversible97) => {
+            for index in 0..pixel_count {
+                let (r, g, b) = inverse_ict_sample(
+                    component_planes[0].samples[index],
+                    component_planes[1].samples[index],
+                    component_planes[2].samples[index],
+                );
+                samples.push(level_shift_and_clamp_float(r, precision)?);
+                samples.push(level_shift_and_clamp_float(g, precision)?);
+                samples.push(level_shift_and_clamp_float(b, precision)?);
+            }
+        }
+        (other, _) => {
+            return Err(DecodeError::new(format!(
+                "unsupported float multiple component transform {other} for {transform}"
+            )));
+        }
+    }
+    Ok(samples)
+}
+
+fn validate_float_component_planes(component_planes: &[PlaneF32]) -> Result<(), DecodeError> {
+    if component_planes.len() != 3 {
+        return Err(DecodeError::new(format!(
+            "rgb48 float packing requires 3 component planes, got {}",
+            component_planes.len()
+        )));
+    }
+    let width = component_planes[0].width;
+    let height = component_planes[0].height;
+    let sample_count = component_planes[0].samples.len();
+    for (index, plane) in component_planes.iter().enumerate() {
+        if plane.width != width || plane.height != height || plane.samples.len() != sample_count {
+            return Err(DecodeError::new(format!(
+                "float component {index} has {}x{} / {} samples, expected {}x{} / {sample_count}",
+                plane.width,
+                plane.height,
+                plane.samples.len(),
+                width,
+                height
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn gpu_color_transform_value(
     multiple_component_transform: u8,
     transform: WaveletTransform,
@@ -334,4 +409,61 @@ fn gpu_color_transform_value(
 
 fn discard_extent(value: u32, discard_levels: u8) -> u32 {
     value.div_ceil(1u32 << discard_levels)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packs_float_rgb48_without_transform() {
+        let planes = vec![
+            plane_f32(&[-1.0, 0.4]),
+            plane_f32(&[2.0, -2048.0]),
+            plane_f32(&[5.0, 2048.0]),
+        ];
+
+        let samples =
+            pack_rgb48_float_samples_cpu(&planes, 12, 0, WaveletTransform::Irreversible97)
+                .expect("pack");
+
+        assert_eq!(samples, vec![2047, 2050, 2053, 2048, 0, 4095]);
+    }
+
+    #[test]
+    fn packs_float_rgb48_with_ict() {
+        let planes = vec![
+            plane_f32(&[100.0, -20.0]),
+            plane_f32(&[10.0, -12.0]),
+            plane_f32(&[-5.0, 7.0]),
+        ];
+
+        let samples =
+            pack_rgb48_float_samples_cpu(&planes, 12, 1, WaveletTransform::Irreversible97)
+                .expect("pack");
+
+        assert_eq!(samples, vec![2141, 2148, 2166, 2038, 2027, 2007]);
+    }
+
+    #[test]
+    fn rejects_float_rgb48_component_shape_mismatch() {
+        let planes = vec![
+            plane_f32(&[0.0, 1.0]),
+            plane_f32(&[2.0]),
+            plane_f32(&[3.0, 4.0]),
+        ];
+
+        let err = pack_rgb48_float_samples_cpu(&planes, 12, 0, WaveletTransform::Irreversible97)
+            .expect_err("shape mismatch must fail");
+
+        assert!(err.message.contains("float component 1"));
+    }
+
+    fn plane_f32(samples: &[f32]) -> PlaneF32 {
+        PlaneF32 {
+            width: samples.len() as u32,
+            height: 1,
+            samples: samples.to_vec(),
+        }
+    }
 }

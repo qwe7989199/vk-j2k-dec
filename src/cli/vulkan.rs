@@ -1,6 +1,9 @@
 use std::process::ExitCode;
 
-use vk_j2k_dec::vulkan::{enumerate_devices, run_color_smoke, run_dequant_smoke, run_idwt53_smoke};
+use vk_j2k_dec::vulkan::{
+    enumerate_devices, run_color_smoke, run_dequant_smoke, run_idwt53_smoke, run_idwt97_smoke,
+    run_irreversible_smoke,
+};
 
 pub fn print_vulkan_info() -> ExitCode {
     let devices = match enumerate_devices() {
@@ -65,6 +68,10 @@ pub fn run_vulkan_color_smoke(shader_path: &str) -> ExitCode {
     println!("  none output rgb16 words: {:?}", result.none_output);
     println!("  rct output rgb16 words: {:?}", result.rct_output);
     println!("  ict output rgb16 words: {:?}", result.ict_output);
+    println!(
+        "  float component output rgb16 words: {:?}",
+        result.float_component_output
+    );
     println!("  validation: passed");
     ExitCode::SUCCESS
 }
@@ -84,6 +91,47 @@ pub fn run_vulkan_idwt53_smoke(shader_path: &str) -> ExitCode {
     println!("  row output: {:?}", result.row_output);
     println!("  column output: {:?}", result.column_output);
     println!("  level output: {:?}", result.level_output);
+    println!("  validation: passed");
+    ExitCode::SUCCESS
+}
+
+pub fn run_vulkan_idwt97_smoke(shader_path: &str) -> ExitCode {
+    let result = match run_idwt97_smoke(shader_path) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("vulkan idwt97 smoke: failed ({err})");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "vulkan idwt97 smoke: device {}, queue family {}",
+        result.device_name, result.queue_family_index
+    );
+    println!("  row output: {:?}", result.row_output);
+    println!("  column output: {:?}", result.column_output);
+    println!("  level output: {:?}", result.level_output);
+    println!("  component output: {:?}", result.component_output);
+    println!("  validation: passed");
+    ExitCode::SUCCESS
+}
+
+pub fn run_vulkan_irreversible_smoke(
+    idwt97_shader_path: &str,
+    color_shader_path: &str,
+) -> ExitCode {
+    let result = match run_irreversible_smoke(idwt97_shader_path, color_shader_path) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("vulkan irreversible smoke: failed ({err})");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "vulkan irreversible smoke: device {}, queue family {}",
+        result.device_name, result.queue_family_index
+    );
+    println!("  cpu rgb16 words: {:?}", result.cpu_samples);
+    println!("  gpu rgb16 words: {:?}", result.gpu_samples);
     println!("  validation: passed");
     ExitCode::SUCCESS
 }

@@ -69,6 +69,77 @@ pub fn inverse_5_3_1d(low: &[i32], high: &[i32]) -> Result<Vec<i32>, DwtError> {
     Ok(output)
 }
 
+pub fn inverse_9_7_1d(low: &[f32], high: &[f32]) -> Result<Vec<f32>, DwtError> {
+    if low.len() < high.len() || low.len().saturating_sub(high.len()) > 1 {
+        return Err(DwtError::new(format!(
+            "invalid 9/7 band lengths: low {}, high {}",
+            low.len(),
+            high.len()
+        )));
+    }
+    if low.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let unscaled_low = (0..low.len())
+        .map(|index| low[index] / DWT97_K)
+        .collect::<Vec<_>>();
+    let unscaled_high = (0..high.len())
+        .map(|index| high[index] * DWT97_K)
+        .collect::<Vec<_>>();
+
+    let mut updated_low = Vec::with_capacity(low.len());
+    for index in 0..low.len() {
+        let left = if index == 0 {
+            high_at_f32(&unscaled_high, 0)
+        } else {
+            high_at_f32(&unscaled_high, index - 1)
+        };
+        let right = high_at_f32(&unscaled_high, index);
+        updated_low.push(unscaled_low[index] - DWT97_DELTA * (left + right));
+    }
+
+    let mut updated_high = Vec::with_capacity(high.len());
+    for index in 0..high.len() {
+        let left = updated_low[index];
+        let right = updated_low
+            .get(index + 1)
+            .copied()
+            .unwrap_or(updated_low[index]);
+        updated_high.push(unscaled_high[index] - DWT97_GAMMA * (left + right));
+    }
+
+    for index in 0..updated_low.len() {
+        let left = if index == 0 {
+            high_at_f32(&updated_high, 0)
+        } else {
+            high_at_f32(&updated_high, index - 1)
+        };
+        let right = high_at_f32(&updated_high, index);
+        updated_low[index] -= DWT97_BETA * (left + right);
+    }
+
+    for index in 0..updated_high.len() {
+        let left = updated_low[index];
+        let right = updated_low
+            .get(index + 1)
+            .copied()
+            .unwrap_or(updated_low[index]);
+        updated_high[index] -= DWT97_ALPHA * (left + right);
+    }
+
+    let mut output = Vec::with_capacity(low.len() + high.len());
+    for index in 0..high.len() {
+        output.push(updated_low[index]);
+        output.push(updated_high[index]);
+    }
+    if low.len() > high.len() {
+        output.push(updated_low[updated_low.len() - 1]);
+    }
+
+    Ok(output)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Band2D<'a> {
     pub width: u32,
@@ -77,6 +148,26 @@ pub struct Band2D<'a> {
 }
 
 impl Band2D<'_> {
+    fn checked_len(&self, name: &str) -> Result<(), DwtError> {
+        let expected = self.width as usize * self.height as usize;
+        if self.samples.len() != expected {
+            return Err(DwtError::new(format!(
+                "{name} band has {} samples, expected {expected}",
+                self.samples.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Band2DF32<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub samples: &'a [f32],
+}
+
+impl Band2DF32<'_> {
     fn checked_len(&self, name: &str) -> Result<(), DwtError> {
         let expected = self.width as usize * self.height as usize;
         if self.samples.len() != expected {
@@ -98,6 +189,22 @@ pub struct PlaneI32 {
 
 impl PlaneI32 {
     pub fn sample(&self, x: u32, y: u32) -> Option<i32> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        Some(self.samples[y as usize * self.width as usize + x as usize])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaneF32 {
+    pub width: u32,
+    pub height: u32,
+    pub samples: Vec<f32>,
+}
+
+impl PlaneF32 {
+    pub fn sample(&self, x: u32, y: u32) -> Option<f32> {
         if x >= self.width || y >= self.height {
             return None;
         }
@@ -174,6 +281,81 @@ pub fn inverse_5_3_level(
     })
 }
 
+pub fn inverse_9_7_level(
+    ll: Band2DF32<'_>,
+    hl: Band2DF32<'_>,
+    lh: Band2DF32<'_>,
+    hh: Band2DF32<'_>,
+) -> Result<PlaneF32, DwtError> {
+    ll.checked_len("LL")?;
+    hl.checked_len("HL")?;
+    lh.checked_len("LH")?;
+    hh.checked_len("HH")?;
+    if ll.width != lh.width || hl.width != hh.width {
+        return Err(DwtError::new(
+            "low/high vertical bands have mismatched widths",
+        ));
+    }
+    if ll.height != hl.height || lh.height != hh.height {
+        return Err(DwtError::new(
+            "low/high horizontal bands have mismatched heights",
+        ));
+    }
+
+    let width = ll.width + hl.width;
+    let height = ll.height + lh.height;
+    let mut low_rows = vec![0.0; ll.width as usize * height as usize];
+    let mut high_rows = vec![0.0; hl.width as usize * height as usize];
+
+    for x in 0..ll.width as usize {
+        let low_column = (0..ll.height as usize)
+            .map(|y| ll.samples[y * ll.width as usize + x])
+            .collect::<Vec<_>>();
+        let high_column = (0..lh.height as usize)
+            .map(|y| lh.samples[y * lh.width as usize + x])
+            .collect::<Vec<_>>();
+        let column = inverse_9_7_1d(&low_column, &high_column)?;
+        for (y, value) in column.into_iter().enumerate() {
+            low_rows[y * ll.width as usize + x] = value;
+        }
+    }
+
+    for x in 0..hl.width as usize {
+        let low_column = (0..hl.height as usize)
+            .map(|y| hl.samples[y * hl.width as usize + x])
+            .collect::<Vec<_>>();
+        let high_column = (0..hh.height as usize)
+            .map(|y| hh.samples[y * hh.width as usize + x])
+            .collect::<Vec<_>>();
+        let column = inverse_9_7_1d(&low_column, &high_column)?;
+        for (y, value) in column.into_iter().enumerate() {
+            high_rows[y * hl.width as usize + x] = value;
+        }
+    }
+
+    let mut samples = Vec::with_capacity(width as usize * height as usize);
+    for y in 0..height as usize {
+        let low_offset = y * ll.width as usize;
+        let high_offset = y * hl.width as usize;
+        samples.extend(inverse_9_7_1d(
+            &low_rows[low_offset..low_offset + ll.width as usize],
+            &high_rows[high_offset..high_offset + hl.width as usize],
+        )?);
+    }
+
+    Ok(PlaneF32 {
+        width,
+        height,
+        samples,
+    })
+}
+
+const DWT97_ALPHA: f32 = -1.586_134_3;
+const DWT97_BETA: f32 = -0.052_980_12;
+const DWT97_GAMMA: f32 = 0.882_911_1;
+const DWT97_DELTA: f32 = 0.443_506_87;
+const DWT97_K: f32 = 1.230_174_1;
+
 #[cfg(test)]
 fn floor_div_pow2(value: i32, shift: u32) -> i32 {
     value.div_euclid(1i32 << shift)
@@ -189,6 +371,14 @@ fn checked_i64_to_i32(value: i64) -> Result<i32, DwtError> {
             "inverse 5/3 intermediate value {value} exceeds i32 coefficient staging"
         ))
     })
+}
+
+fn high_at_f32(high: &[f32], index: usize) -> f32 {
+    if high.is_empty() {
+        0.0
+    } else {
+        high[index.min(high.len() - 1)]
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +445,74 @@ mod tests {
 
         assert_eq!(reconstructed, original);
         assert_eq!(reconstructed.sample(4, 3), Some(-1));
+        assert_eq!(reconstructed.sample(5, 3), None);
+    }
+
+    #[test]
+    fn inverse_9_7_roundtrips_even_length_signal() {
+        let original = vec![12.25, -3.5, 7.0, 4.75, 18.125, 6.5];
+        let (low, high) = forward_9_7_1d(&original);
+        let reconstructed = inverse_9_7_1d(&low, &high).expect("inverse");
+
+        assert_f32_slices_close(&reconstructed, &original);
+    }
+
+    #[test]
+    fn inverse_9_7_roundtrips_odd_length_signal() {
+        let original = vec![5.0, 9.5, -2.25, 3.75, 11.0];
+        let (low, high) = forward_9_7_1d(&original);
+        let reconstructed = inverse_9_7_1d(&low, &high).expect("inverse");
+
+        assert_f32_slices_close(&reconstructed, &original);
+    }
+
+    #[test]
+    fn inverse_9_7_rejects_impossible_band_lengths() {
+        let err = inverse_9_7_1d(&[1.0], &[2.0, 3.0]).expect_err("must fail");
+
+        assert!(err.message.contains("invalid"));
+    }
+
+    #[test]
+    fn inverse_9_7_level_roundtrips_plane() {
+        let original = PlaneF32 {
+            width: 5,
+            height: 4,
+            samples: vec![
+                1.25, 5.5, 2.0, 8.75, 3.0, -4.5, 9.25, 7.0, 6.5, 0.25, 12.0, 11.5, -2.25, 4.0,
+                10.75, 3.125, 2.5, 1.0, 0.0, -1.5,
+            ],
+        };
+        let (ll, hl, lh, hh) = forward_9_7_level(&original);
+
+        let reconstructed = inverse_9_7_level(
+            Band2DF32 {
+                width: ll.width,
+                height: ll.height,
+                samples: &ll.samples,
+            },
+            Band2DF32 {
+                width: hl.width,
+                height: hl.height,
+                samples: &hl.samples,
+            },
+            Band2DF32 {
+                width: lh.width,
+                height: lh.height,
+                samples: &lh.samples,
+            },
+            Band2DF32 {
+                width: hh.width,
+                height: hh.height,
+                samples: &hh.samples,
+            },
+        )
+        .expect("inverse level");
+
+        assert_eq!(reconstructed.width, original.width);
+        assert_eq!(reconstructed.height, original.height);
+        assert_f32_slices_close(&reconstructed.samples, &original.samples);
+        assert_f32_close(reconstructed.sample(4, 3).unwrap(), -1.5);
         assert_eq!(reconstructed.sample(5, 3), None);
     }
 
@@ -354,5 +612,140 @@ mod tests {
                 samples: hh,
             },
         )
+    }
+
+    fn forward_9_7_1d(input: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let mut low = input.iter().step_by(2).copied().collect::<Vec<_>>();
+        let mut high = input.iter().skip(1).step_by(2).copied().collect::<Vec<_>>();
+
+        for index in 0..high.len() {
+            let left = low[index];
+            let right = low.get(index + 1).copied().unwrap_or(left);
+            high[index] += DWT97_ALPHA * (left + right);
+        }
+
+        for index in 0..low.len() {
+            let left = if index == 0 {
+                high_at_f32(&high, 0)
+            } else {
+                high_at_f32(&high, index - 1)
+            };
+            let right = high_at_f32(&high, index);
+            low[index] += DWT97_BETA * (left + right);
+        }
+
+        for index in 0..high.len() {
+            let left = low[index];
+            let right = low.get(index + 1).copied().unwrap_or(left);
+            high[index] += DWT97_GAMMA * (left + right);
+        }
+
+        for index in 0..low.len() {
+            let left = if index == 0 {
+                high_at_f32(&high, 0)
+            } else {
+                high_at_f32(&high, index - 1)
+            };
+            let right = high_at_f32(&high, index);
+            low[index] += DWT97_DELTA * (left + right);
+        }
+
+        for value in &mut low {
+            *value *= DWT97_K;
+        }
+        for value in &mut high {
+            *value /= DWT97_K;
+        }
+
+        (low, high)
+    }
+
+    fn forward_9_7_level(input: &PlaneF32) -> (PlaneF32, PlaneF32, PlaneF32, PlaneF32) {
+        let low_width = input.width.div_ceil(2);
+        let high_width = input.width / 2;
+        let low_height = input.height.div_ceil(2);
+        let high_height = input.height / 2;
+
+        let mut low_rows = vec![0.0; low_width as usize * input.height as usize];
+        let mut high_rows = vec![0.0; high_width as usize * input.height as usize];
+        for y in 0..input.height {
+            let start = y as usize * input.width as usize;
+            let row = &input.samples[start..start + input.width as usize];
+            let (low, high) = forward_9_7_1d(row);
+            let low_offset = y as usize * low_width as usize;
+            let high_offset = y as usize * high_width as usize;
+            low_rows[low_offset..low_offset + low.len()].copy_from_slice(&low);
+            high_rows[high_offset..high_offset + high.len()].copy_from_slice(&high);
+        }
+
+        let mut ll = vec![0.0; low_width as usize * low_height as usize];
+        let mut lh = vec![0.0; low_width as usize * high_height as usize];
+        for x in 0..low_width as usize {
+            let column = (0..input.height as usize)
+                .map(|y| low_rows[y * low_width as usize + x])
+                .collect::<Vec<_>>();
+            let (low, high) = forward_9_7_1d(&column);
+            for (y, value) in low.into_iter().enumerate() {
+                ll[y * low_width as usize + x] = value;
+            }
+            for (y, value) in high.into_iter().enumerate() {
+                lh[y * low_width as usize + x] = value;
+            }
+        }
+
+        let mut hl = vec![0.0; high_width as usize * low_height as usize];
+        let mut hh = vec![0.0; high_width as usize * high_height as usize];
+        for x in 0..high_width as usize {
+            let column = (0..input.height as usize)
+                .map(|y| high_rows[y * high_width as usize + x])
+                .collect::<Vec<_>>();
+            let (low, high) = forward_9_7_1d(&column);
+            for (y, value) in low.into_iter().enumerate() {
+                hl[y * high_width as usize + x] = value;
+            }
+            for (y, value) in high.into_iter().enumerate() {
+                hh[y * high_width as usize + x] = value;
+            }
+        }
+
+        (
+            PlaneF32 {
+                width: low_width,
+                height: low_height,
+                samples: ll,
+            },
+            PlaneF32 {
+                width: high_width,
+                height: low_height,
+                samples: hl,
+            },
+            PlaneF32 {
+                width: low_width,
+                height: high_height,
+                samples: lh,
+            },
+            PlaneF32 {
+                width: high_width,
+                height: high_height,
+                samples: hh,
+            },
+        )
+    }
+
+    fn assert_f32_slices_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.0001,
+                "sample {index}: got {actual}, expected {expected}"
+            );
+        }
+    }
+
+    fn assert_f32_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= 0.0001,
+            "got {actual}, expected {expected}"
+        );
     }
 }

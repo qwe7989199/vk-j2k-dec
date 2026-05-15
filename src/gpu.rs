@@ -68,6 +68,7 @@ impl GpuPipelinePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuDwtDispatchPlan {
+    pub transform: WaveletTransform,
     pub tile_count: u32,
     pub component_count: u16,
     pub stages: Vec<GpuDwtStagePlan>,
@@ -79,9 +80,12 @@ impl GpuDwtDispatchPlan {
             .cod
             .as_ref()
             .ok_or_else(|| GpuPlanError::new("missing COD marker"))?;
-        if cod.transform != WaveletTransform::Reversible53 {
+        if !matches!(
+            cod.transform,
+            WaveletTransform::Reversible53 | WaveletTransform::Irreversible97
+        ) {
             return Err(GpuPlanError::new(format!(
-                "DWT dispatch planning currently targets reversible 5/3, got {}",
+                "DWT dispatch planning does not support {}",
                 cod.transform
             )));
         }
@@ -166,6 +170,7 @@ impl GpuDwtDispatchPlan {
         }
 
         Ok(Self {
+            transform: cod.transform,
             tile_count: layouts.len() as u32,
             component_count,
             stages,
@@ -416,6 +421,7 @@ mod tests {
         assert_eq!(plan.level_shift, 2048.0);
         assert_eq!(plan.qcd_steps.len(), 16);
         assert_eq!(plan.qcd_steps[0].exponent, 5);
+        assert_eq!(dwt_plan.transform, WaveletTransform::Reversible53);
         assert_eq!(dwt_plan.tile_count, 1);
         assert_eq!(dwt_plan.component_count, 3);
         assert_eq!(dwt_plan.stages.len(), 45);
@@ -443,5 +449,85 @@ mod tests {
         assert_eq!(dwt_plan.stages[2].pass, GpuDwtPassKind::HorizontalRows);
         assert_eq!(dwt_plan.stages[2].low_sample_stride, 1);
         assert_eq!(dwt_plan.stages[2].output_line_stride, 120);
+    }
+
+    #[test]
+    fn builds_dwt_dispatch_plan_for_irreversible_97_codestream() {
+        let mut codestream = reversible_rgb12_codestream();
+        codestream.cod.as_mut().expect("COD").transform = WaveletTransform::Irreversible97;
+
+        let dwt_plan = GpuDwtDispatchPlan::from_codestream(&codestream).expect("dwt plan");
+
+        assert_eq!(dwt_plan.transform, WaveletTransform::Irreversible97);
+        assert_eq!(dwt_plan.tile_count, 1);
+        assert_eq!(dwt_plan.component_count, 3);
+        assert_eq!(dwt_plan.stages.len(), 45);
+        assert_eq!(dwt_plan.total_workgroups(), 65337);
+    }
+
+    #[test]
+    fn builds_gpu_plan_for_irreversible_97_ict_codestream() {
+        let mut codestream = reversible_rgb12_codestream();
+        let cod = codestream.cod.as_mut().expect("COD");
+        cod.transform = WaveletTransform::Irreversible97;
+        cod.multiple_component_transform = 1;
+        codestream.qcd = Some(QcdSegment {
+            guard_bits: 2,
+            style: QuantizationStyle::ScalarExpounded,
+            raw_steps: vec![0x12, 0x34],
+        });
+
+        let plan = GpuPipelinePlan::from_codestream(&codestream).expect("gpu plan");
+
+        assert_eq!(plan.color_transform, GpuColorTransform::Ict);
+        assert_eq!(plan.color_transform.shader_value(), 2);
+        assert_eq!(plan.qcd_steps.len(), 1);
+        assert_eq!(plan.qcd_steps[0].raw, 0x1234);
+    }
+
+    fn reversible_rgb12_codestream() -> Codestream {
+        Codestream {
+            byte_len: 0,
+            siz: Some(SizSegment {
+                capabilities: 0,
+                width: 1920,
+                height: 1080,
+                x_origin: 0,
+                y_origin: 0,
+                tile_width: 1920,
+                tile_height: 1080,
+                tile_x_origin: 0,
+                tile_y_origin: 0,
+                components: vec![
+                    ComponentSpec {
+                        precision: 12,
+                        is_signed: false,
+                        x_subsampling: 1,
+                        y_subsampling: 1,
+                    };
+                    3
+                ],
+            }),
+            cod: Some(CodSegment {
+                coding_style: 0,
+                progression_order: ProgressionOrder::Lrcp,
+                layers: 1,
+                multiple_component_transform: 0,
+                decomposition_levels: 5,
+                codeblock_width: 64,
+                codeblock_height: 64,
+                codeblock_style: 0,
+                transform: WaveletTransform::Reversible53,
+                precinct_sizes: Vec::new(),
+            }),
+            qcd: Some(QcdSegment {
+                guard_bits: 2,
+                style: QuantizationStyle::NoQuantization,
+                raw_steps: vec![0x28; 16],
+            }),
+            comments: Vec::new(),
+            tile_parts: Vec::new(),
+            markers: Vec::new(),
+        }
     }
 }

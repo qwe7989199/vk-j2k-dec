@@ -98,7 +98,7 @@ tier1 decode staging tile 0: 3177152 coefficient samples allocated, 25206 pendin
 tier1 input tile 0: 879 codeblocks, 879 segments, 97023 bound bytes
 tier1 execution tile 0: 25206 passes, 25206 mq, 0 raw bypass
 gpu plan: 2073600 samples, color none, shader mode 0, output max 4095, level shift 2048, qcd steps 16
-gpu dwt plan: 1 tiles, 3 components, 45 stages, 65337 workgroups, 16572960 output samples touched
+gpu dwt plan: reversible 5/3, 1 tiles, 3 components, 45 stages, 65337 workgroups, 16572960 output samples touched
 ```
 
 Arithmetic-only Tier-1 smoke can decode a bounded number of codeblocks from the
@@ -229,6 +229,7 @@ Expected output:
 ```text
 compiled shaders\dequant.comp.glsl -> target\shaders\dequant.comp.spv
 compiled shaders\idwt53_1d.comp.glsl -> target\shaders\idwt53_1d.comp.spv
+compiled shaders\idwt97_1d.comp.glsl -> target\shaders\idwt97_1d.comp.spv
 compiled shaders\color_convert.comp.glsl -> target\shaders\color_convert.comp.spv
 ```
 
@@ -273,6 +274,7 @@ vulkan color smoke: device NVIDIA GeForce RTX 5060, queue family 2
   none output rgb16 words: [2047, 2050, 2053, 2048, 2051, 2054, 2049, 2052, 2055, 4095, 0, 2171]
   rct output rgb16 words: [2058, 2028, 2078, 2043, 2055, 2039, 4095, 0, 2080]
   ict output rgb16 words: [2141, 2148, 2166, 2038, 2027, 2007, 3990, 4095, 4095]
+  float component output rgb16 words: [2047, 2050, 2053, 2048, 0, 4095]
   validation: passed
 ```
 
@@ -289,5 +291,37 @@ vulkan idwt53 smoke: device NVIDIA GeForce RTX 5060, queue family 2
   row output: [0, 5, -4, 0, 14, 0, 4, 4, 8, 7]
   column output: [0, 0, 5, 4, -4, 4, 0, 8, 14, 7]
   level output: [-2, 1, -8, 0, 16, 4, 7, 3, 4, 10, -2, -1, -1, 8, 10, -4, 7, 9, 7, 4]
+  validation: passed
+```
+
+Inverse 9/7 DWT compute dispatch:
+
+```text
+cargo run -- vk-idwt97-smoke
+```
+
+Current local result:
+
+```text
+vulkan idwt97 smoke: device NVIDIA GeForce RTX 5060, queue family 2
+  row output: [-2.9280057, 5.887209, -4.0766177, -0.8807415, 14.2842045, -1.2063935, 3.1971178, 1.4401908, 8.269233, 3.4771054]
+  column output: [-2.9280057, -1.2063935, 5.887209, 3.1971178, -4.0766177, 1.4401908, -0.8807415, 8.269233, 14.2842045, 3.4771054]
+  level output: [-4.726807, -0.8607417, -7.9491744, -0.12102845, 11.747075, 1.3871123, 8.083892, 3.5944486, 0.7425408, 5.06571, -0.07499531, -3.5440383, -4.3107452, 7.1394205, 3.9131682, -4.9557676, 8.0120735, 7.800835, 5.050199, -1.6363475]
+  component output: [-4.4902697, -0.65487915, -7.339456, -0.48657295, 10.977664, 1.3847177, 7.50584, 3.533594, 1.0696449, 5.0084, 0.011556479, -3.2508037, -4.2915163, 6.1909294, 4.2609515, -4.837547, 7.402795, 7.862847, 4.539947, -1.3311605]
+  validation: passed
+```
+
+Synthetic irreversible GPU pipeline smoke:
+
+```text
+cargo run -- vk-irreversible-smoke
+```
+
+Current local result:
+
+```text
+vulkan irreversible smoke: device NVIDIA GeForce RTX 5060, queue family 2
+  cpu rgb16 words: [2050, 2043, 2028, 2048, 2047, 2045, 2051, 2040, 2015, 2048, 2048, 2046, 2044, 2059, 2098, 2047, 2049, 2054, 2045, 2056, 2082, 2047, 2052, 2064, 2048, 2049, 2053, 2046, 2053, 2071, 2048, 2048, 2048, 2049, 2045, 2033, 2050, 2044, 2028, 2046, 2054, 2076, 2046, 2052, 2067, 2050, 2043, 2026, 2045, 2056, 2082, 2045, 2056, 2084, 2046, 2053, 2069, 2049, 2047, 2042]
+  gpu rgb16 words: [2050, 2043, 2028, 2048, 2047, 2045, 2051, 2040, 2015, 2048, 2048, 2046, 2044, 2059, 2098, 2047, 2049, 2054, 2045, 2056, 2082, 2047, 2052, 2064, 2048, 2049, 2053, 2046, 2053, 2071, 2048, 2048, 2048, 2049, 2045, 2033, 2050, 2044, 2028, 2046, 2054, 2076, 2046, 2052, 2067, 2050, 2043, 2026, 2045, 2056, 2082, 2045, 2056, 2084, 2046, 2053, 2069, 2049, 2047, 2042]
   validation: passed
 ```

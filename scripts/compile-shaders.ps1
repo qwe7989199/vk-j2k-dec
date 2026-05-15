@@ -20,6 +20,7 @@ New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $shaders = @(
     @{ Source = "shaders\dequant.comp.glsl"; Output = "dequant.comp.spv" },
     @{ Source = "shaders\idwt53_1d.comp.glsl"; Output = "idwt53_1d.comp.spv" },
+    @{ Source = "shaders\idwt97_1d.comp.glsl"; Output = "idwt97_1d.comp.spv" },
     @{ Source = "shaders\color_convert.comp.glsl"; Output = "color_convert.comp.spv" }
 )
 

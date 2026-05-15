@@ -45,7 +45,7 @@ The repository can start as one crate while the data model is still changing. Sp
 - Parse packet headers for the initial supported profile.
 - Decode codeblock bitstreams with a CPU Tier-1 path.
 - Build coefficient planes per component and subband.
-- Add CPU inverse DWT 5/3 and 9/7 reference implementations.
+- Add CPU inverse DWT 5/3 and 9/7 reference implementations. Done for one-level references.
 - Compare decoded output against OpenJPEG.
 
 ### v0.3: Vulkan setup and buffer model
@@ -54,13 +54,15 @@ The repository can start as one crate while the data model is still changing. Sp
 - Define GPU buffer layouts for coefficient planes and output planes.
 - Implement dequantization compute shaders. Initial storage-buffer smoke is working.
 - Implement color conversion compute shaders. No-transform, RCT, and ICT smoke paths are working.
+- Add float component-plane packing for irreversible paths. CPU and GPU helpers are covered by local tests/smoke.
+- Add a synthetic irreversible GPU pipeline check. Done for 9/7 component reconstruction plus ICT/RGB48 packing.
 - Keep readback simple and explicit.
 
 ### v0.4: Vulkan inverse DWT
 
 - Implement inverse 5/3 lifting in compute. Initial 1D, strided column, and one-level 2D smoke paths are working.
-- Implement inverse 9/7 lifting in compute.
-- Validate against the CPU reference path.
+- Implement inverse 9/7 lifting in compute. Initial 1D, strided column, one-level 2D smoke, and component-backend paths are working.
+- Validate against the CPU reference path. Done for 5/3 and 9/7 smoke paths.
 - Benchmark tile sizes, workgroup shapes, and memory layouts.
 
 ### v0.5: DCP-focused fast path
@@ -100,8 +102,8 @@ DCP-o-matic is a promising downstream target because JPEG 2000 decode performanc
 
 - Continue CPU Tier-1: implement significance propagation, cleanup, magnitude refinement, and sign contexts on top of the MQ decoder.
 - Build coefficient planes from decoded codeblocks and feed the CPU/GPU reconstruction path.
-- Add irreversible 9/7 CPU reference and Vulkan smoke shader.
-- Turn the Vulkan smoke helpers into a reusable reconstruction backend with persistent pipelines and buffers.
+- Add irreversible 9/7 CPU reference and Vulkan smoke shader. Done.
+- Turn the Vulkan smoke helpers into a reusable reconstruction backend with persistent pipelines and buffers. Component-level 5/3 and 9/7 helpers exist; persistent pipeline reuse is still pending.
 - Add a frame-level compare path against FFmpeg/OpenJPEG output once Tier-1 is producing coefficients.
 - Build a `dump` CLI for codestream headers. Done.
 - Parse and print `SIZ`, `COD`, `QCD`, and `SOT`. Done.

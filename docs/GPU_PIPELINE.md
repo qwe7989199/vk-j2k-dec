@@ -7,7 +7,7 @@ compute shaders. The first useful GPU boundary is:
 2. CPU writes coefficient planes plus per-sample subband step indices.
 3. `dequant.comp.glsl` converts integer coefficients to float working samples.
 4. `idwt53_1d.comp.glsl` performs inverse 5/3 lifting over rows/columns.
-   The 9/7 path still needs a separate float lifting shader.
+   `idwt97_1d.comp.glsl` covers the irreversible 9/7 float lifting smoke path.
 5. Inverse DWT shaders reconstruct component planes in place.
 6. `color_convert.comp.glsl` applies no transform, RCT, or ICT and writes RGB16.
 
@@ -69,7 +69,7 @@ performance shape. The next GPU milestones are:
 - keep intermediate DWT buffers device-local and avoid CPU readback between levels;
 - reuse descriptor layouts, pipelines, command pools, and command buffers;
 - keep DWT output on device for color conversion instead of re-uploading planes;
-- add the irreversible 9/7 float DWT shader.
+- wire irreversible 9/7 DWT into real-frame decode once a representative sample is available.
 
 ## Shader build
 
@@ -100,7 +100,7 @@ CPU-computed reference.
 
 `vk-j2k-dec vk-color-smoke` runs the same host path against
 `color_convert.comp.spv` and validates RGB16 packing for no-transform RGB, RCT,
-and ICT paths.
+ICT, and float component-plane paths.
 
 `vk-j2k-dec vk-idwt53-smoke` runs `idwt53_1d.comp.spv` over multiple independent
 lines and validates the output against the CPU `inverse_5_3_1d` reference. The
@@ -110,8 +110,23 @@ It also chains three dispatches into a complete one-level 2D inverse 5/3 smoke:
 vertical low columns, vertical high columns, then horizontal rows, validated
 against the CPU `inverse_5_3_level` reference.
 
+`vk-j2k-dec vk-idwt97-smoke` runs the same row, column, and one-level 2D smoke
+shape against `idwt97_1d.comp.spv`, using float buffers and validating against
+the CPU `inverse_9_7_1d` and `inverse_9_7_level` references.
+
+The Vulkan backend now also exposes a component-level 9/7 reconstruction helper
+that mirrors the 5/3 backend shape and returns float component planes. CPU and
+GPU color packing both have float component-plane helpers for the no-transform
+and ICT cases. Real irreversible-frame decode still needs dequantized float
+subband planes and a validated sample before it should be treated as an
+end-to-end path.
+
+`vk-j2k-dec vk-irreversible-smoke` chains the synthetic irreversible pieces:
+three component-level 9/7 reconstructions feed GPU ICT/color packing, and the
+result is compared against CPU 9/7 plus CPU float RGB48 packing.
+
 `vk-j2k-dec dump <input.j2k>` also prints a DWT dispatch plan for supported
-5/3 codestreams. The current RGB12 sample produces 45 planned IDWT stages:
+5/3 and 9/7 codestreams. The current RGB12 5/3 sample produces 45 planned IDWT stages:
 vertical low columns, vertical high columns, then horizontal rows for each
 component and reconstruction level. This follows the CPU reference path: inverse
 vertical reconstruction of `LL/LH` and `HL/HH`, followed by inverse horizontal

@@ -1,5 +1,5 @@
 use crate::codestream::{SubbandKind, SubbandLayout, TileComponentLayout};
-use crate::dwt::{Band2D, PlaneI32, inverse_5_3_level};
+use crate::dwt::{Band2D, Band2DF32, PlaneF32, PlaneI32, inverse_5_3_level, inverse_9_7_level};
 use crate::tier1::{
     DecodedCodeblock, SubbandCoefficientPlane, Tier1BoundWorkPlan, Tier1DecodeError,
 };
@@ -165,6 +165,53 @@ impl ComponentSubbandPlanes {
         Ok(current)
     }
 
+    pub fn inverse_9_7(&self) -> Result<PlaneF32, Tier1DecodeError> {
+        let max_resolution = self
+            .planes
+            .iter()
+            .map(|plane| plane.resolution)
+            .max()
+            .unwrap_or(0);
+        self.inverse_9_7_until(max_resolution)
+    }
+
+    pub fn inverse_9_7_until(&self, max_resolution: u8) -> Result<PlaneF32, Tier1DecodeError> {
+        let mut current = plane_to_f32(
+            self.plane(0, SubbandKind::Ll)
+                .ok_or_else(|| Tier1DecodeError::new("missing resolution 0 LL plane"))?,
+        );
+        let available_max_resolution = self
+            .planes
+            .iter()
+            .map(|plane| plane.resolution)
+            .max()
+            .unwrap_or(0);
+        if max_resolution > available_max_resolution {
+            return Err(Tier1DecodeError::new(format!(
+                "requested resolution {max_resolution}, but component only has {available_max_resolution}"
+            )));
+        }
+
+        for resolution in 1..=max_resolution {
+            let hl = plane_to_f32(self.require_plane(resolution, SubbandKind::Hl)?);
+            let lh = plane_to_f32(self.require_plane(resolution, SubbandKind::Lh)?);
+            let hh = plane_to_f32(self.require_plane(resolution, SubbandKind::Hh)?);
+            current = inverse_9_7_level(
+                Band2DF32 {
+                    width: current.width,
+                    height: current.height,
+                    samples: &current.samples,
+                },
+                band_f32(&hl),
+                band_f32(&lh),
+                band_f32(&hh),
+            )
+            .map_err(|err| Tier1DecodeError::new(err.message))?;
+        }
+
+        Ok(current)
+    }
+
     fn require_plane(
         &self,
         resolution: u8,
@@ -194,11 +241,31 @@ fn plane_to_i32(plane: &SubbandCoefficientPlane) -> PlaneI32 {
     }
 }
 
+fn plane_to_f32(plane: &SubbandCoefficientPlane) -> PlaneF32 {
+    PlaneF32 {
+        width: plane.width,
+        height: plane.height,
+        samples: plane
+            .coefficients
+            .iter()
+            .map(|coefficient| *coefficient as f32)
+            .collect(),
+    }
+}
+
 fn band(plane: &SubbandCoefficientPlane) -> Band2D<'_> {
     Band2D {
         width: plane.width,
         height: plane.height,
         samples: &plane.coefficients,
+    }
+}
+
+fn band_f32(plane: &PlaneF32) -> Band2DF32<'_> {
+    Band2DF32 {
+        width: plane.width,
+        height: plane.height,
+        samples: &plane.samples,
     }
 }
 
@@ -421,6 +488,158 @@ mod tests {
             vec![
                 -2, 1, -8, 0, 16, 4, 7, 3, 4, 10, -2, -1, -1, 8, 10, -4, 7, 9, 7, 4
             ]
+        );
+    }
+
+    #[test]
+    fn reconstructs_component_plane_from_one_9_7_level() {
+        let mut component = one_level_component();
+
+        set_plane(&mut component, 0, SubbandKind::Ll, vec![4, -3, 12, 1, 5, 9]);
+        set_plane(&mut component, 1, SubbandKind::Hl, vec![7, -5, 2, 3]);
+        set_plane(
+            &mut component,
+            1,
+            SubbandKind::Lh,
+            vec![6, 8, -4, 0, 11, -7],
+        );
+        set_plane(&mut component, 1, SubbandKind::Hh, vec![1, -2, 4, -3]);
+
+        let plane = component.inverse_9_7().expect("inverse");
+
+        assert_eq!(plane.width, 5);
+        assert_eq!(plane.height, 4);
+        assert_f32_slices_close(
+            &plane.samples,
+            &[
+                -4.4902697,
+                -0.65487915,
+                -7.339456,
+                -0.48657295,
+                10.977664,
+                1.3847177,
+                7.50584,
+                3.533594,
+                1.0696449,
+                5.0084,
+                0.011556479,
+                -3.2508037,
+                -4.2915163,
+                6.1909294,
+                4.2609515,
+                -4.837547,
+                7.402795,
+                7.862847,
+                4.539947,
+                -1.3311605,
+            ],
+        );
+        assert_f32_close(plane.sample(4, 3).unwrap(), -1.3311605);
+        assert_eq!(plane.sample(5, 3), None);
+    }
+
+    #[test]
+    fn inverse_9_7_until_rejects_unavailable_resolution() {
+        let component = one_level_component();
+
+        let err = component
+            .inverse_9_7_until(2)
+            .expect_err("resolution must be unavailable");
+
+        assert!(err.message.contains("requested resolution 2"));
+    }
+
+    fn one_level_component() -> ComponentSubbandPlanes {
+        let component_layout = TileComponentLayout {
+            width: 5,
+            height: 4,
+            resolutions: vec![
+                ResolutionLayout {
+                    level: 0,
+                    width: 3,
+                    height: 2,
+                    precincts_x: 1,
+                    precincts_y: 1,
+                    subbands: vec![SubbandLayout {
+                        kind: SubbandKind::Ll,
+                        width: 3,
+                        height: 2,
+                        codeblock_width: 3,
+                        codeblock_height: 2,
+                        codeblocks_x: 1,
+                        codeblocks_y: 1,
+                    }],
+                },
+                ResolutionLayout {
+                    level: 1,
+                    width: 5,
+                    height: 4,
+                    precincts_x: 1,
+                    precincts_y: 1,
+                    subbands: vec![
+                        SubbandLayout {
+                            kind: SubbandKind::Hl,
+                            width: 2,
+                            height: 2,
+                            codeblock_width: 2,
+                            codeblock_height: 2,
+                            codeblocks_x: 1,
+                            codeblocks_y: 1,
+                        },
+                        SubbandLayout {
+                            kind: SubbandKind::Lh,
+                            width: 3,
+                            height: 2,
+                            codeblock_width: 3,
+                            codeblock_height: 2,
+                            codeblocks_x: 1,
+                            codeblocks_y: 1,
+                        },
+                        SubbandLayout {
+                            kind: SubbandKind::Hh,
+                            width: 2,
+                            height: 2,
+                            codeblock_width: 2,
+                            codeblock_height: 2,
+                            codeblocks_x: 1,
+                            codeblocks_y: 1,
+                        },
+                    ],
+                },
+            ],
+        };
+        ComponentSubbandPlanes::new(0, &component_layout).expect("component")
+    }
+
+    fn set_plane(
+        component: &mut ComponentSubbandPlanes,
+        resolution: u8,
+        subband: SubbandKind,
+        coefficients: Vec<i32>,
+    ) {
+        component
+            .planes
+            .iter_mut()
+            .find(|plane| plane.resolution == resolution && plane.layout.kind == subband)
+            .expect("plane")
+            .plane
+            .coefficients = coefficients;
+    }
+
+    fn assert_f32_slices_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.0001,
+                "sample {index}: got {actual}, expected {expected}"
+            );
+        }
+    }
+
+    fn assert_f32_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= 0.0001,
+            "got {actual}, expected {expected}"
         );
     }
 }
