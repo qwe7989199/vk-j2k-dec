@@ -177,6 +177,20 @@ diff-rgb48: samples 6120, differing 0, max_abs 0 at sample 0, mean_abs 0.0000000
 
 This is a live correctness baseline, not a pass condition yet.
 
+Current local low-resolution sweep after exact reversible Tier-1 reconstruction:
+
+| discard | output | differing samples | max_abs | mean_abs |
+| --- | --- | ---: | ---: | ---: |
+| 5 | 60x34 | 0 | 0 | 0.000000000000 |
+| 4 | 120x68 | 1414 | 32 | 0.941830065359 |
+| 3 | 240x135 | 7159 | 48 | 1.237695473251 |
+| 2 | 480x270 | 30761 | 48 | 1.351522633745 |
+| 1 | 960x540 | 130649 | 80 | 1.446347736626 |
+| 0 | 1920x1080 | 533125 | 80 | 1.479717078189 |
+
+The LL-only path is now exact, and the first remaining error appears when the
+first high-frequency 5/3 reconstruction level is included.
+
 Irreversible 9/7 codestreams now have a high-level CPU decode route for QCD
 scalar-expounded and scalar-derived quantization: steps are converted to float
 subband scales, then fed through CPU 9/7 reconstruction and float RGB48 packing.
