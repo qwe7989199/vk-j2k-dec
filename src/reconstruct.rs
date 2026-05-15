@@ -4,7 +4,8 @@ use crate::codestream::{
 };
 use crate::dwt::{Band2D, Band2DF32, PlaneF32, PlaneI32, inverse_5_3_level, inverse_9_7_level};
 use crate::tier1::{
-    DecodedCodeblock, SubbandCoefficientPlane, Tier1BoundWorkPlan, Tier1DecodeError,
+    CoefficientReconstruction, DecodedCodeblock, SubbandCoefficientPlane, Tier1BoundWorkPlan,
+    Tier1DecodeError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,20 @@ impl TileCoefficientPlanes {
         work_plan: &Tier1BoundWorkPlan<'_>,
         codeblock_style: crate::codestream::CodeblockStyle,
     ) -> Result<Self, Tier1DecodeError> {
+        Self::decode_arithmetic_with_reconstruction(
+            component_layouts,
+            work_plan,
+            codeblock_style,
+            CoefficientReconstruction::Midpoint,
+        )
+    }
+
+    pub fn decode_arithmetic_with_reconstruction(
+        component_layouts: &[TileComponentLayout],
+        work_plan: &Tier1BoundWorkPlan<'_>,
+        codeblock_style: crate::codestream::CodeblockStyle,
+        reconstruction: CoefficientReconstruction,
+    ) -> Result<Self, Tier1DecodeError> {
         let mut components = component_layouts
             .iter()
             .enumerate()
@@ -31,7 +46,8 @@ impl TileCoefficientPlanes {
         let mut nonzero_coefficients = 0usize;
 
         for codeblock in &work_plan.codeblocks {
-            let decoded = codeblock.decode_arithmetic_passes(codeblock_style)?;
+            let decoded = codeblock
+                .decode_arithmetic_passes_with_reconstruction(codeblock_style, reconstruction)?;
             let component = components
                 .get_mut(decoded.id.component as usize)
                 .ok_or_else(|| {

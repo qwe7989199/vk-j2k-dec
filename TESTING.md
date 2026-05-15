@@ -150,12 +150,13 @@ writing raw `rgb48le`.
 
 Current local full-resolution diff against FFmpeg after MQ context
 initialization, QCD-derived bitplane scheduling, corrected MQ MPS exchange,
-Tier-1 half-bin coefficient reconstruction, and high-bit `rgb48le` packing:
+exact reversible Tier-1 coefficient reconstruction, and high-bit `rgb48le`
+packing:
 
 ```text
-diff-rgb48: samples 6220800, differing 1995314, max_abs 96 at sample 4682877, mean_abs 5.871877572016
-  channel_diff R=732047 G=788492 B=474775
-  channel_mean R=6.490995370370 G=6.690015432099 B=4.434621913580
+diff-rgb48: samples 6220800, differing 533125, max_abs 80 at sample 1417778, mean_abs 1.479717078189
+  channel_diff R=215703 G=160041 B=157381
+  channel_mean R=1.779521604938 G=1.337168209877 B=1.322461419753
 ```
 
 The low-resolution LL-only path helps isolate Tier-1 from inverse DWT:
@@ -169,9 +170,9 @@ cargo run -- diff-rgb48 target\samples\ours_frame0_rgb48le_lowres5.raw target\sa
 Current local lowres-5 diff:
 
 ```text
-diff-rgb48: samples 6120, differing 1298, max_abs 16 at sample 34, mean_abs 3.393464052288
-  channel_diff R=434 G=590 B=274
-  channel_mean R=3.403921568627 G=4.627450980392 B=2.149019607843
+diff-rgb48: samples 6120, differing 0, max_abs 0 at sample 0, mean_abs 0.000000000000
+  channel_diff R=0 G=0 B=0
+  channel_mean R=0.000000000000 G=0.000000000000 B=0.000000000000
 ```
 
 This is a live correctness baseline, not a pass condition yet.
@@ -201,9 +202,9 @@ diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0, mean_abs 0.0000
 GPU-DWT vs FFmpeg currently has the same diff as CPU-DWT vs FFmpeg:
 
 ```text
-diff-rgb48: samples 6220800, differing 1995314, max_abs 96 at sample 4682877, mean_abs 5.871877572016
-  channel_diff R=732047 G=788492 B=474775
-  channel_mean R=6.490995370370 G=6.690015432099 B=4.434621913580
+diff-rgb48: samples 6220800, differing 533125, max_abs 80 at sample 1417778, mean_abs 1.479717078189
+  channel_diff R=215703 G=160041 B=157381
+  channel_mean R=1.779521604938 G=1.337168209877 B=1.322461419753
 ```
 
 The real-frame GPU DWT plus GPU color/packing path is exposed through:

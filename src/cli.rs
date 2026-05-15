@@ -2,11 +2,11 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-use vk_j2k_dec::codestream::{Codestream, scan_codestreams};
+use vk_j2k_dec::codestream::{Codestream, WaveletTransform, scan_codestreams};
 use vk_j2k_dec::gpu::{GpuDwtDispatchPlan, GpuPipelinePlan};
 use vk_j2k_dec::packet::{TilePacketHeaderState, parse_lrcp_tile_packets};
 use vk_j2k_dec::reconstruct::TileCoefficientPlanes;
-use vk_j2k_dec::tier1::Tier1WorkPlan;
+use vk_j2k_dec::tier1::{CoefficientReconstruction, Tier1WorkPlan};
 
 mod raw;
 mod scan;
@@ -269,10 +269,11 @@ fn reconstruct_smoke(path: &str) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let planes = match TileCoefficientPlanes::decode_arithmetic(
+        let planes = match TileCoefficientPlanes::decode_arithmetic_with_reconstruction(
             &layout.components,
             &bound,
             cod.codeblock_style_flags(),
+            coefficient_reconstruction_for_transform(cod.transform),
         ) {
             Ok(planes) => planes,
             Err(err) => {
@@ -433,7 +434,10 @@ fn tier1_smoke(path: &str, max_codeblocks: usize) -> ExitCode {
             if decoded_codeblocks >= max_codeblocks {
                 break;
             }
-            let decoded = match codeblock.decode_arithmetic_passes(cod.codeblock_style_flags()) {
+            let decoded = match codeblock.decode_arithmetic_passes_with_reconstruction(
+                cod.codeblock_style_flags(),
+                coefficient_reconstruction_for_transform(cod.transform),
+            ) {
                 Ok(decoded) => decoded,
                 Err(err) => {
                     eprintln!("tier1 smoke: codeblock {:?} failed: {err}", codeblock.id);
@@ -467,6 +471,17 @@ fn tier1_smoke(path: &str, max_codeblocks: usize) -> ExitCode {
         decoded_codeblocks, decoded_passes, nonzero_coefficients, consumed_bytes, source_bytes
     );
     ExitCode::SUCCESS
+}
+
+fn coefficient_reconstruction_for_transform(
+    transform: WaveletTransform,
+) -> CoefficientReconstruction {
+    match transform {
+        WaveletTransform::Reversible53 => CoefficientReconstruction::Exact,
+        WaveletTransform::Irreversible97 | WaveletTransform::Unknown(_) => {
+            CoefficientReconstruction::Midpoint
+        }
+    }
 }
 
 fn dump_codestream(path: &str) -> ExitCode {

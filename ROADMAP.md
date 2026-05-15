@@ -46,6 +46,7 @@ The repository can start as one crate while the data model is still changing. Sp
 - Decode codeblock bitstreams with a CPU Tier-1 path.
 - Build coefficient planes per component and subband.
 - Add CPU inverse DWT 5/3 and 9/7 reference implementations. Done for one-level references.
+- Split Tier-1 coefficient reconstruction into exact reversible output and midpoint irreversible output. Done; the local lowres-5 reversible baseline now matches FFmpeg exactly.
 - Compare decoded output against OpenJPEG.
 
 ### v0.3: Vulkan setup and buffer model
@@ -101,7 +102,7 @@ DCP-o-matic is a promising downstream target because JPEG 2000 decode performanc
 
 ## Immediate tasks
 
-- Continue CPU Tier-1: implement significance propagation, cleanup, magnitude refinement, and sign contexts on top of the MQ decoder.
+- Continue CPU Tier-1: significance propagation, cleanup, magnitude refinement, sign contexts, and exact reversible coefficient reconstruction are in place; remaining work is full-resolution differential cleanup against FFmpeg/OpenJPEG.
 - Build coefficient planes from decoded codeblocks and feed the CPU/GPU reconstruction path.
 - Add irreversible 9/7 CPU reference and Vulkan smoke shader. Done.
 - Wire irreversible 9/7 into the high-level CPU decode path. Done for QCD scalar-expounded and scalar-derived codestreams; QCC overrides and corpus validation still need implementation.

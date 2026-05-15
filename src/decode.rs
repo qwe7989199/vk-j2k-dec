@@ -8,7 +8,7 @@ use crate::packet::parse_lrcp_tile_packets;
 use crate::reconstruct::{
     ComponentFloatSubbandPlanes, ComponentSubbandPlanes, TileCoefficientPlanes,
 };
-use crate::tier1::Tier1WorkPlan;
+use crate::tier1::{CoefficientReconstruction, Tier1WorkPlan};
 use crate::vulkan::{
     run_color_components, run_color_float_components, run_idwt53_components,
     run_idwt97_float_components,
@@ -180,10 +180,11 @@ fn decode_rgb48_with_backends(
     let bound = work_plan
         .bind_segment_data(tile_data)
         .map_err(|err| DecodeError::new(err.to_string()))?;
-    let coefficient_planes = TileCoefficientPlanes::decode_arithmetic(
+    let coefficient_planes = TileCoefficientPlanes::decode_arithmetic_with_reconstruction(
         &layout.components,
         &bound,
         cod.codeblock_style_flags(),
+        coefficient_reconstruction_for_transform(cod.transform),
     )
     .map_err(|err| DecodeError::new(err.to_string()))?;
 
@@ -539,6 +540,17 @@ fn gpu_color_transform_value(
         (other, _) => Err(DecodeError::new(format!(
             "unsupported multiple component transform {other}"
         ))),
+    }
+}
+
+fn coefficient_reconstruction_for_transform(
+    transform: WaveletTransform,
+) -> CoefficientReconstruction {
+    match transform {
+        WaveletTransform::Reversible53 => CoefficientReconstruction::Exact,
+        WaveletTransform::Irreversible97 | WaveletTransform::Unknown(_) => {
+            CoefficientReconstruction::Midpoint
+        }
     }
 }
 

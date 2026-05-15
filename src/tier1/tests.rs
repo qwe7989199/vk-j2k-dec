@@ -582,6 +582,44 @@ mod tests {
     }
 
     #[test]
+    fn exact_reconstruction_tracks_decoded_bits_without_half_bin() {
+        let input = CompressedCodeblock {
+            id: CodeblockId {
+                component: 0,
+                resolution: 1,
+                subband: SubbandKind::Hh,
+                codeblock_x: 0,
+                codeblock_y: 0,
+            },
+            width: 4,
+            height: 4,
+            magnitude_bitplanes: 8,
+            zero_bit_planes: 0,
+            segments: Vec::new(),
+        };
+        let mut decoded =
+            DecodedCodeblock::new_with_reconstruction(&input, CoefficientReconstruction::Exact)
+                .expect("decoded block");
+
+        decoded
+            .apply_significance_decision(2, 2, 5, true, Some(true))
+            .expect("significant");
+        assert_eq!(decoded.coefficient(2, 2), Some(-32));
+
+        decoded.state.clear_bitplane_visits();
+        decoded
+            .apply_magnitude_refinement_bit(2, 2, 4, false)
+            .expect("zero refinement");
+        assert_eq!(decoded.coefficient(2, 2), Some(-32));
+
+        decoded.state.clear_bitplane_visits();
+        decoded
+            .apply_magnitude_refinement_bit(2, 2, 3, true)
+            .expect("one refinement");
+        assert_eq!(decoded.coefficient(2, 2), Some(-40));
+    }
+
+    #[test]
     fn decode_pass_applies_scripted_cleanup_and_refinement_bits() {
         let input = CompressedCodeblock {
             id: CodeblockId {
@@ -680,6 +718,14 @@ mod tests {
         assert_eq!(decoded.decoded_passes, 1);
         assert_eq!(decoded.coefficient(0, 0), Some(191));
         assert_eq!(decoded.state.is_visited_in_bitplane(0, 0), Some(true));
+
+        let exact = bound
+            .decode_arithmetic_passes_with_reconstruction(
+                CodeblockStyle::from_raw(0),
+                CoefficientReconstruction::Exact,
+            )
+            .expect("exact decode");
+        assert_eq!(exact.coefficient(0, 0), Some(128));
     }
 
     #[test]

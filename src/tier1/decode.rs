@@ -5,6 +5,7 @@ pub struct DecodedCodeblock {
     pub height: u32,
     pub coefficients: Vec<i32>,
     pub state: CodeblockStatePlanes,
+    pub reconstruction: CoefficientReconstruction,
     pub decoded_passes: u32,
     pub source_bytes: usize,
     pub decoder_bytes_consumed: usize,
@@ -23,6 +24,12 @@ pub struct SubbandCoefficientPlane {
     pub width: u32,
     pub height: u32,
     pub coefficients: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoefficientReconstruction {
+    Exact,
+    Midpoint,
 }
 
 impl SubbandCoefficientPlane {
@@ -102,6 +109,13 @@ impl Tier1DecodeResult {
 
 impl DecodedCodeblock {
     pub fn new(input: &CompressedCodeblock) -> Result<Self, Tier1DecodeError> {
+        Self::new_with_reconstruction(input, CoefficientReconstruction::Midpoint)
+    }
+
+    pub fn new_with_reconstruction(
+        input: &CompressedCodeblock,
+        reconstruction: CoefficientReconstruction,
+    ) -> Result<Self, Tier1DecodeError> {
         let sample_count = checked_sample_count(input.width, input.height)?;
         Ok(Self {
             id: input.id,
@@ -109,6 +123,7 @@ impl DecodedCodeblock {
             height: input.height,
             coefficients: vec![0; sample_count],
             state: CodeblockStatePlanes::new(input.width, input.height)?,
+            reconstruction,
             decoded_passes: 0,
             source_bytes: 0,
             decoder_bytes_consumed: 0,
@@ -116,6 +131,13 @@ impl DecodedCodeblock {
     }
 
     pub fn new_bound(input: &BoundCompressedCodeblock<'_>) -> Result<Self, Tier1DecodeError> {
+        Self::new_bound_with_reconstruction(input, CoefficientReconstruction::Midpoint)
+    }
+
+    pub fn new_bound_with_reconstruction(
+        input: &BoundCompressedCodeblock<'_>,
+        reconstruction: CoefficientReconstruction,
+    ) -> Result<Self, Tier1DecodeError> {
         let sample_count = checked_sample_count(input.width, input.height)?;
         Ok(Self {
             id: input.id,
@@ -123,6 +145,7 @@ impl DecodedCodeblock {
             height: input.height,
             coefficients: vec![0; sample_count],
             state: CodeblockStatePlanes::new(input.width, input.height)?,
+            reconstruction,
             decoded_passes: 0,
             source_bytes: input.total_bytes(),
             decoder_bytes_consumed: 0,
@@ -166,7 +189,8 @@ impl DecodedCodeblock {
         let is_negative = is_negative.ok_or_else(|| {
             Tier1DecodeError::new("significant coefficient decision is missing sign bit")
         })?;
-        let magnitude = significance_reconstruction_magnitude(self.id, bitplane)?;
+        let magnitude =
+            significance_reconstruction_magnitude(self.id, bitplane, self.reconstruction)?;
         let value = if is_negative { -magnitude } else { magnitude };
         self.set_coefficient(x, y, value)?;
         self.state.mark_significant(x, y, is_negative)
@@ -191,12 +215,13 @@ impl DecodedCodeblock {
             )));
         }
 
-        let poshalf = coefficient_positive_half(bitplane)?;
+        let magnitude_delta =
+            refinement_reconstruction_delta(bitplane, bit, self.reconstruction)?;
         let current = self.coefficients[index];
-        let delta = if bit ^ (current < 0) {
-            poshalf
+        let delta = if current < 0 {
+            -magnitude_delta
         } else {
-            -poshalf
+            magnitude_delta
         };
         self.coefficients[index] = current.checked_add(delta).ok_or_else(|| {
             Tier1DecodeError::new(format!("coefficient refinement overflow at {x},{y}"))
@@ -489,6 +514,17 @@ impl BoundCompressedCodeblock<'_> {
         &self,
         codeblock_style: CodeblockStyle,
     ) -> Result<DecodedCodeblock, Tier1DecodeError> {
+        self.decode_arithmetic_passes_with_reconstruction(
+            codeblock_style,
+            CoefficientReconstruction::Midpoint,
+        )
+    }
+
+    pub fn decode_arithmetic_passes_with_reconstruction(
+        &self,
+        codeblock_style: CodeblockStyle,
+        reconstruction: CoefficientReconstruction,
+    ) -> Result<DecodedCodeblock, Tier1DecodeError> {
         let execution = self.execution_plan(codeblock_style)?;
         if let Some(raw_pass) = execution
             .passes
@@ -506,7 +542,7 @@ impl BoundCompressedCodeblock<'_> {
             data.extend_from_slice(segment.data);
         }
 
-        let mut decoded = DecodedCodeblock::new_bound(self)?;
+        let mut decoded = DecodedCodeblock::new_bound_with_reconstruction(self, reconstruction)?;
         let mut mq = MqDecoder::with_data(&data);
         for pass in execution.passes {
             decoded.decode_pass(pass.pass, &mut mq)?;
@@ -521,10 +557,22 @@ impl Tier1BoundWorkPlan<'_> {
         &self,
         codeblock_style: CodeblockStyle,
     ) -> Result<Tier1DecodeResult, Tier1DecodeError> {
+        self.decode_arithmetic_passes_with_reconstruction(
+            codeblock_style,
+            CoefficientReconstruction::Midpoint,
+        )
+    }
+
+    pub fn decode_arithmetic_passes_with_reconstruction(
+        &self,
+        codeblock_style: CodeblockStyle,
+        reconstruction: CoefficientReconstruction,
+    ) -> Result<Tier1DecodeResult, Tier1DecodeError> {
         let mut codeblocks = Vec::with_capacity(self.codeblocks.len());
         let mut decoded_passes = 0;
         for codeblock in &self.codeblocks {
-            let decoded = codeblock.decode_arithmetic_passes(codeblock_style)?;
+            let decoded =
+                codeblock.decode_arithmetic_passes_with_reconstruction(codeblock_style, reconstruction)?;
             decoded_passes += decoded.decoded_passes;
             codeblocks.push(decoded);
         }
@@ -841,19 +889,45 @@ fn coefficient_one_plus_half(bitplane: i32) -> Result<i32, Tier1DecodeError> {
 fn significance_reconstruction_magnitude(
     codeblock: CodeblockId,
     bitplane: i32,
+    reconstruction: CoefficientReconstruction,
 ) -> Result<i32, Tier1DecodeError> {
-    let magnitude = coefficient_one_plus_half(bitplane)?;
-    if codeblock.resolution == 0 && codeblock.subband == SubbandKind::Ll {
-        // FFmpeg's reversible path lands one integer below the generic half-bin
-        // midpoint for the LL band. Keep the compatibility adjustment isolated
-        // until the dequantization staging is modeled explicitly.
-        return Ok(magnitude.saturating_sub(1));
+    match reconstruction {
+        CoefficientReconstruction::Exact => coefficient_bit_value(bitplane),
+        CoefficientReconstruction::Midpoint => {
+            let magnitude = coefficient_one_plus_half(bitplane)?;
+            if codeblock.resolution == 0 && codeblock.subband == SubbandKind::Ll {
+                // FFmpeg's reversible path lands one integer below the generic half-bin
+                // midpoint for the LL band. Keep the compatibility adjustment isolated
+                // until the dequantization staging is modeled explicitly.
+                return Ok(magnitude.saturating_sub(1));
+            }
+            Ok(magnitude)
+        }
     }
-    Ok(magnitude)
 }
 
 fn coefficient_positive_half(bitplane: i32) -> Result<i32, Tier1DecodeError> {
     Ok(coefficient_bit_value(bitplane)? >> 1)
+}
+
+fn refinement_reconstruction_delta(
+    bitplane: i32,
+    bit: bool,
+    reconstruction: CoefficientReconstruction,
+) -> Result<i32, Tier1DecodeError> {
+    match reconstruction {
+        CoefficientReconstruction::Exact => {
+            if bit {
+                coefficient_bit_value(bitplane)
+            } else {
+                Ok(0)
+            }
+        }
+        CoefficientReconstruction::Midpoint => {
+            let poshalf = coefficient_positive_half(bitplane)?;
+            if bit { Ok(poshalf) } else { Ok(-poshalf) }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
