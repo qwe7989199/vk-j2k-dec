@@ -1,0 +1,114 @@
+# vk-j2k-dec roadmap
+
+`vk-j2k-dec` aims to become a Rust JPEG 2000 decoder with Vulkan compute acceleration for the stages that are naturally GPU-friendly. The first useful target is not a complete ISO 15444 implementation. It is a correct, measurable, open decoder for common 3-component codestreams, especially the kind of material found in DCP, broadcast, scanning, and archival workflows.
+
+## Project shape
+
+- CPU handles container, codestream, tile, packet, and codeblock metadata parsing.
+- CPU keeps Tier-1 codeblock decoding in the first production path.
+- Vulkan compute handles dequantization, inverse DWT, inverse color transform, level shift, and final packing.
+- The decoder should remain usable without Vulkan through a CPU fallback path.
+- The public API should be designed so a C ABI wrapper can be added later.
+
+## First supported profile
+
+- Raw `.j2k` / `.j2c` codestream first, `.jp2` later.
+- 3 components.
+- 8, 10, 12, and 16-bit samples.
+- Reversible 5/3 and irreversible 9/7 wavelet transforms.
+- Common progression orders, with LRCP as the first target.
+- RCT and ICT color transforms.
+- No exotic ROI in the first implementation.
+- No JPIP, JPWL, or error resilience features in the first implementation.
+
+## Crate layout target
+
+- `j2k-codestream`: marker, tile, packet, precinct, and codeblock parsing.
+- `j2k-tier1`: CPU EBCOT Tier-1 codeblock decoder.
+- `j2k-dwt`: CPU reference inverse DWT implementation.
+- `j2k-vk`: Vulkan compute backend.
+- `vk-j2k-dec`: high-level decoder API and CLI tools.
+
+The repository can start as one crate while the data model is still changing. Split crates only once module boundaries become stable.
+
+## Milestones
+
+### v0.1: codestream inspection
+
+- Parse `SOC`, `SIZ`, `COD`, `QCD`, `SOT`, `SOD`, and `EOC`.
+- Dump image size, tile grid, component precision, progression order, layer count, transform type, and tile-part metadata.
+- Add structured parse errors with byte offsets.
+- Add fixtures for minimal valid and invalid codestreams.
+
+### v0.2: CPU reference decode path
+
+- Parse packet headers for the initial supported profile.
+- Decode codeblock bitstreams with a CPU Tier-1 path.
+- Build coefficient planes per component and subband.
+- Add CPU inverse DWT 5/3 and 9/7 reference implementations.
+- Compare decoded output against OpenJPEG.
+
+### v0.3: Vulkan setup and buffer model
+
+- Add Vulkan device/context selection. Done for the local dynamic-loader path.
+- Define GPU buffer layouts for coefficient planes and output planes.
+- Implement dequantization compute shaders. Initial storage-buffer smoke is working.
+- Implement color conversion compute shaders. No-transform, RCT, and ICT smoke paths are working.
+- Keep readback simple and explicit.
+
+### v0.4: Vulkan inverse DWT
+
+- Implement inverse 5/3 lifting in compute. Initial 1D, strided column, and one-level 2D smoke paths are working.
+- Implement inverse 9/7 lifting in compute.
+- Validate against the CPU reference path.
+- Benchmark tile sizes, workgroup shapes, and memory layouts.
+
+### v0.5: DCP-focused fast path
+
+- Optimize 3-component 12-bit XYZ output.
+- Add DCP profile validation helpers.
+- Measure 2K and 4K frame throughput.
+- Overlap CPU Tier-1 work, GPU transfer, and GPU reconstruction.
+
+### v0.6: integration prototypes
+
+- Add a stable C ABI wrapper.
+- Build a simple FFmpeg integration experiment outside the FFmpeg tree.
+- Build a DCP-o-matic integration experiment or replacement decode path.
+- Document integration constraints and licensing decisions.
+
+## Longer-term work
+
+- GPU Tier-1 codeblock decoding experiments.
+- Multi-tile scheduling and asynchronous transfer queues.
+- Direct Vulkan image output to avoid CPU readback.
+- SIMD CPU fallback for Tier-1 and DWT.
+- JP2 container support.
+- 1-component, 4-component, alpha, and unusual component sampling support.
+- More progression orders and more codestream edge cases.
+- Fuzzing for marker, tile-part, packet, and codeblock parsers.
+- Conformance corpus and differential tests against OpenJPEG.
+- Optional backends such as Metal, CUDA, or OpenCL if there is a real downstream need.
+
+## Upstream strategy
+
+FFmpeg integration is easier to evaluate after the decoder has a stable C ABI and a proven benchmark story. FFmpeg's core codebase is C and has strict development policy, style, memory allocation, and API compatibility requirements, so an external Rust library is likely the best first step.
+
+DCP-o-matic is a promising downstream target because JPEG 2000 decode performance matters directly for DCP workflows. A DCP-focused fast path and clear comparison against OpenJPEG/Grok-style workflows should make the project easier to evaluate.
+
+## Immediate tasks
+
+- Continue CPU Tier-1: implement significance propagation, cleanup, magnitude refinement, and sign contexts on top of the MQ decoder.
+- Build coefficient planes from decoded codeblocks and feed the CPU/GPU reconstruction path.
+- Add irreversible 9/7 CPU reference and Vulkan smoke shader.
+- Turn the Vulkan smoke helpers into a reusable reconstruction backend with persistent pipelines and buffers.
+- Add a frame-level compare path against FFmpeg/OpenJPEG output once Tier-1 is producing coefficients.
+- Build a `dump` CLI for codestream headers. Done.
+- Parse and print `SIZ`, `COD`, `QCD`, and `SOT`. Done.
+- Scan MXF/container files for embedded JPEG 2000 codestreams for early validation. Done for the local MXF sample.
+- Track tile-part payload ranges and LRCP packet iteration order. Done for the first profile path.
+- Add packet-header bitstream helpers with JPEG 2000 byte stuffing. Done.
+- Add tag-tree, codeblock packet-header state, and first-profile LRCP packet parsing. Done for the local sample.
+- Add unit tests with tiny synthetic codestreams. Ongoing.
+- Add a reference corpus directory once real sample files are available.
+- Decide the license before accepting outside contributions.
