@@ -154,6 +154,28 @@ pub fn run() -> ExitCode {
             };
             raw::dump_coeff_plane_file(&path, component, resolution, &subband, &output)
         }
+        (Some("dump-component-plane"), Some(path)) => {
+            let Some(component) = args.next().and_then(|value| value.parse::<usize>().ok()) else {
+                eprintln!(
+                    "usage: {program} dump-component-plane <input.j2k> <component> <discard-levels> <output.i32le>"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(discard_levels) = args.next().and_then(|value| value.parse::<u8>().ok())
+            else {
+                eprintln!(
+                    "usage: {program} dump-component-plane <input.j2k> <component> <discard-levels> <output.i32le>"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(output) = args.next() else {
+                eprintln!(
+                    "usage: {program} dump-component-plane <input.j2k> <component> <discard-levels> <output.i32le>"
+                );
+                return ExitCode::FAILURE;
+            };
+            raw::dump_component_plane_file(&path, component, discard_levels, &output)
+        }
         (Some("vk-info"), _) => vulkan::print_vulkan_info(),
         (Some("vk-smoke"), shader_path) => vulkan::run_vulkan_smoke(
             shader_path
@@ -205,6 +227,9 @@ pub fn run() -> ExitCode {
             eprintln!("  {program} diff-rgb48 <actual.rgb48le> <reference.rgb48le>");
             eprintln!(
                 "  {program} dump-coeff-plane <input.j2k> <component> <resolution> <LL|HL|LH|HH> <output.i32le>"
+            );
+            eprintln!(
+                "  {program} dump-component-plane <input.j2k> <component> <discard-levels> <output.i32le>"
             );
             eprintln!("  {program} vk-info");
             eprintln!("  {program} vk-smoke [dequant.comp.spv]");

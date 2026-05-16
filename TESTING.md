@@ -242,6 +242,24 @@ C2 R1 LH: 1 cblk, 708 bytes, consumed 708, 37 passes, zbp 1..1, mbp 14..14, size
 C2 R1 HH: 1 cblk, 452 bytes, consumed 452, 37 passes, zbp 2..2, mbp 15..15, size 60..60 x 34..34, 318 nonzero
 ```
 
+Post-DWT reversible component planes can also be dumped before level shift,
+clamping, and `rgb48le` packing:
+
+```text
+cargo run -- dump-component-plane target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 2 4 target\samples\ours_c2_lowres4.i32le
+```
+
+Current local component-2 lowres-4 result:
+
+```text
+dump-component-plane: component 2 120x68 12-bit discard 4, 8160 samples, 8160 nonzero, min -3161, max 3300
+```
+
+The component plane exceeds the signed 12-bit level-shift display range
+(-2048..2047), so raw RGB diffs include many clamped samples. Comparing only
+unclipped component-2 samples recoverable from FFmpeg's `rgb48le` output leaves
+387 / 4979 differing samples with component deltas in -2..2.
+
 Irreversible 9/7 codestreams now have a high-level CPU decode route for QCD
 scalar-expounded and scalar-derived quantization: steps are converted to float
 subband scales, then fed through CPU 9/7 reconstruction and float RGB48 packing.

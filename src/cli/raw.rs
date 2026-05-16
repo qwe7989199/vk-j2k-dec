@@ -3,8 +3,8 @@ use std::process::ExitCode;
 
 use vk_j2k_dec::codestream::SubbandKind;
 use vk_j2k_dec::decode::{
-    decode_coefficient_planes, decode_rgb48_with_discard, decode_rgb48_with_gpu_dwt,
-    decode_rgb48_with_gpu_pipeline,
+    decode_coefficient_planes, decode_reversible_component_planes_with_discard,
+    decode_rgb48_with_discard, decode_rgb48_with_gpu_dwt, decode_rgb48_with_gpu_pipeline,
 };
 
 pub fn decode_rgb48_file(input: &str, output: &str) -> ExitCode {
@@ -230,6 +230,56 @@ pub fn dump_coeff_plane_file(
         plane.width,
         plane.height,
         plane.coefficients.len(),
+        nonzero,
+        min,
+        max
+    );
+    ExitCode::SUCCESS
+}
+
+pub fn dump_component_plane_file(
+    input: &str,
+    component: usize,
+    discard_levels: u8,
+    output: &str,
+) -> ExitCode {
+    let data = match fs::read(input) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("failed to read {input}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let planes = match decode_reversible_component_planes_with_discard(&data, discard_levels) {
+        Ok(planes) => planes,
+        Err(err) => {
+            eprintln!("dump-component-plane failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(plane) = planes.components.get(component) else {
+        eprintln!("dump-component-plane failed: missing component {component}");
+        return ExitCode::FAILURE;
+    };
+
+    let mut bytes = Vec::with_capacity(plane.samples.len() * 4);
+    for sample in &plane.samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    if let Err(err) = fs::write(output, bytes) {
+        eprintln!("failed to write {output}: {err}");
+        return ExitCode::FAILURE;
+    }
+    let nonzero = plane.samples.iter().filter(|sample| **sample != 0).count();
+    let min = plane.samples.iter().min().copied().unwrap_or(0);
+    let max = plane.samples.iter().max().copied().unwrap_or(0);
+    println!(
+        "dump-component-plane: component {component} {}x{} {}-bit discard {}, {} samples, {} nonzero, min {}, max {} -> {output}",
+        plane.width,
+        plane.height,
+        planes.precision,
+        discard_levels,
+        plane.samples.len(),
         nonzero,
         min,
         max
