@@ -22,6 +22,14 @@ pub struct DecodedRgb48 {
     pub samples: Vec<u16>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedCoefficientPlanes {
+    pub components: Vec<ComponentSubbandPlanes>,
+    pub decoded_codeblocks: usize,
+    pub decoded_passes: u32,
+    pub nonzero_coefficients: usize,
+}
+
 impl DecodedRgb48 {
     pub fn to_le_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(self.samples.len() * 2);
@@ -97,6 +105,55 @@ pub fn decode_rgb48_with_gpu_pipeline(
         DwtBackend::Gpu { idwt53_shader_path },
         ColorBackend::Gpu { color_shader_path },
     )
+}
+
+pub fn decode_coefficient_planes(data: &[u8]) -> Result<DecodedCoefficientPlanes, DecodeError> {
+    let codestream = Codestream::parse(data).map_err(|err| DecodeError::new(err.to_string()))?;
+    let cod = codestream
+        .cod
+        .as_ref()
+        .ok_or_else(|| DecodeError::new("missing COD marker"))?;
+    if codestream.tile_parts.len() != 1 {
+        return Err(DecodeError::new(format!(
+            "coefficient-plane decode only supports a single tile-part for now, found {}",
+            codestream.tile_parts.len()
+        )));
+    }
+    let layouts = codestream
+        .tile_layouts()
+        .map_err(|err| DecodeError::new(err.to_string()))?;
+    let tile_part = &codestream.tile_parts[0];
+    let layout = layouts
+        .iter()
+        .find(|layout| layout.tile_index == tile_part.tile_index)
+        .ok_or_else(|| {
+            DecodeError::new(format!("missing layout for tile {}", tile_part.tile_index))
+        })?;
+    let tile_data = data
+        .get(tile_part.data_start..tile_part.data_end)
+        .ok_or_else(|| DecodeError::new("tile payload is outside codestream data"))?;
+    let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers)
+        .map_err(|err| DecodeError::new(err.to_string()))?;
+    let work_plan =
+        Tier1WorkPlan::from_packet_summary_with_qcd(&packet_summary, codestream.qcd.as_ref())
+            .map_err(|err| DecodeError::new(err.to_string()))?;
+    let bound = work_plan
+        .bind_segment_data(tile_data)
+        .map_err(|err| DecodeError::new(err.to_string()))?;
+    let coefficient_planes = TileCoefficientPlanes::decode_arithmetic_with_reconstruction(
+        &layout.components,
+        &bound,
+        cod.codeblock_style_flags(),
+        coefficient_reconstruction_for_transform(cod.transform),
+    )
+    .map_err(|err| DecodeError::new(err.to_string()))?;
+
+    Ok(DecodedCoefficientPlanes {
+        components: coefficient_planes.components,
+        decoded_codeblocks: coefficient_planes.decoded_codeblocks,
+        decoded_passes: coefficient_planes.decoded_passes,
+        nonzero_coefficients: coefficient_planes.nonzero_coefficients,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

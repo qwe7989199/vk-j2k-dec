@@ -48,6 +48,7 @@ pub fn run() -> ExitCode {
                 .unwrap_or(8);
             tier1_smoke(&path, max_codeblocks)
         }
+        (Some("tier1-subband-stats"), Some(path)) => tier1_subband_stats(&path),
         (Some("reconstruct-smoke"), Some(path)) => reconstruct_smoke(&path),
         (Some("decode-rgb48"), Some(path)) => {
             let Some(output) = args.next() else {
@@ -126,6 +127,33 @@ pub fn run() -> ExitCode {
             };
             raw::diff_rgb48_files(&actual, &reference)
         }
+        (Some("dump-coeff-plane"), Some(path)) => {
+            let Some(component) = args.next().and_then(|value| value.parse::<u16>().ok()) else {
+                eprintln!(
+                    "usage: {program} dump-coeff-plane <input.j2k> <component> <resolution> <LL|HL|LH|HH> <output.i32le>"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(resolution) = args.next().and_then(|value| value.parse::<u8>().ok()) else {
+                eprintln!(
+                    "usage: {program} dump-coeff-plane <input.j2k> <component> <resolution> <LL|HL|LH|HH> <output.i32le>"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(subband) = args.next() else {
+                eprintln!(
+                    "usage: {program} dump-coeff-plane <input.j2k> <component> <resolution> <LL|HL|LH|HH> <output.i32le>"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(output) = args.next() else {
+                eprintln!(
+                    "usage: {program} dump-coeff-plane <input.j2k> <component> <resolution> <LL|HL|LH|HH> <output.i32le>"
+                );
+                return ExitCode::FAILURE;
+            };
+            raw::dump_coeff_plane_file(&path, component, resolution, &subband, &output)
+        }
         (Some("vk-info"), _) => vulkan::print_vulkan_info(),
         (Some("vk-smoke"), shader_path) => vulkan::run_vulkan_smoke(
             shader_path
@@ -162,6 +190,7 @@ pub fn run() -> ExitCode {
             eprintln!("  {program} scan-summary <container-or-bytestream>");
             eprintln!("  {program} extract <container-or-bytestream> <index> <output.j2k>");
             eprintln!("  {program} tier1-smoke <input.j2k> [max_codeblocks]");
+            eprintln!("  {program} tier1-subband-stats <input.j2k>");
             eprintln!("  {program} reconstruct-smoke <input.j2k>");
             eprintln!("  {program} decode-rgb48 <input.j2k> <output.rgb48le>");
             eprintln!(
@@ -174,6 +203,9 @@ pub fn run() -> ExitCode {
                 "  {program} decode-rgb48-gpu <input.j2k> <discard-levels> <output.rgb48le> [idwt53.comp.spv] [color.comp.spv]"
             );
             eprintln!("  {program} diff-rgb48 <actual.rgb48le> <reference.rgb48le>");
+            eprintln!(
+                "  {program} dump-coeff-plane <input.j2k> <component> <resolution> <LL|HL|LH|HH> <output.i32le>"
+            );
             eprintln!("  {program} vk-info");
             eprintln!("  {program} vk-smoke [dequant.comp.spv]");
             eprintln!("  {program} vk-color-smoke [color_convert.comp.spv]");
@@ -184,6 +216,216 @@ pub fn run() -> ExitCode {
             );
             ExitCode::FAILURE
         }
+    }
+}
+
+fn tier1_subband_stats(path: &str) -> ExitCode {
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("failed to read {path}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let codestream = match Codestream::parse(&data) {
+        Ok(codestream) => codestream,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(cod) = &codestream.cod else {
+        eprintln!("tier1 subband stats: missing COD marker");
+        return ExitCode::FAILURE;
+    };
+    let layouts = match codestream.tile_layouts() {
+        Ok(layouts) => layouts,
+        Err(err) => {
+            eprintln!("tier1 subband stats: tile layout unavailable ({err})");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("tier1 subband stats: {path}");
+    for tile_part in &codestream.tile_parts {
+        let Some(layout) = layouts
+            .iter()
+            .find(|layout| layout.tile_index == tile_part.tile_index)
+        else {
+            eprintln!(
+                "tier1 subband stats: missing layout for tile {}",
+                tile_part.tile_index
+            );
+            return ExitCode::FAILURE;
+        };
+        let Some(tile_data) = data.get(tile_part.data_start..tile_part.data_end) else {
+            eprintln!(
+                "tier1 subband stats: tile {} payload outside input",
+                tile_part.tile_index
+            );
+            return ExitCode::FAILURE;
+        };
+        let packet_summary = match parse_lrcp_tile_packets(tile_data, layout, cod.layers) {
+            Ok(summary) => summary,
+            Err(err) => {
+                eprintln!(
+                    "tier1 subband stats: packet parse failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let work_plan = match Tier1WorkPlan::from_packet_summary_with_qcd(
+            &packet_summary,
+            codestream.qcd.as_ref(),
+        ) {
+            Ok(plan) => plan,
+            Err(err) => {
+                eprintln!(
+                    "tier1 subband stats: work plan failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let bound = match work_plan.bind_segment_data(tile_data) {
+            Ok(bound) => bound,
+            Err(err) => {
+                eprintln!(
+                    "tier1 subband stats: segment bind failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut stats = Vec::<SubbandWorkStats>::new();
+        for codeblock in &bound.codeblocks {
+            let stat = match stats.iter_mut().find(|stat| {
+                stat.component == codeblock.id.component
+                    && stat.resolution == codeblock.id.resolution
+                    && stat.subband == codeblock.id.subband
+            }) {
+                Some(stat) => stat,
+                None => {
+                    stats.push(SubbandWorkStats::new(
+                        codeblock.id.component,
+                        codeblock.id.resolution,
+                        codeblock.id.subband,
+                    ));
+                    stats.last_mut().expect("just pushed")
+                }
+            };
+            stat.add(codeblock);
+            let decoded = match codeblock.decode_arithmetic_passes_with_reconstruction(
+                cod.codeblock_style_flags(),
+                coefficient_reconstruction_for_transform(cod.transform),
+            ) {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    eprintln!(
+                        "tier1 subband stats: codeblock {:?} failed: {err}",
+                        codeblock.id
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            stat.add_decoded(&decoded);
+        }
+        stats.sort_by_key(|stat| (stat.component, stat.resolution, stat.subband));
+        println!("  tile {}:", tile_part.tile_index);
+        for stat in stats {
+            println!(
+                "    C{} R{} {}: {} cblk, {} bytes, consumed {}, {} passes, zbp {}..{}, mbp {}..{}, size {}..{} x {}..{}, {} nonzero",
+                stat.component,
+                stat.resolution,
+                stat.subband,
+                stat.codeblocks,
+                stat.bytes,
+                stat.consumed_bytes,
+                stat.passes,
+                stat.min_zero_bit_planes,
+                stat.max_zero_bit_planes,
+                stat.min_magnitude_bitplanes,
+                stat.max_magnitude_bitplanes,
+                stat.min_width,
+                stat.max_width,
+                stat.min_height,
+                stat.max_height,
+                stat.nonzero_coefficients
+            );
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubbandWorkStats {
+    component: u16,
+    resolution: u8,
+    subband: vk_j2k_dec::codestream::SubbandKind,
+    codeblocks: usize,
+    bytes: usize,
+    consumed_bytes: usize,
+    passes: u32,
+    nonzero_coefficients: usize,
+    min_zero_bit_planes: u32,
+    max_zero_bit_planes: u32,
+    min_magnitude_bitplanes: u32,
+    max_magnitude_bitplanes: u32,
+    min_width: u32,
+    max_width: u32,
+    min_height: u32,
+    max_height: u32,
+}
+
+impl SubbandWorkStats {
+    fn new(component: u16, resolution: u8, subband: vk_j2k_dec::codestream::SubbandKind) -> Self {
+        Self {
+            component,
+            resolution,
+            subband,
+            codeblocks: 0,
+            bytes: 0,
+            consumed_bytes: 0,
+            passes: 0,
+            nonzero_coefficients: 0,
+            min_zero_bit_planes: u32::MAX,
+            max_zero_bit_planes: 0,
+            min_magnitude_bitplanes: u32::MAX,
+            max_magnitude_bitplanes: 0,
+            min_width: u32::MAX,
+            max_width: 0,
+            min_height: u32::MAX,
+            max_height: 0,
+        }
+    }
+
+    fn add(&mut self, codeblock: &vk_j2k_dec::tier1::BoundCompressedCodeblock<'_>) {
+        self.codeblocks += 1;
+        self.bytes += codeblock.total_bytes();
+        self.passes += codeblock.total_coding_passes();
+        self.min_zero_bit_planes = self.min_zero_bit_planes.min(codeblock.zero_bit_planes);
+        self.max_zero_bit_planes = self.max_zero_bit_planes.max(codeblock.zero_bit_planes);
+        self.min_magnitude_bitplanes = self
+            .min_magnitude_bitplanes
+            .min(codeblock.magnitude_bitplanes);
+        self.max_magnitude_bitplanes = self
+            .max_magnitude_bitplanes
+            .max(codeblock.magnitude_bitplanes);
+        self.min_width = self.min_width.min(codeblock.width);
+        self.max_width = self.max_width.max(codeblock.width);
+        self.min_height = self.min_height.min(codeblock.height);
+        self.max_height = self.max_height.max(codeblock.height);
+    }
+
+    fn add_decoded(&mut self, decoded: &vk_j2k_dec::tier1::DecodedCodeblock) {
+        self.consumed_bytes += decoded.decoder_bytes_consumed;
+        self.nonzero_coefficients += decoded
+            .coefficients
+            .iter()
+            .filter(|coefficient| **coefficient != 0)
+            .count();
     }
 }
 

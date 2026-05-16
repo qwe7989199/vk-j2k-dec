@@ -154,7 +154,8 @@ exact reversible Tier-1 coefficient reconstruction, and high-bit `rgb48le`
 packing:
 
 ```text
-diff-rgb48: samples 6220800, differing 533125, max_abs 80 at sample 1417778, mean_abs 1.479717078189
+diff-rgb48: samples 6220800, differing 533125, max_abs 80 at sample 1417778 (x 272, y 246, channel B), mean_abs 1.479717078189
+  signed_delta min -80 max 80
   channel_diff R=215703 G=160041 B=157381
   channel_mean R=1.779521604938 G=1.337168209877 B=1.322461419753
 ```
@@ -170,7 +171,8 @@ cargo run -- diff-rgb48 target\samples\ours_frame0_rgb48le_lowres5.raw target\sa
 Current local lowres-5 diff:
 
 ```text
-diff-rgb48: samples 6120, differing 0, max_abs 0 at sample 0, mean_abs 0.000000000000
+diff-rgb48: samples 6120, differing 0, max_abs 0 at sample 0 (x 0, y 0, channel R), mean_abs 0.000000000000
+  signed_delta min 0 max 0
   channel_diff R=0 G=0 B=0
   channel_mean R=0.000000000000 G=0.000000000000 B=0.000000000000
 ```
@@ -191,6 +193,55 @@ Current local low-resolution sweep after exact reversible Tier-1 reconstruction:
 The LL-only path is now exact, and the first remaining error appears when the
 first high-frequency 5/3 reconstruction level is included.
 
+`diff-rgb48` now reports the max-difference pixel coordinate, channel, and signed
+delta range. Regenerating the current lowres-4 output gives:
+
+```text
+diff-rgb48: samples 24480, differing 1414, max_abs 32 at sample 809 (x 29, y 2, channel B), mean_abs 0.941830065359
+  signed_delta min -32 max 32
+  channel_diff R=528 G=462 B=424
+  channel_mean R=1.050980392157 G=0.921568627451 B=0.852941176471
+```
+
+Tier-1 coefficient planes can be dumped before inverse DWT for subband-level
+inspection:
+
+```text
+cargo run -- dump-coeff-plane target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 0 1 HL target\samples\c0_r1_hl.i32le
+cargo run -- dump-coeff-plane target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 0 1 LH target\samples\c0_r1_lh.i32le
+cargo run -- dump-coeff-plane target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 0 1 HH target\samples\c0_r1_hh.i32le
+```
+
+Current local component-0 R1 high-band stats:
+
+```text
+dump-coeff-plane: component 0 R1 HL 60x34, 2040 samples, 837 nonzero, min -4700, max 3104
+dump-coeff-plane: component 0 R1 LH 60x34, 2040 samples, 578 nonzero, min -3442, max 3011
+dump-coeff-plane: component 0 R1 HH 60x34, 2040 samples, 387 nonzero, min -4580, max 4557
+```
+
+Subband-level Tier-1 stats show that R1 high-band packet bodies are fully
+consumed by the MQ decoder, so the first lowres-4 mismatch is not caused by an
+obvious early stop in byte input:
+
+```text
+cargo run -- tier1-subband-stats target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
+```
+
+Current local R1 subset:
+
+```text
+C0 R1 HL: 1 cblk, 1060 bytes, consumed 1060, 37 passes, zbp 1..1, mbp 14..14, size 60..60 x 34..34, 837 nonzero
+C0 R1 LH: 1 cblk, 764 bytes, consumed 764, 34 passes, zbp 2..2, mbp 14..14, size 60..60 x 34..34, 578 nonzero
+C0 R1 HH: 1 cblk, 551 bytes, consumed 551, 37 passes, zbp 2..2, mbp 15..15, size 60..60 x 34..34, 387 nonzero
+C1 R1 HL: 1 cblk, 756 bytes, consumed 756, 37 passes, zbp 1..1, mbp 14..14, size 60..60 x 34..34, 572 nonzero
+C1 R1 LH: 1 cblk, 752 bytes, consumed 752, 37 passes, zbp 1..1, mbp 14..14, size 60..60 x 34..34, 590 nonzero
+C1 R1 HH: 1 cblk, 488 bytes, consumed 488, 37 passes, zbp 2..2, mbp 15..15, size 60..60 x 34..34, 350 nonzero
+C2 R1 HL: 1 cblk, 621 bytes, consumed 621, 37 passes, zbp 1..1, mbp 14..14, size 60..60 x 34..34, 579 nonzero
+C2 R1 LH: 1 cblk, 708 bytes, consumed 708, 37 passes, zbp 1..1, mbp 14..14, size 60..60 x 34..34, 552 nonzero
+C2 R1 HH: 1 cblk, 452 bytes, consumed 452, 37 passes, zbp 2..2, mbp 15..15, size 60..60 x 34..34, 318 nonzero
+```
+
 Irreversible 9/7 codestreams now have a high-level CPU decode route for QCD
 scalar-expounded and scalar-derived quantization: steps are converted to float
 subband scales, then fed through CPU 9/7 reconstruction and float RGB48 packing.
@@ -208,7 +259,8 @@ cargo run -- diff-rgb48 target\samples\ours_frame0_rgb48le_gpu_dwt.raw target\sa
 Current local GPU-DWT vs CPU-DWT diff:
 
 ```text
-diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0, mean_abs 0.000000000000
+diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0 (x 0, y 0, channel R), mean_abs 0.000000000000
+  signed_delta min 0 max 0
   channel_diff R=0 G=0 B=0
   channel_mean R=0.000000000000 G=0.000000000000 B=0.000000000000
 ```
@@ -216,7 +268,8 @@ diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0, mean_abs 0.0000
 GPU-DWT vs FFmpeg currently has the same diff as CPU-DWT vs FFmpeg:
 
 ```text
-diff-rgb48: samples 6220800, differing 533125, max_abs 80 at sample 1417778, mean_abs 1.479717078189
+diff-rgb48: samples 6220800, differing 533125, max_abs 80 at sample 1417778 (x 272, y 246, channel B), mean_abs 1.479717078189
+  signed_delta min -80 max 80
   channel_diff R=215703 G=160041 B=157381
   channel_mean R=1.779521604938 G=1.337168209877 B=1.322461419753
 ```
@@ -231,7 +284,8 @@ cargo run -- diff-rgb48 target\samples\ours_frame0_rgb48le_gpu.raw target\sample
 Current local GPU full path vs CPU full path diff:
 
 ```text
-diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0, mean_abs 0.000000000000
+diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0 (x 0, y 0, channel R), mean_abs 0.000000000000
+  signed_delta min 0 max 0
   channel_diff R=0 G=0 B=0
   channel_mean R=0.000000000000 G=0.000000000000 B=0.000000000000
 ```
