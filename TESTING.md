@@ -404,13 +404,14 @@ profile-rgb48: mode gpu, 1920x1080 12-bit, discard 0, 6220800 samples
 For repeated-frame timing, `profile-rgb48-bench` reads the codestream once,
 builds the persistent GPU pipeline once, then decodes the same in-memory frame
 multiple times and reports both all-run and warm-skip-one averages. Current
-local 10-iteration GPU bench after packed RGB48 readback:
+local 10-iteration GPU bench after packed RGB48 readback and direct `u16`
+readback:
 
 ```text
 profile-rgb48-bench: mode gpu, 1920x1080 12-bit, discard 0, iterations 10, 6220800 samples
-  pipeline_setup_ms 200.302
-  avg_all_ms decode_total 412.959 tier1 314.650 gpu_setup 0.000 reconstruct 52.471 pack 44.559
-  avg_warm_skip1_ms decode_total 411.919 tier1 314.855 gpu_setup 0.000 reconstruct 51.213 pack 44.589
+  pipeline_setup_ms 218.570
+  avg_all_ms decode_total 399.965 tier1 306.327 gpu_setup 0.000 reconstruct 52.626 pack 39.732
+  avg_warm_skip1_ms decode_total 397.016 tier1 303.656 gpu_setup 0.000 reconstruct 52.502 pack 39.574
 ```
 
 The matching CPU 10-iteration bench reports:

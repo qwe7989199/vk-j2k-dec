@@ -991,15 +991,7 @@ fn run_color_i32_buffers_on_device_with_program(
         (packed_output_count as u32).div_ceil(256),
         1,
     )?;
-    let output = output_buffer.read_vec::<u32>(packed_output_count)?;
-    let mut samples = Vec::with_capacity(output_count);
-    for packed in output {
-        samples.push((packed & 0xffff) as u16);
-        if samples.len() < output_count {
-            samples.push((packed >> 16) as u16);
-        }
-    }
-    Ok(samples)
+    output_buffer.read_vec::<u16>(output_count)
 }
 
 fn run_color_float_slices_on_device_with_program(
