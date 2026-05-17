@@ -383,18 +383,19 @@ profile-rgb48: mode cpu, 1920x1080 12-bit, discard 0, 6220800 samples
     pack_ms 6.273
 ```
 
-Current local GPU full-path profile still includes per-frame Vulkan setup,
-transient buffers, dispatches, and readback. Tier-1 shares the optimized CPU
-state tracking path; the remaining GPU-path bottleneck is now reconstruction,
-packing, and readback rather than arithmetic decode:
+Current local GPU full-path profile uses a fused reversible 5/3 DWT plus
+color/packing call so those GPU-parallel stages share one Vulkan device/context.
+It still uses transient buffers and reads reconstructed component planes back
+before color conversion, so reconstruction, packing, and readback remain the
+dominant GPU-path bottleneck rather than arithmetic decode:
 
 ```text
 profile-rgb48: mode gpu, 1920x1080 12-bit, discard 0, 6220800 samples
   input_bytes 99657, tile_bytes 99516, codeblocks decoded 879/879 (skipped 0), passes 25206, nonzero 119556
-  decode_total_ms 1583.763
-    tier1_decode_ms 315.437
-    reconstruct_ms 1096.750
-    pack_ms 169.824
+  decode_total_ms 1543.753
+    tier1_decode_ms 319.783
+    reconstruct_ms 922.592
+    pack_ms 121.072
 ```
 
 The low-resolution path now prunes unused high-resolution codeblocks before

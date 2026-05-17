@@ -13,7 +13,7 @@ use crate::reconstruct::{
 use crate::tier1::{CoefficientReconstruction, Tier1WorkPlan};
 use crate::vulkan::{
     run_color_components, run_color_float_components, run_idwt53_components,
-    run_idwt97_float_components,
+    run_idwt53_rgb48_components, run_idwt97_float_components,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,25 +476,52 @@ fn decode_rgb48_with_backends_profiled(
 
     let (width, height, samples) = match cod.transform {
         WaveletTransform::Reversible53 => {
-            let stage_start = Instant::now();
-            let component_planes =
-                reconstruct_components(&components, target_resolution, dwt_backend)?;
-            profile.timings.reconstruct_ms = elapsed_ms(stage_start);
-            validate_component_planes_i32(&component_planes, expected_width, expected_height)?;
-            let stage_start = Instant::now();
-            let samples = pack_rgb48_samples(
-                &component_planes,
-                precision,
-                cod.multiple_component_transform,
-                cod.transform,
-                color_backend,
-            )?;
-            profile.timings.pack_ms = elapsed_ms(stage_start);
-            (
-                component_planes[0].width,
-                component_planes[0].height,
-                samples,
-            )
+            if let (
+                DwtBackend::Gpu { idwt53_shader_path },
+                ColorBackend::Gpu { color_shader_path },
+            ) = (dwt_backend, color_backend)
+            {
+                let color_transform =
+                    gpu_color_transform_value(cod.multiple_component_transform, cod.transform)?;
+                let result = run_idwt53_rgb48_components(
+                    idwt53_shader_path,
+                    color_shader_path,
+                    &components,
+                    target_resolution,
+                    color_transform,
+                    precision,
+                )
+                .map_err(|err| DecodeError::new(format!("GPU RGB48 pipeline failed: {err}")))?;
+                profile.timings.reconstruct_ms = result.reconstruct_ms;
+                profile.timings.pack_ms = result.pack_ms;
+                if result.width != expected_width || result.height != expected_height {
+                    return Err(DecodeError::new(format!(
+                        "GPU RGB48 pipeline produced {}x{}, expected {}x{}",
+                        result.width, result.height, expected_width, expected_height
+                    )));
+                }
+                (result.width, result.height, result.samples)
+            } else {
+                let stage_start = Instant::now();
+                let component_planes =
+                    reconstruct_components(&components, target_resolution, dwt_backend)?;
+                profile.timings.reconstruct_ms = elapsed_ms(stage_start);
+                validate_component_planes_i32(&component_planes, expected_width, expected_height)?;
+                let stage_start = Instant::now();
+                let samples = pack_rgb48_samples(
+                    &component_planes,
+                    precision,
+                    cod.multiple_component_transform,
+                    cod.transform,
+                    color_backend,
+                )?;
+                profile.timings.pack_ms = elapsed_ms(stage_start);
+                (
+                    component_planes[0].width,
+                    component_planes[0].height,
+                    samples,
+                )
+            }
         }
         WaveletTransform::Irreversible97 => {
             let stage_start = Instant::now();

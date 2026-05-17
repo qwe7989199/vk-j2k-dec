@@ -19,6 +19,17 @@ pub struct ColorComponentsResult {
     pub samples: Vec<u16>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuRgb48ComponentsResult {
+    pub device_name: String,
+    pub queue_family_index: u32,
+    pub width: u32,
+    pub height: u32,
+    pub samples: Vec<u16>,
+    pub reconstruct_ms: f64,
+    pub pack_ms: f64,
+}
+
 pub fn run_idwt53_components(
     shader_path: &str,
     components: &[&ComponentSubbandPlanes],
@@ -41,6 +52,58 @@ pub fn run_idwt53_components(
             device_name: summary.name.clone(),
             queue_family_index,
             planes,
+        })
+    })
+}
+
+pub fn run_idwt53_rgb48_components(
+    idwt53_shader_path: &str,
+    color_shader_path: &str,
+    components: &[&ComponentSubbandPlanes],
+    target_resolution: u8,
+    color_transform: u32,
+    precision: u8,
+) -> Result<GpuRgb48ComponentsResult, VulkanError> {
+    let idwt53_spirv = read_spirv(idwt53_shader_path)?;
+    let color_spirv = read_spirv(color_shader_path)?;
+    with_compute_device(|device, summary, queue_family_index| {
+        let stage_start = std::time::Instant::now();
+        let mut planes = Vec::with_capacity(components.len());
+        for component in components {
+            planes.push(run_idwt53_component_on_device(
+                device,
+                queue_family_index,
+                &idwt53_spirv,
+                component,
+                target_resolution,
+            )?);
+        }
+        let reconstruct_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
+
+        let width = planes
+            .first()
+            .map(|plane| plane.width)
+            .ok_or_else(|| VulkanError::new("GPU RGB48 pipeline requires at least one plane"))?;
+        let height = planes[0].height;
+        let stage_start = std::time::Instant::now();
+        let samples = run_color_components_on_device(
+            device,
+            queue_family_index,
+            &color_spirv,
+            &planes,
+            color_transform,
+            precision,
+        )?;
+        let pack_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
+        device.wait_idle()?;
+        Ok(GpuRgb48ComponentsResult {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            width,
+            height,
+            samples,
+            reconstruct_ms,
+            pack_ms,
         })
     })
 }
