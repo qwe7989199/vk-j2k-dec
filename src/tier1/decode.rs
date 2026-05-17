@@ -288,7 +288,7 @@ impl DecodedCodeblock {
             pass,
             ..Tier1DecodedPassSummary::default()
         };
-        let coordinates = self.coefficient_scan().collect::<Vec<_>>();
+        let coordinates = self.coefficient_scan();
         for (x, y) in coordinates {
             let Some(operation) = self.coding_operation(pass.kind, x, y) else {
                 continue;

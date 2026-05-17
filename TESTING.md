@@ -358,6 +358,64 @@ diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0 (x 0, y 0, chann
 
 - This sample is inside the first target profile.
 
+## Local profiling
+
+The profiling CLI logs stage timings and decode volume so performance runs have
+an immediate bottleneck breakdown:
+
+```text
+cargo run --release -- profile-rgb48 target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 0 cpu target\samples\profile_cpu_full.rgb48le
+cargo run --release -- profile-rgb48 target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 4 cpu target\samples\profile_cpu_lowres4.rgb48le
+cargo run --release -- profile-rgb48 target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 0 gpu target\samples\profile_gpu_full.rgb48le
+```
+
+Current local CPU full-resolution profile:
+
+```text
+profile-rgb48: mode cpu, 1920x1080 12-bit, discard 0, 6220800 samples
+  input_bytes 99657, tile_bytes 99516, codeblocks decoded 879/879 (skipped 0), passes 25206, nonzero 119556
+  decode_total_ms 1164.224
+    packet_ms 0.586
+    work_plan_ms 0.201
+    bind_ms 0.063
+    tier1_decode_ms 1061.619
+    reconstruct_ms 93.723
+    pack_ms 6.406
+```
+
+Current local GPU full-path profile still includes per-frame Vulkan setup,
+transient buffers, dispatches, and readback:
+
+```text
+profile-rgb48: mode gpu, 1920x1080 12-bit, discard 0, 6220800 samples
+  input_bytes 99657, tile_bytes 99516, codeblocks decoded 879/879 (skipped 0), passes 25206, nonzero 119556
+  decode_total_ms 2513.220
+    tier1_decode_ms 1130.933
+    reconstruct_ms 1198.752
+    pack_ms 181.933
+```
+
+The low-resolution path now prunes unused high-resolution codeblocks before
+Tier-1 decode:
+
+```text
+profile-rgb48: mode cpu, 120x68 12-bit, discard 4, 24480 samples
+  input_bytes 99657, tile_bytes 99516, codeblocks decoded 12/879 (skipped 867), passes 432, nonzero 10883
+  decode_total_ms 14.093
+    tier1_decode_ms 13.105
+    reconstruct_ms 0.255
+    pack_ms 0.031
+```
+
+Current local release median timings, 6 runs with the first run discarded:
+
+| path | median |
+| --- | ---: |
+| FFmpeg full | 171.47 ms |
+| `vk-j2k-dec` CPU full | 1266.96 ms |
+| FFmpeg lowres4 | 47.81 ms |
+| `vk-j2k-dec` CPU lowres4 | 30.36 ms |
+
 ## Local Vulkan checks
 
 Shader compilation and SPIR-V validation:
@@ -432,7 +490,7 @@ Current local result:
 vulkan idwt53 smoke: device NVIDIA GeForce RTX 5060, queue family 2
   row output: [0, 5, -4, 0, 14, 0, 4, 4, 8, 7]
   column output: [0, 0, 5, 4, -4, 4, 0, 8, 14, 7]
-  level output: [-2, 1, -8, 0, 16, 4, 7, 3, 4, 10, -2, -1, -1, 8, 10, -4, 7, 9, 7, 4]
+  level output: [-3, 1, -8, 0, 15, 3, 7, 3, 4, 9, -1, 0, -1, 8, 9, -3, 8, 10, 7, 3]
   validation: passed
 ```
 

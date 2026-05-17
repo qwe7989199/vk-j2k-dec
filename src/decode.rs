@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::codestream::{Codestream, WaveletTransform};
 use crate::color::{
     ColorError, inverse_ict_sample, inverse_rct_sample, level_shift_and_clamp,
@@ -20,6 +22,38 @@ pub struct DecodedRgb48 {
     pub height: u32,
     pub precision: u8,
     pub samples: Vec<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfiledDecodedRgb48 {
+    pub image: DecodedRgb48,
+    pub profile: DecodeProfile,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DecodeProfile {
+    pub input_bytes: usize,
+    pub tile_bytes: usize,
+    pub total_codeblocks: usize,
+    pub decoded_codeblocks: usize,
+    pub skipped_codeblocks: usize,
+    pub decoded_passes: u32,
+    pub nonzero_coefficients: usize,
+    pub output_samples: usize,
+    pub timings: DecodeTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DecodeTimings {
+    pub parse_ms: f64,
+    pub layout_ms: f64,
+    pub packet_ms: f64,
+    pub work_plan_ms: f64,
+    pub bind_ms: f64,
+    pub tier1_decode_ms: f64,
+    pub reconstruct_ms: f64,
+    pub pack_ms: f64,
+    pub total_ms: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +119,15 @@ pub fn decode_rgb48_with_discard(
     data: &[u8],
     discard_levels: u8,
 ) -> Result<DecodedRgb48, DecodeError> {
-    decode_rgb48_with_backends(data, discard_levels, DwtBackend::Cpu, ColorBackend::Cpu)
+    decode_rgb48_with_backends_profiled(data, discard_levels, DwtBackend::Cpu, ColorBackend::Cpu)
+        .map(|decoded| decoded.image)
+}
+
+pub fn decode_rgb48_with_discard_profiled(
+    data: &[u8],
+    discard_levels: u8,
+) -> Result<ProfiledDecodedRgb48, DecodeError> {
+    decode_rgb48_with_backends_profiled(data, discard_levels, DwtBackend::Cpu, ColorBackend::Cpu)
 }
 
 pub fn decode_rgb48_with_gpu_dwt(
@@ -93,7 +135,21 @@ pub fn decode_rgb48_with_gpu_dwt(
     discard_levels: u8,
     idwt53_shader_path: &str,
 ) -> Result<DecodedRgb48, DecodeError> {
-    decode_rgb48_with_backends(
+    decode_rgb48_with_backends_profiled(
+        data,
+        discard_levels,
+        DwtBackend::Gpu { idwt53_shader_path },
+        ColorBackend::Cpu,
+    )
+    .map(|decoded| decoded.image)
+}
+
+pub fn decode_rgb48_with_gpu_dwt_profiled(
+    data: &[u8],
+    discard_levels: u8,
+    idwt53_shader_path: &str,
+) -> Result<ProfiledDecodedRgb48, DecodeError> {
+    decode_rgb48_with_backends_profiled(
         data,
         discard_levels,
         DwtBackend::Gpu { idwt53_shader_path },
@@ -107,7 +163,22 @@ pub fn decode_rgb48_with_gpu_pipeline(
     idwt53_shader_path: &str,
     color_shader_path: &str,
 ) -> Result<DecodedRgb48, DecodeError> {
-    decode_rgb48_with_backends(
+    decode_rgb48_with_backends_profiled(
+        data,
+        discard_levels,
+        DwtBackend::Gpu { idwt53_shader_path },
+        ColorBackend::Gpu { color_shader_path },
+    )
+    .map(|decoded| decoded.image)
+}
+
+pub fn decode_rgb48_with_gpu_pipeline_profiled(
+    data: &[u8],
+    discard_levels: u8,
+    idwt53_shader_path: &str,
+    color_shader_path: &str,
+) -> Result<ProfiledDecodedRgb48, DecodeError> {
+    decode_rgb48_with_backends_profiled(
         data,
         discard_levels,
         DwtBackend::Gpu { idwt53_shader_path },
@@ -214,12 +285,14 @@ pub fn decode_reversible_component_planes_with_discard(
         .ok_or_else(|| DecodeError::new("tile payload is outside codestream data"))?;
     let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers)
         .map_err(|err| DecodeError::new(err.to_string()))?;
-    let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
+    let target_resolution = cod.decomposition_levels - discard_levels;
+    let mut work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
         &packet_summary,
         codestream.qcd.as_ref(),
         &codestream.qccs,
     )
     .map_err(|err| DecodeError::new(err.to_string()))?;
+    work_plan.retain_max_resolution(target_resolution);
     let bound = work_plan
         .bind_segment_data(tile_data)
         .map_err(|err| DecodeError::new(err.to_string()))?;
@@ -238,7 +311,6 @@ pub fn decode_reversible_component_planes_with_discard(
                 .ok_or_else(|| DecodeError::new(format!("missing component {component}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let target_resolution = cod.decomposition_levels - discard_levels;
     let expected_width = discard_extent(siz.width, discard_levels);
     let expected_height = discard_extent(siz.height, discard_levels);
     let components = reconstruct_components(&component_refs, target_resolution, DwtBackend::Cpu)?;
@@ -269,13 +341,21 @@ enum ColorBackend<'a> {
     Gpu { color_shader_path: &'a str },
 }
 
-fn decode_rgb48_with_backends(
+fn decode_rgb48_with_backends_profiled(
     data: &[u8],
     discard_levels: u8,
     dwt_backend: DwtBackend<'_>,
     color_backend: ColorBackend<'_>,
-) -> Result<DecodedRgb48, DecodeError> {
+) -> Result<ProfiledDecodedRgb48, DecodeError> {
+    let total_start = Instant::now();
+    let mut profile = DecodeProfile {
+        input_bytes: data.len(),
+        ..DecodeProfile::default()
+    };
+
+    let stage_start = Instant::now();
     let codestream = Codestream::parse(data).map_err(|err| DecodeError::new(err.to_string()))?;
+    profile.timings.parse_ms = elapsed_ms(stage_start);
     let siz = codestream
         .siz
         .as_ref()
@@ -317,9 +397,11 @@ fn decode_rgb48_with_backends(
         )));
     }
 
+    let stage_start = Instant::now();
     let layouts = codestream
         .tile_layouts()
         .map_err(|err| DecodeError::new(err.to_string()))?;
+    profile.timings.layout_ms = elapsed_ms(stage_start);
     let tile_part = &codestream.tile_parts[0];
     let layout = layouts
         .iter()
@@ -330,17 +412,38 @@ fn decode_rgb48_with_backends(
     let tile_data = data
         .get(tile_part.data_start..tile_part.data_end)
         .ok_or_else(|| DecodeError::new("tile payload is outside codestream data"))?;
+    profile.tile_bytes = tile_data.len();
+    let target_resolution = cod.decomposition_levels - discard_levels;
+    let expected_width = discard_extent(siz.width, discard_levels);
+    let expected_height = discard_extent(siz.height, discard_levels);
+
+    let stage_start = Instant::now();
     let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers)
         .map_err(|err| DecodeError::new(err.to_string()))?;
-    let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
+    profile.timings.packet_ms = elapsed_ms(stage_start);
+
+    let stage_start = Instant::now();
+    let mut work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
         &packet_summary,
         codestream.qcd.as_ref(),
         &codestream.qccs,
     )
     .map_err(|err| DecodeError::new(err.to_string()))?;
+    profile.total_codeblocks = work_plan.codeblock_count();
+    work_plan.retain_max_resolution(target_resolution);
+    profile.decoded_codeblocks = work_plan.codeblock_count();
+    profile.skipped_codeblocks = profile
+        .total_codeblocks
+        .saturating_sub(profile.decoded_codeblocks);
+    profile.timings.work_plan_ms = elapsed_ms(stage_start);
+
+    let stage_start = Instant::now();
     let bound = work_plan
         .bind_segment_data(tile_data)
         .map_err(|err| DecodeError::new(err.to_string()))?;
+    profile.timings.bind_ms = elapsed_ms(stage_start);
+
+    let stage_start = Instant::now();
     let coefficient_planes = TileCoefficientPlanes::decode_arithmetic_with_reconstruction(
         &layout.components,
         &bound,
@@ -348,6 +451,10 @@ fn decode_rgb48_with_backends(
         coefficient_reconstruction_for_transform(cod.transform),
     )
     .map_err(|err| DecodeError::new(err.to_string()))?;
+    profile.timings.tier1_decode_ms = elapsed_ms(stage_start);
+    profile.decoded_codeblocks = coefficient_planes.decoded_codeblocks;
+    profile.decoded_passes = coefficient_planes.decoded_passes;
+    profile.nonzero_coefficients = coefficient_planes.nonzero_coefficients;
 
     let components = (0..3)
         .map(|component| {
@@ -367,14 +474,14 @@ fn decode_rgb48_with_backends(
         ));
     }
 
-    let target_resolution = cod.decomposition_levels - discard_levels;
-    let expected_width = discard_extent(siz.width, discard_levels);
-    let expected_height = discard_extent(siz.height, discard_levels);
     let (width, height, samples) = match cod.transform {
         WaveletTransform::Reversible53 => {
+            let stage_start = Instant::now();
             let component_planes =
                 reconstruct_components(&components, target_resolution, dwt_backend)?;
+            profile.timings.reconstruct_ms = elapsed_ms(stage_start);
             validate_component_planes_i32(&component_planes, expected_width, expected_height)?;
+            let stage_start = Instant::now();
             let samples = pack_rgb48_samples(
                 &component_planes,
                 precision,
@@ -382,6 +489,7 @@ fn decode_rgb48_with_backends(
                 cod.transform,
                 color_backend,
             )?;
+            profile.timings.pack_ms = elapsed_ms(stage_start);
             (
                 component_planes[0].width,
                 component_planes[0].height,
@@ -389,6 +497,7 @@ fn decode_rgb48_with_backends(
             )
         }
         WaveletTransform::Irreversible97 => {
+            let stage_start = Instant::now();
             let component_planes = reconstruct_float_components(
                 &components,
                 target_resolution,
@@ -397,7 +506,9 @@ fn decode_rgb48_with_backends(
                 precision,
                 cod.decomposition_levels,
             )?;
+            profile.timings.reconstruct_ms = elapsed_ms(stage_start);
             validate_component_planes_f32(&component_planes, expected_width, expected_height)?;
+            let stage_start = Instant::now();
             let samples = pack_rgb48_float_samples(
                 &component_planes,
                 precision,
@@ -405,6 +516,7 @@ fn decode_rgb48_with_backends(
                 cod.transform,
                 color_backend,
             )?;
+            profile.timings.pack_ms = elapsed_ms(stage_start);
             (
                 component_planes[0].width,
                 component_planes[0].height,
@@ -414,12 +526,22 @@ fn decode_rgb48_with_backends(
         WaveletTransform::Unknown(_) => unreachable!("unsupported transform checked above"),
     };
 
-    Ok(DecodedRgb48 {
-        width,
-        height,
-        precision,
-        samples,
+    profile.output_samples = samples.len();
+    profile.timings.total_ms = elapsed_ms(total_start);
+
+    Ok(ProfiledDecodedRgb48 {
+        image: DecodedRgb48 {
+            width,
+            height,
+            precision,
+            samples,
+        },
+        profile,
     })
+}
+
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
 }
 
 fn reconstruct_components(

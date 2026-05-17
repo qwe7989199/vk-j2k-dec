@@ -30,6 +30,27 @@ mod tests {
         }
     }
 
+    fn compressed_codeblock_at_resolution(resolution: u8) -> CompressedCodeblock {
+        CompressedCodeblock {
+            id: CodeblockId {
+                component: 0,
+                resolution,
+                subband: if resolution == 0 {
+                    SubbandKind::Ll
+                } else {
+                    SubbandKind::Hl
+                },
+                codeblock_x: 0,
+                codeblock_y: 0,
+            },
+            width: 1,
+            height: 1,
+            magnitude_bitplanes: 8,
+            zero_bit_planes: 0,
+            segments: Vec::new(),
+        }
+    }
+
     #[test]
     fn builds_work_plan_from_packet_segments() {
         let summary = TilePacketParseSummary {
@@ -788,6 +809,27 @@ mod tests {
         assert_eq!(schedule[2].bitplane, 10);
         assert_eq!(schedule[3].bitplane, 10);
         assert_eq!(schedule[6].bitplane, 9);
+    }
+
+    #[test]
+    fn work_plan_can_prune_unused_resolutions() {
+        let mut plan = Tier1WorkPlan {
+            codeblocks: vec![
+                compressed_codeblock_at_resolution(0),
+                compressed_codeblock_at_resolution(1),
+                compressed_codeblock_at_resolution(2),
+            ],
+        };
+
+        plan.retain_max_resolution(1);
+
+        assert_eq!(
+            plan.codeblocks
+                .iter()
+                .map(|codeblock| codeblock.id.resolution)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 
     #[test]

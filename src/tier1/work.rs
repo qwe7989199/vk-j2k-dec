@@ -501,6 +501,11 @@ impl Tier1WorkPlan {
             .sum()
     }
 
+    pub fn retain_max_resolution(&mut self, max_resolution: u8) {
+        self.codeblocks
+            .retain(|codeblock| codeblock.id.resolution <= max_resolution);
+    }
+
     pub fn pass_kind_counts(&self) -> Tier1PassKindCounts {
         let mut counts = Tier1PassKindCounts::default();
         for codeblock in &self.codeblocks {

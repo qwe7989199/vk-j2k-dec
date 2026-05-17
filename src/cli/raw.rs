@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use vk_j2k_dec::codestream::{Codestream, SubbandKind, WaveletTransform};
 use vk_j2k_dec::decode::{
-    decode_coefficient_planes, decode_reversible_component_planes_with_discard,
-    decode_rgb48_with_discard, decode_rgb48_with_gpu_dwt, decode_rgb48_with_gpu_pipeline,
+    DecodeProfile, decode_coefficient_planes, decode_reversible_component_planes_with_discard,
+    decode_rgb48_with_discard, decode_rgb48_with_discard_profiled, decode_rgb48_with_gpu_dwt,
+    decode_rgb48_with_gpu_dwt_profiled, decode_rgb48_with_gpu_pipeline,
+    decode_rgb48_with_gpu_pipeline_profiled,
 };
 use vk_j2k_dec::packet::parse_lrcp_tile_packets;
 use vk_j2k_dec::reconstruct::{ComponentSubbandPlanes, ResolutionSubbandPlane};
@@ -123,6 +126,71 @@ pub fn decode_rgb48_gpu_file(
         discard_levels,
         image.samples.len()
     );
+    ExitCode::SUCCESS
+}
+
+pub fn profile_rgb48_file(
+    input: &str,
+    discard_levels: u8,
+    mode: &str,
+    output: &str,
+    idwt53_shader_path: &str,
+    color_shader_path: &str,
+) -> ExitCode {
+    let total_start = Instant::now();
+    let read_start = Instant::now();
+    let data = match fs::read(input) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("failed to read {input}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let read_ms = elapsed_ms(read_start);
+
+    let decoded = match mode {
+        "cpu" => decode_rgb48_with_discard_profiled(&data, discard_levels),
+        "gpu-dwt" => decode_rgb48_with_gpu_dwt_profiled(&data, discard_levels, idwt53_shader_path),
+        "gpu" => decode_rgb48_with_gpu_pipeline_profiled(
+            &data,
+            discard_levels,
+            idwt53_shader_path,
+            color_shader_path,
+        ),
+        other => {
+            eprintln!("profile-rgb48 failed: mode must be cpu, gpu-dwt, or gpu, got {other}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let decoded = match decoded {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            eprintln!("profile-rgb48 failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let write_start = Instant::now();
+    let bytes = decoded.image.to_le_bytes();
+    if let Err(err) = fs::write(output, bytes) {
+        eprintln!("failed to write {output}: {err}");
+        return ExitCode::FAILURE;
+    }
+    let write_ms = elapsed_ms(write_start);
+    let total_ms = elapsed_ms(total_start);
+
+    println!(
+        "profile-rgb48: mode {mode}, {}x{} {}-bit, discard {}, {} samples -> {output}",
+        decoded.image.width,
+        decoded.image.height,
+        decoded.image.precision,
+        discard_levels,
+        decoded.image.samples.len()
+    );
+    println!("  read_ms {:.3}", read_ms);
+    print_decode_profile(&decoded.profile);
+    println!("  write_ms {:.3}", write_ms);
+    println!("  cli_total_ms {:.3}", total_ms);
     ExitCode::SUCCESS
 }
 
@@ -703,6 +771,33 @@ fn parse_subband(value: &str) -> Option<SubbandKind> {
         "HH" => Some(SubbandKind::Hh),
         _ => None,
     }
+}
+
+fn print_decode_profile(profile: &DecodeProfile) {
+    println!(
+        "  input_bytes {}, tile_bytes {}, codeblocks decoded {}/{} (skipped {}), passes {}, nonzero {}, output_samples {}",
+        profile.input_bytes,
+        profile.tile_bytes,
+        profile.decoded_codeblocks,
+        profile.total_codeblocks,
+        profile.skipped_codeblocks,
+        profile.decoded_passes,
+        profile.nonzero_coefficients,
+        profile.output_samples
+    );
+    println!("  decode_total_ms {:.3}", profile.timings.total_ms);
+    println!("    parse_ms {:.3}", profile.timings.parse_ms);
+    println!("    layout_ms {:.3}", profile.timings.layout_ms);
+    println!("    packet_ms {:.3}", profile.timings.packet_ms);
+    println!("    work_plan_ms {:.3}", profile.timings.work_plan_ms);
+    println!("    bind_ms {:.3}", profile.timings.bind_ms);
+    println!("    tier1_decode_ms {:.3}", profile.timings.tier1_decode_ms);
+    println!("    reconstruct_ms {:.3}", profile.timings.reconstruct_ms);
+    println!("    pack_ms {:.3}", profile.timings.pack_ms);
+}
+
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
