@@ -409,9 +409,9 @@ readback:
 
 ```text
 profile-rgb48-bench: mode gpu, 1920x1080 12-bit, discard 0, iterations 10, 6220800 samples
-  pipeline_setup_ms 218.570
-  avg_all_ms decode_total 399.965 tier1 306.327 gpu_setup 0.000 reconstruct 52.626 pack 39.732
-  avg_warm_skip1_ms decode_total 397.016 tier1 303.656 gpu_setup 0.000 reconstruct 52.502 pack 39.574
+  pipeline_setup_ms 221.954
+  avg_all_ms decode_total 354.095 tier1 259.244 gpu_setup 0.000 reconstruct 52.873 pack 40.684
+  avg_warm_skip1_ms decode_total 353.452 tier1 259.544 gpu_setup 0.000 reconstruct 52.249 pack 40.353
 ```
 
 The matching CPU 10-iteration bench reports:

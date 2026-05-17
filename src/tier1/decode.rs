@@ -296,17 +296,23 @@ impl DecodedCodeblock {
             ..Tier1DecodedPassSummary::default()
         };
         let coordinates = self.coefficient_scan();
-        for (x, y) in coordinates {
-            let Some(operation) = self.coding_operation(pass.kind, x, y) else {
-                continue;
-            };
-            match operation {
-                Tier1CodingOperation::Significance | Tier1CodingOperation::Cleanup => {
-                    let context = self.significance_context(x, y).ok_or_else(|| {
-                        Tier1DecodeError::new(format!(
-                            "missing significance context for coefficient {x},{y}"
-                        ))
-                    })?;
+        match pass.kind {
+            Tier1PassKind::SignificancePropagation => {
+                let width = self.width as usize;
+                for (x, y) in coordinates {
+                    let index = y as usize * width + x as usize;
+                    if self.state.visited_in_bitplane[index] != 0
+                        || self.state.significant[index] != 0
+                    {
+                        continue;
+                    }
+                    let neighbors = self
+                        .state
+                        .significance_neighbors_unchecked(x as usize, y as usize);
+                    if !neighbors.has_any() {
+                        continue;
+                    }
+                    let context = significance_context_label(self.id.subband, neighbors);
                     let is_significant = reader.decode_context_bit(context)?;
                     summary.significance_bits += 1;
                     if is_significant {
@@ -329,19 +335,36 @@ impl DecodedCodeblock {
                     } else {
                         self.apply_significance_decision(x, y, pass.bitplane, false, None)?;
                     }
+                    summary.visited += 1;
                 }
-                Tier1CodingOperation::MagnitudeRefinement => {
-                    let context = self.magnitude_refinement_context(x, y).ok_or_else(|| {
-                        Tier1DecodeError::new(format!(
-                            "missing magnitude refinement context for coefficient {x},{y}"
-                        ))
-                    })?;
+            }
+            Tier1PassKind::MagnitudeRefinement => {
+                let width = self.width as usize;
+                for (x, y) in coordinates {
+                    let index = y as usize * width + x as usize;
+                    if self.state.visited_in_bitplane[index] != 0
+                        || self.state.significant[index] == 0
+                    {
+                        continue;
+                    }
+                    let context = if self.state.magnitude_refined[index] != 0 {
+                        TIER1_MAGNITUDE_REFINEMENT_CONTEXT_REFINED
+                    } else if self
+                        .state
+                        .significance_neighbors_unchecked(x as usize, y as usize)
+                        .has_any()
+                    {
+                        TIER1_MAGNITUDE_REFINEMENT_CONTEXT_FIRST_WITH_NEIGHBORS
+                    } else {
+                        TIER1_MAGNITUDE_REFINEMENT_CONTEXT_FIRST
+                    };
                     let bit = reader.decode_context_bit(context)?;
                     summary.refinement_bits += 1;
                     self.apply_magnitude_refinement_bit(x, y, pass.bitplane, bit)?;
+                    summary.visited += 1;
                 }
             }
-            summary.visited += 1;
+            Tier1PassKind::Cleanup => unreachable!("cleanup pass handled above"),
         }
 
         self.decoded_passes += 1;
