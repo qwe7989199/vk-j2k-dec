@@ -109,8 +109,8 @@ DCP-o-matic is a promising downstream target because JPEG 2000 decode performanc
 - Add irreversible 9/7 CPU reference and Vulkan smoke shader. Done.
 - Wire irreversible 9/7 into the high-level CPU decode path. Done for QCD scalar-expounded/scalar-derived codestreams and QCC component overrides; corpus validation still needs implementation.
 - Turn the Vulkan smoke helpers into a reusable reconstruction backend with persistent pipelines and buffers. Component-level 5/3 and 9/7 helpers exist; persistent pipeline reuse is still pending.
-- Use the profiling CLI for every performance run. Current full-resolution bottleneck is CPU Tier-1 (~1.13s of ~1.23s decode on the local frame); current GPU path is slower because it includes per-frame setup, transient buffers, dispatches, and readback.
-- Continue CPU performance work without sacrificing correctness: lowres pruning is done, and the next likely wins are Tier-1 allocation/state reuse, avoiding repeated coordinate vectors, and persistent GPU resources.
+- Use the profiling CLI for every performance run. Current full-resolution CPU decode is ~0.420s on the local frame, with Tier-1 still the largest CPU stage at ~0.325s. Current GPU full path is ~1.584s and is dominated by transient Vulkan reconstruction, packing, and readback rather than Tier-1 arithmetic.
+- Continue performance work without sacrificing correctness: lowres pruning, cached Tier-1 significance-neighbor state, byte-backed state planes, direct pass-state access, and one fewer MQ input copy are done. Next likely wins are persistent Vulkan device/pipeline/buffer reuse, CPU Tier-1 allocation reuse, and eventually overlapping CPU Tier-1 with GPU reconstruction.
 - Add a frame-level compare path against FFmpeg/OpenJPEG output once Tier-1 is producing coefficients.
 - Build a `dump` CLI for codestream headers. Done.
 - Parse and print `SIZ`, `COD`, `QCD`, and `SOT`. Done.

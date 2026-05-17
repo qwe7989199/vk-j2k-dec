@@ -192,7 +192,7 @@ impl DecodedCodeblock {
         let magnitude =
             significance_reconstruction_magnitude(self.id, bitplane, self.reconstruction)?;
         let value = if is_negative { -magnitude } else { magnitude };
-        self.set_coefficient(x, y, value)?;
+        self.coefficients[y as usize * self.width as usize + x as usize] = value;
         self.state.mark_significant(x, y, is_negative)
     }
 
@@ -209,7 +209,7 @@ impl DecodedCodeblock {
                 self.width, self.height
             ))
         })?;
-        if !self.state.is_significant(x, y).unwrap_or(false) {
+        if self.state.significant[index] == 0 {
             return Err(Tier1DecodeError::new(format!(
                 "cannot refine insignificant coefficient {x},{y}"
             )));
@@ -226,8 +226,9 @@ impl DecodedCodeblock {
         self.coefficients[index] = current.checked_add(delta).ok_or_else(|| {
             Tier1DecodeError::new(format!("coefficient refinement overflow at {x},{y}"))
         })?;
-        self.state.mark_magnitude_refined(x, y)?;
-        self.state.mark_visited_in_bitplane(x, y)
+        self.state.magnitude_refined[index] = 1;
+        self.state.visited_in_bitplane[index] = 1;
+        Ok(())
     }
 
     pub fn coefficient_scan(&self) -> Tier1CoefficientScan {
@@ -252,23 +253,28 @@ impl DecodedCodeblock {
         x: u32,
         y: u32,
     ) -> Option<Tier1CodingOperation> {
-        self.index(x, y)?;
-        if self.state.is_visited_in_bitplane(x, y)? {
+        let index = self.index(x, y)?;
+        if self.state.visited_in_bitplane[index] != 0 {
             return None;
         }
 
         match pass_kind {
             Tier1PassKind::SignificancePropagation => {
-                let significant = self.state.is_significant(x, y)?;
-                let neighbors = self.state.significance_neighbors(x, y)?;
-                (!significant && neighbors.has_any()).then_some(Tier1CodingOperation::Significance)
+                if self.state.significant[index] != 0 {
+                    return None;
+                }
+                self.state
+                    .significance_neighbors_unchecked(x as usize, y as usize)
+                    .has_any()
+                    .then_some(Tier1CodingOperation::Significance)
             }
-            Tier1PassKind::MagnitudeRefinement => self
-                .state
-                .is_significant(x, y)?
-                .then_some(Tier1CodingOperation::MagnitudeRefinement),
-            Tier1PassKind::Cleanup => (!self.state.is_significant(x, y)?)
-                .then_some(Tier1CodingOperation::Cleanup),
+            Tier1PassKind::MagnitudeRefinement => {
+                (self.state.significant[index] != 0)
+                    .then_some(Tier1CodingOperation::MagnitudeRefinement)
+            }
+            Tier1PassKind::Cleanup => {
+                (self.state.significant[index] == 0).then_some(Tier1CodingOperation::Cleanup)
+            }
         }
     }
 
@@ -468,9 +474,14 @@ impl DecodedCodeblock {
     fn cleanup_run_length_candidate(&self, x: u32, stripe_y: u32) -> bool {
         (0..4).all(|y_offset| {
             let y = stripe_y + y_offset;
-            self.coding_operation(Tier1PassKind::Cleanup, x, y)
-                == Some(Tier1CodingOperation::Cleanup)
-                && self.significance_context(x, y) == Some(0)
+            let index = y as usize * self.width as usize + x as usize;
+            self.state.visited_in_bitplane[index] == 0
+                && self.state.significant[index] == 0
+                && self
+                    .state
+                    .significance_neighbors_unchecked(x as usize, y as usize)
+                    .total()
+                    == 0
         })
     }
 
@@ -503,10 +514,11 @@ impl SignificanceNeighbors {
 pub struct CodeblockStatePlanes {
     width: u32,
     height: u32,
-    significant: Vec<bool>,
-    sign: Vec<bool>,
-    magnitude_refined: Vec<bool>,
-    visited_in_bitplane: Vec<bool>,
+    significant: Vec<u8>,
+    sign: Vec<u8>,
+    magnitude_refined: Vec<u8>,
+    visited_in_bitplane: Vec<u8>,
+    neighbor_counts: Vec<SignificanceNeighbors>,
 }
 
 impl BoundCompressedCodeblock<'_> {
@@ -543,7 +555,7 @@ impl BoundCompressedCodeblock<'_> {
         }
 
         let mut decoded = DecodedCodeblock::new_bound_with_reconstruction(self, reconstruction)?;
-        let mut mq = MqDecoder::with_data(&data);
+        let mut mq = MqDecoder::with_owned_data(data);
         for pass in execution.passes {
             decoded.decode_pass(pass.pass, &mut mq)?;
         }
@@ -590,31 +602,34 @@ impl CodeblockStatePlanes {
         Ok(Self {
             width,
             height,
-            significant: vec![false; sample_count],
-            sign: vec![false; sample_count],
-            magnitude_refined: vec![false; sample_count],
-            visited_in_bitplane: vec![false; sample_count],
+            significant: vec![0; sample_count],
+            sign: vec![0; sample_count],
+            magnitude_refined: vec![0; sample_count],
+            visited_in_bitplane: vec![0; sample_count],
+            neighbor_counts: vec![SignificanceNeighbors::default(); sample_count],
         })
     }
 
     pub fn is_significant(&self, x: u32, y: u32) -> Option<bool> {
-        self.index(x, y).map(|index| self.significant[index])
+        self.index(x, y).map(|index| self.significant[index] != 0)
     }
 
     pub fn sign(&self, x: u32, y: u32) -> Option<bool> {
-        self.index(x, y).map(|index| self.sign[index])
+        self.index(x, y).map(|index| self.sign[index] != 0)
     }
 
     pub fn is_magnitude_refined(&self, x: u32, y: u32) -> Option<bool> {
-        self.index(x, y).map(|index| self.magnitude_refined[index])
+        self.index(x, y)
+            .map(|index| self.magnitude_refined[index] != 0)
     }
 
     pub fn is_visited_in_bitplane(&self, x: u32, y: u32) -> Option<bool> {
-        self.index(x, y).map(|index| self.visited_in_bitplane[index])
+        self.index(x, y)
+            .map(|index| self.visited_in_bitplane[index] != 0)
     }
 
     pub fn clear_bitplane_visits(&mut self) {
-        self.visited_in_bitplane.fill(false);
+        self.visited_in_bitplane.fill(0);
     }
 
     pub fn mark_significant(
@@ -629,8 +644,11 @@ impl CodeblockStatePlanes {
                 self.width, self.height
             ))
         })?;
-        self.significant[index] = true;
-        self.sign[index] = is_negative;
+        if self.significant[index] == 0 {
+            self.update_neighbor_counts_for_significant(x as usize, y as usize);
+        }
+        self.significant[index] = 1;
+        self.sign[index] = u8::from(is_negative);
         Ok(())
     }
 
@@ -641,7 +659,7 @@ impl CodeblockStatePlanes {
                 self.width, self.height
             ))
         })?;
-        self.magnitude_refined[index] = true;
+        self.magnitude_refined[index] = 1;
         Ok(())
     }
 
@@ -652,59 +670,64 @@ impl CodeblockStatePlanes {
                 self.width, self.height
             ))
         })?;
-        self.visited_in_bitplane[index] = true;
+        self.visited_in_bitplane[index] = 1;
         Ok(())
     }
 
     pub fn significance_neighbors(&self, x: u32, y: u32) -> Option<SignificanceNeighbors> {
         self.index(x, y)?;
+        Some(self.significance_neighbors_unchecked(x as usize, y as usize))
+    }
 
-        let mut neighbors = SignificanceNeighbors::default();
-        for y_delta in -1i32..=1 {
-            for x_delta in -1i32..=1 {
-                if x_delta == 0 && y_delta == 0 {
+    fn significance_neighbors_unchecked(&self, x: usize, y: usize) -> SignificanceNeighbors {
+        self.neighbor_counts[y * self.width as usize + x]
+    }
+
+    fn update_neighbor_counts_for_significant(&mut self, x: usize, y: usize) {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let y0 = y.saturating_sub(1);
+        let y1 = (y + 1).min(height - 1);
+        let x0 = x.saturating_sub(1);
+        let x1 = (x + 1).min(width - 1);
+
+        for ny in y0..=y1 {
+            for nx in x0..=x1 {
+                if nx == x && ny == y {
                     continue;
                 }
-                let Some(nx) = x.checked_add_signed(x_delta) else {
-                    continue;
-                };
-                let Some(ny) = y.checked_add_signed(y_delta) else {
-                    continue;
-                };
-                if !self.is_significant(nx, ny).unwrap_or(false) {
-                    continue;
-                }
-
-                match (x_delta, y_delta) {
-                    (-1 | 1, 0) => neighbors.horizontal += 1,
-                    (0, -1 | 1) => neighbors.vertical += 1,
-                    _ => neighbors.diagonal += 1,
+                let neighbors = &mut self.neighbor_counts[ny * width + nx];
+                if ny == y {
+                    neighbors.horizontal += 1;
+                } else if nx == x {
+                    neighbors.vertical += 1;
+                } else {
+                    neighbors.diagonal += 1;
                 }
             }
         }
-
-        Some(neighbors)
     }
 
     pub fn significance_context(&self, subband: SubbandKind, x: u32, y: u32) -> Option<usize> {
-        let neighbors = self.significance_neighbors(x, y)?;
+        self.index(x, y)?;
+        let neighbors = self.significance_neighbors_unchecked(x as usize, y as usize);
         Some(significance_context_label(subband, neighbors))
     }
 
     pub fn sign_context_for(&self, x: u32, y: u32) -> Option<SignCodingContext> {
         self.index(x, y)?;
-        let horizontal = self.sign_contribution(x, y, [(-1, 0), (1, 0)]);
-        let vertical = self.sign_contribution(x, y, [(0, -1), (0, 1)]);
+        let horizontal = self.sign_contribution_unchecked(x as usize, y as usize, [(-1, 0), (1, 0)]);
+        let vertical = self.sign_contribution_unchecked(x as usize, y as usize, [(0, -1), (0, 1)]);
         Some(SignCodingContext::from_contributions(horizontal, vertical))
     }
 
     pub fn magnitude_refinement_context(&self, x: u32, y: u32) -> Option<usize> {
-        let is_refined = self.is_magnitude_refined(x, y)?;
-        if is_refined {
+        let index = self.index(x, y)?;
+        if self.magnitude_refined[index] != 0 {
             return Some(TIER1_MAGNITUDE_REFINEMENT_CONTEXT_REFINED);
         }
 
-        let neighbors = self.significance_neighbors(x, y)?;
+        let neighbors = self.significance_neighbors_unchecked(x as usize, y as usize);
         if neighbors.has_any() {
             Some(TIER1_MAGNITUDE_REFINEMENT_CONTEXT_FIRST_WITH_NEIGHBORS)
         } else {
@@ -713,7 +736,7 @@ impl CodeblockStatePlanes {
     }
 
     pub fn significant_count(&self) -> usize {
-        self.significant.iter().filter(|value| **value).count()
+        self.significant.iter().filter(|value| **value != 0).count()
     }
 
     fn index(&self, x: u32, y: u32) -> Option<usize> {
@@ -723,21 +746,27 @@ impl CodeblockStatePlanes {
         Some((y * self.width + x) as usize)
     }
 
-    fn sign_contribution(&self, x: u32, y: u32, offsets: [(i32, i32); 2]) -> i8 {
+    fn sign_contribution_unchecked(&self, x: usize, y: usize, offsets: [(i32, i32); 2]) -> i8 {
         let mut has_positive = false;
         let mut has_negative = false;
+        let width = self.width as usize;
+        let height = self.height as usize;
 
         for (x_delta, y_delta) in offsets {
-            let Some(nx) = x.checked_add_signed(x_delta) else {
+            let Some(nx) = x.checked_add_signed(x_delta as isize) else {
                 continue;
             };
-            let Some(ny) = y.checked_add_signed(y_delta) else {
+            let Some(ny) = y.checked_add_signed(y_delta as isize) else {
                 continue;
             };
-            if !self.is_significant(nx, ny).unwrap_or(false) {
+            if nx >= width || ny >= height {
                 continue;
             }
-            if self.sign(nx, ny).unwrap_or(false) {
+            let index = ny * width + nx;
+            if self.significant[index] == 0 {
+                continue;
+            }
+            if self.sign[index] != 0 {
                 has_negative = true;
             } else {
                 has_positive = true;

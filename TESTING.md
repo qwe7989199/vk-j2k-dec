@@ -374,25 +374,27 @@ Current local CPU full-resolution profile:
 ```text
 profile-rgb48: mode cpu, 1920x1080 12-bit, discard 0, 6220800 samples
   input_bytes 99657, tile_bytes 99516, codeblocks decoded 879/879 (skipped 0), passes 25206, nonzero 119556
-  decode_total_ms 1164.224
-    packet_ms 0.586
-    work_plan_ms 0.201
-    bind_ms 0.063
-    tier1_decode_ms 1061.619
-    reconstruct_ms 93.723
-    pack_ms 6.406
+  decode_total_ms 419.794
+    packet_ms 0.584
+    work_plan_ms 0.203
+    bind_ms 0.053
+    tier1_decode_ms 325.135
+    reconstruct_ms 85.339
+    pack_ms 6.273
 ```
 
 Current local GPU full-path profile still includes per-frame Vulkan setup,
-transient buffers, dispatches, and readback:
+transient buffers, dispatches, and readback. Tier-1 shares the optimized CPU
+state tracking path; the remaining GPU-path bottleneck is now reconstruction,
+packing, and readback rather than arithmetic decode:
 
 ```text
 profile-rgb48: mode gpu, 1920x1080 12-bit, discard 0, 6220800 samples
   input_bytes 99657, tile_bytes 99516, codeblocks decoded 879/879 (skipped 0), passes 25206, nonzero 119556
-  decode_total_ms 2513.220
-    tier1_decode_ms 1130.933
-    reconstruct_ms 1198.752
-    pack_ms 181.933
+  decode_total_ms 1583.763
+    tier1_decode_ms 315.437
+    reconstruct_ms 1096.750
+    pack_ms 169.824
 ```
 
 The low-resolution path now prunes unused high-resolution codeblocks before
@@ -401,11 +403,16 @@ Tier-1 decode:
 ```text
 profile-rgb48: mode cpu, 120x68 12-bit, discard 4, 24480 samples
   input_bytes 99657, tile_bytes 99516, codeblocks decoded 12/879 (skipped 867), passes 432, nonzero 10883
-  decode_total_ms 14.093
-    tier1_decode_ms 13.105
-    reconstruct_ms 0.255
-    pack_ms 0.031
+  decode_total_ms 7.761
+    tier1_decode_ms 6.728
+    reconstruct_ms 0.280
+    pack_ms 0.035
 ```
+
+The current Tier-1 hot-path win comes from cached significance-neighbor counts,
+byte-backed state planes, direct coefficient/state access in decode passes, and
+avoiding an extra arithmetic-stream copy when binding concatenated codeblock
+segments.
 
 Current local release median timings, 6 runs with the first run discarded:
 

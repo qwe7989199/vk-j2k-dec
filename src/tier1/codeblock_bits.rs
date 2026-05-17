@@ -100,8 +100,18 @@ impl MqDecoder {
         decoder
     }
 
+    pub fn with_owned_data(data: Vec<u8>) -> Self {
+        let mut decoder = Self::new();
+        decoder.reset_owned_input(data);
+        decoder
+    }
+
     pub fn reset_input(&mut self, data: &[u8]) {
         self.input.reset(data);
+    }
+
+    pub fn reset_owned_input(&mut self, data: Vec<u8>) {
+        self.input.reset_owned(data);
     }
 
     pub fn reset_contexts(&mut self) {
@@ -250,9 +260,19 @@ impl MqInput {
     fn reset(&mut self, data: &[u8]) {
         self.data.clear();
         self.data.extend_from_slice(data);
+        self.reset_registers(data.is_empty());
+    }
+
+    fn reset_owned(&mut self, data: Vec<u8>) {
+        let is_empty = data.is_empty();
+        self.data = data;
+        self.reset_registers(is_empty);
+    }
+
+    fn reset_registers(&mut self, is_empty: bool) {
         self.data.extend_from_slice(&[0xff, 0xff]);
         self.byte_pos = 0;
-        self.c = if data.is_empty() {
+        self.c = if is_empty {
             0xff << 16
         } else {
             u32::from(self.byte_at(0)) << 16
