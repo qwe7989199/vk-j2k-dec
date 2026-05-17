@@ -1,4 +1,6 @@
-use crate::codestream::{CodeblockStyle, QcdSegment, QuantizationStep, SubbandKind, SubbandLayout};
+use crate::codestream::{
+    CodeblockStyle, QccSegment, QcdSegment, QuantizationStep, SubbandKind, SubbandLayout,
+};
 use crate::packet::{CodeblockSegmentRecord, TilePacketParseSummary};
 
 include!("tier1/work.rs");

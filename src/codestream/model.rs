@@ -4,6 +4,7 @@ pub struct Codestream {
     pub siz: Option<SizSegment>,
     pub cod: Option<CodSegment>,
     pub qcd: Option<QcdSegment>,
+    pub qccs: Vec<QccSegment>,
     pub comments: Vec<CommentSegment>,
     pub tile_parts: Vec<SotSegment>,
     pub markers: Vec<MarkerRecord>,
@@ -98,7 +99,7 @@ impl Codestream {
 
         for record in &self.markers {
             match record.marker {
-                Marker::Coc | Marker::Qcc | Marker::Rgn | Marker::Pod | Marker::Ppm => {
+                Marker::Coc | Marker::Rgn | Marker::Pod | Marker::Ppm => {
                     issues.push(ProfileIssue::new(format!(
                         "{} marker at 0x{:08x} is outside the first target",
                         record.marker, record.offset
@@ -109,6 +110,15 @@ impl Codestream {
         }
 
         ProfileReport { issues }
+    }
+
+    pub fn quantization_for_component(&self, component: u16) -> Option<&QcdSegment> {
+        self.qccs
+            .iter()
+            .rev()
+            .find(|qcc| qcc.component == component)
+            .map(|qcc| &qcc.quantization)
+            .or(self.qcd.as_ref())
     }
 
     pub fn tile_layouts(&self) -> Result<Vec<TileLayout>, LayoutError> {
@@ -571,6 +581,12 @@ pub struct QcdSegment {
     pub guard_bits: u8,
     pub style: QuantizationStyle,
     pub raw_steps: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QccSegment {
+    pub component: u16,
+    pub quantization: QcdSegment,
 }
 
 impl QcdSegment {

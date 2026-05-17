@@ -13,6 +13,7 @@ pub struct GpuPipelinePlan {
     pub output_max: u32,
     pub level_shift: f32,
     pub qcd_steps: Vec<GpuQuantizationStep>,
+    pub qcc_steps: Vec<GpuComponentQuantizationSteps>,
 }
 
 impl GpuPipelinePlan {
@@ -25,10 +26,7 @@ impl GpuPipelinePlan {
             .cod
             .as_ref()
             .ok_or_else(|| GpuPlanError::new("missing COD marker"))?;
-        let qcd = codestream
-            .qcd
-            .as_ref()
-            .ok_or_else(|| GpuPlanError::new("missing QCD marker"))?;
+        let qcd = codestream.qcd.as_ref();
         let precision = siz
             .components
             .iter()
@@ -57,11 +55,26 @@ impl GpuPipelinePlan {
             output_max: (1u32 << precision) - 1,
             level_shift: (1u32 << (precision - 1)) as f32,
             qcd_steps: qcd
-                .steps()
+                .map(|qcd| qcd.steps())
+                .transpose()
                 .map_err(|err| GpuPlanError::new(err.message))?
+                .unwrap_or_default()
                 .into_iter()
                 .map(GpuQuantizationStep::from)
                 .collect(),
+            qcc_steps: codestream
+                .qccs
+                .iter()
+                .map(|qcc| {
+                    qcc.quantization
+                        .steps()
+                        .map_err(|err| GpuPlanError::new(err.message))
+                        .map(|steps| GpuComponentQuantizationSteps {
+                            component: qcc.component,
+                            steps: steps.into_iter().map(GpuQuantizationStep::from).collect(),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 
@@ -70,18 +83,51 @@ impl GpuPipelinePlan {
         resolution: u8,
         subband: crate::codestream::SubbandKind,
     ) -> Result<&GpuQuantizationStep, GpuPlanError> {
+        self.quantization_step_for(None, resolution, subband)
+    }
+
+    pub fn qcd_step_for_component(
+        &self,
+        component: u16,
+        resolution: u8,
+        subband: crate::codestream::SubbandKind,
+    ) -> Result<&GpuQuantizationStep, GpuPlanError> {
+        self.quantization_step_for(Some(component), resolution, subband)
+    }
+
+    fn quantization_step_for(
+        &self,
+        component: Option<u16>,
+        resolution: u8,
+        subband: crate::codestream::SubbandKind,
+    ) -> Result<&GpuQuantizationStep, GpuPlanError> {
         let index = qcd_step_index(resolution, subband).ok_or_else(|| {
             GpuPlanError::new(format!(
                 "resolution {resolution} subband {subband} has no QCD step index"
             ))
         })?;
-        self.qcd_steps.get(index).ok_or_else(|| {
+        let steps = component
+            .and_then(|component| {
+                self.qcc_steps
+                    .iter()
+                    .rev()
+                    .find(|qcc| qcc.component == component)
+            })
+            .map(|qcc| qcc.steps.as_slice())
+            .unwrap_or(&self.qcd_steps);
+        steps.get(index).ok_or_else(|| {
             GpuPlanError::new(format!(
-                "QCD has {} step(s), missing index {index} for R{resolution} {subband}",
-                self.qcd_steps.len()
+                "quantization table has {} step(s), missing index {index} for R{resolution} {subband}",
+                steps.len()
             ))
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuComponentQuantizationSteps {
+    pub component: u16,
+    pub steps: Vec<GpuQuantizationStep>,
 }
 
 fn qcd_step_index(resolution: u8, subband: crate::codestream::SubbandKind) -> Option<usize> {
@@ -389,8 +435,8 @@ impl std::error::Error for GpuPlanError {}
 mod tests {
     use super::*;
     use crate::codestream::{
-        CodSegment, ComponentSpec, ProgressionOrder, QcdSegment, QuantizationStyle, SizSegment,
-        SubbandKind,
+        CodSegment, ComponentSpec, ProgressionOrder, QccSegment, QcdSegment, QuantizationStyle,
+        SizSegment, SubbandKind,
     };
 
     #[test]
@@ -434,6 +480,7 @@ mod tests {
                 style: QuantizationStyle::NoQuantization,
                 raw_steps: vec![0x28; 16],
             }),
+            qccs: Vec::new(),
             comments: Vec::new(),
             tile_parts: Vec::new(),
             markers: Vec::new(),
@@ -520,6 +567,35 @@ mod tests {
         assert!(plan.qcd_step_for(1, SubbandKind::Hl).is_err());
     }
 
+    #[test]
+    fn gpu_plan_tracks_component_quantization_overrides() {
+        let mut codestream = reversible_rgb12_codestream();
+        codestream.qccs.push(QccSegment {
+            component: 2,
+            quantization: QcdSegment {
+                guard_bits: 2,
+                style: QuantizationStyle::NoQuantization,
+                raw_steps: vec![0x28, 0x30, 0x38, 0x40],
+            },
+        });
+
+        let plan = GpuPipelinePlan::from_codestream(&codestream).expect("gpu plan");
+
+        assert_eq!(plan.qcc_steps.len(), 1);
+        assert_eq!(
+            plan.qcd_step_for_component(2, 1, SubbandKind::Hl)
+                .expect("QCC HL")
+                .raw,
+            0x30
+        );
+        assert_eq!(
+            plan.qcd_step_for_component(1, 1, SubbandKind::Hl)
+                .expect("QCD fallback")
+                .raw,
+            0x28
+        );
+    }
+
     fn reversible_rgb12_codestream() -> Codestream {
         Codestream {
             byte_len: 0,
@@ -560,6 +636,7 @@ mod tests {
                 style: QuantizationStyle::NoQuantization,
                 raw_steps: vec![0x28; 16],
             }),
+            qccs: Vec::new(),
             comments: Vec::new(),
             tile_parts: Vec::new(),
             markers: Vec::new(),

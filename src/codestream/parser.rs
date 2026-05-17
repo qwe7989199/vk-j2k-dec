@@ -14,6 +14,7 @@ impl<'a> Parser<'a> {
                 siz: None,
                 cod: None,
                 qcd: None,
+                qccs: Vec::new(),
                 comments: Vec::new(),
                 tile_parts: Vec::new(),
                 markers: Vec::new(),
@@ -52,6 +53,12 @@ impl<'a> Parser<'a> {
                     let segment = self.read_segment(marker)?;
                     self.codestream.qcd = Some(parse_qcd(marker_offset, segment)?);
                 }
+                Marker::Qcc => {
+                    let segment = self.read_segment(marker)?;
+                    self.codestream
+                        .qccs
+                        .push(parse_qcc(marker_offset, segment, self.component_index_bytes()?)?);
+                }
                 Marker::Sot => {
                     let segment = self.read_segment(marker)?;
                     let mut sot = parse_sot(marker_offset, segment)?;
@@ -69,7 +76,6 @@ impl<'a> Parser<'a> {
                     return Ok(self.codestream);
                 }
                 Marker::Coc
-                | Marker::Qcc
                 | Marker::Rgn
                 | Marker::Pod
                 | Marker::Ppm
@@ -127,6 +133,12 @@ impl<'a> Parser<'a> {
                     let segment = self.read_segment(marker)?;
                     self.codestream.qcd = Some(parse_qcd(marker_offset, segment)?);
                 }
+                Marker::Qcc => {
+                    let segment = self.read_segment(marker)?;
+                    self.codestream
+                        .qccs
+                        .push(parse_qcc(marker_offset, segment, self.component_index_bytes()?)?);
+                }
                 marker if marker.has_segment() => {
                     let _ = self.read_segment(marker)?;
                 }
@@ -182,6 +194,17 @@ impl<'a> Parser<'a> {
         let segment = &self.data[self.pos..self.pos + payload_len];
         self.pos += payload_len;
         Ok(segment)
+    }
+
+    fn component_index_bytes(&self) -> Result<usize, ParseError> {
+        let component_count = self
+            .codestream
+            .siz
+            .as_ref()
+            .ok_or_else(|| ParseError::new(self.pos, "QCC marker requires preceding SIZ marker"))?
+            .components
+            .len();
+        Ok(if component_count < 257 { 1 } else { 2 })
     }
 
     fn skip_entropy_data(&mut self, tile_part_end: Option<usize>) -> Result<(), ParseError> {

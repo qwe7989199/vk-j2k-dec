@@ -50,6 +50,47 @@ mod tests {
     }
 
     #[test]
+    fn parses_component_quantization_override() {
+        let mut data = minimal_codestream();
+        let sot = data
+            .windows(2)
+            .position(|bytes| bytes == [0xff, 0x90])
+            .expect("SOT marker");
+        let qcc = [
+            0xff, 0x5d, // QCC
+            0x00, 0x06, // Lqcc
+            0x01, // component 1, one-byte Cqcc because Csiz < 257
+            0x42, // guard bits 2, scalar expounded
+            0x23, 0x45,
+        ];
+        data.splice(sot..sot, qcc);
+
+        let codestream = Codestream::parse(&data).expect("valid codestream");
+
+        assert_eq!(codestream.qccs.len(), 1);
+        assert_eq!(codestream.qccs[0].component, 1);
+        assert_eq!(
+            codestream
+                .quantization_for_component(1)
+                .expect("component override")
+                .steps()
+                .expect("steps")[0]
+                .raw,
+            0x2345
+        );
+        assert_eq!(
+            codestream
+                .quantization_for_component(0)
+                .expect("default qcd")
+                .steps()
+                .expect("steps")[0]
+                .raw,
+            0x1234
+        );
+        assert!(codestream.first_profile_report().is_supported());
+    }
+
+    #[test]
     fn builds_tile_layout_for_minimal_profile() {
         let data = minimal_codestream();
         let codestream = Codestream::parse(&data).expect("valid codestream");

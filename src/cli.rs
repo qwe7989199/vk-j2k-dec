@@ -300,9 +300,10 @@ fn tier1_subband_stats(path: &str) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let work_plan = match Tier1WorkPlan::from_packet_summary_with_qcd(
+        let work_plan = match Tier1WorkPlan::from_packet_summary_with_quantization(
             &packet_summary,
             codestream.qcd.as_ref(),
+            &codestream.qccs,
         ) {
             Ok(plan) => plan,
             Err(err) => {
@@ -513,9 +514,10 @@ fn reconstruct_smoke(path: &str) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let work_plan = match Tier1WorkPlan::from_packet_summary_with_qcd(
+        let work_plan = match Tier1WorkPlan::from_packet_summary_with_quantization(
             &packet_summary,
             codestream.qcd.as_ref(),
+            &codestream.qccs,
         ) {
             Ok(plan) => plan,
             Err(err) => {
@@ -667,9 +669,10 @@ fn tier1_smoke(path: &str, max_codeblocks: usize) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let work_plan = match Tier1WorkPlan::from_packet_summary_with_qcd(
+        let work_plan = match Tier1WorkPlan::from_packet_summary_with_quantization(
             &packet_summary,
             codestream.qcd.as_ref(),
+            &codestream.qccs,
         ) {
             Ok(plan) => plan,
             Err(err) => {
@@ -830,16 +833,38 @@ fn dump_codestream(path: &str) -> ExitCode {
             Err(err) => println!("quantization steps: unavailable ({err})"),
         }
     }
+    if !codestream.qccs.is_empty() {
+        println!(
+            "component quantization overrides: {}",
+            codestream.qccs.len()
+        );
+        for qcc in &codestream.qccs {
+            match qcc.quantization.steps() {
+                Ok(steps) => println!(
+                    "  component {}: {}, guard bits {}, {} step(s)",
+                    qcc.component,
+                    qcc.quantization.style,
+                    qcc.quantization.guard_bits,
+                    steps.len()
+                ),
+                Err(err) => println!(
+                    "  component {}: {}, guard bits {}, steps unavailable ({err})",
+                    qcc.component, qcc.quantization.style, qcc.quantization.guard_bits
+                ),
+            }
+        }
+    }
 
     match GpuPipelinePlan::from_codestream(&codestream) {
         Ok(plan) => println!(
-            "gpu plan: {} samples, color {}, shader mode {}, output max {}, level shift {}, qcd steps {}",
+            "gpu plan: {} samples, color {}, shader mode {}, output max {}, level shift {}, qcd steps {}, qcc overrides {}",
             plan.sample_count,
             plan.color_transform,
             plan.color_transform.shader_value(),
             plan.output_max,
             plan.level_shift,
-            plan.qcd_steps.len()
+            plan.qcd_steps.len(),
+            plan.qcc_steps.len()
         ),
         Err(err) => println!("gpu plan: unavailable ({err})"),
     }
@@ -974,8 +999,11 @@ fn print_packet_parse_summary(codestream: &Codestream, data: &[u8]) {
                         packet.segments.len()
                     );
                 }
-                match Tier1WorkPlan::from_packet_summary_with_qcd(&summary, codestream.qcd.as_ref())
-                {
+                match Tier1WorkPlan::from_packet_summary_with_quantization(
+                    &summary,
+                    codestream.qcd.as_ref(),
+                    &codestream.qccs,
+                ) {
                     Ok(plan) => match plan.dimension_bounds() {
                         Some(bounds) => {
                             println!(

@@ -384,8 +384,23 @@ impl Tier1WorkPlan {
         summary: &TilePacketParseSummary,
         qcd: Option<&QcdSegment>,
     ) -> Result<Self, Tier1PlanError> {
+        Self::from_packet_summary_with_quantization(summary, qcd, &[])
+    }
+
+    pub fn from_packet_summary_with_quantization(
+        summary: &TilePacketParseSummary,
+        qcd: Option<&QcdSegment>,
+        qccs: &[QccSegment],
+    ) -> Result<Self, Tier1PlanError> {
         let mut codeblocks = Vec::<CompressedCodeblock>::new();
-        let quantization = qcd.map(QuantizationBitplanes::new).transpose()?;
+        let default_quantization = qcd.map(QuantizationBitplanes::new).transpose()?;
+        let qcc_quantizations = qccs
+            .iter()
+            .map(|qcc| {
+                QuantizationBitplanes::new(&qcc.quantization)
+                    .map(|quantization| (qcc.component, quantization))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         for (packet_index, packet) in summary.packets.iter().enumerate() {
             for segment in &packet.segments {
@@ -406,8 +421,14 @@ impl Tier1WorkPlan {
                                 id
                             ))
                         })?;
+                        let quantization = qcc_quantizations
+                            .iter()
+                            .rev()
+                            .find(|(component, _)| *component == segment.component)
+                            .map(|(_, quantization)| quantization)
+                            .or(default_quantization.as_ref());
                         let magnitude_bitplanes =
-                            magnitude_bitplanes_for_segment(segment, quantization.as_ref())?;
+                            magnitude_bitplanes_for_segment(segment, quantization)?;
                         codeblocks.insert(
                             index,
                             CompressedCodeblock {

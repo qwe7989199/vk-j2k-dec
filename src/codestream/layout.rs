@@ -99,6 +99,34 @@ fn parse_qcd(marker_offset: usize, segment: &[u8]) -> Result<QcdSegment, ParseEr
     })
 }
 
+fn parse_qcc(
+    marker_offset: usize,
+    segment: &[u8],
+    component_index_bytes: usize,
+) -> Result<QccSegment, ParseError> {
+    let mut pos = 0;
+    let component = match component_index_bytes {
+        1 => u16::from(read_u8(segment, &mut pos, marker_offset + 4)?),
+        2 => read_u16(segment, &mut pos, marker_offset + 4)?,
+        _ => {
+            return Err(ParseError::new(
+                marker_offset,
+                format!("unsupported QCC component index width {component_index_bytes}"),
+            ));
+        }
+    };
+    let sqcc = read_u8(segment, &mut pos, marker_offset + 4 + component_index_bytes)?;
+
+    Ok(QccSegment {
+        component,
+        quantization: QcdSegment {
+            guard_bits: sqcc >> 5,
+            style: QuantizationStyle::from(sqcc & 0x1f),
+            raw_steps: segment[pos..].to_vec(),
+        },
+    })
+}
+
 fn parse_sot(marker_offset: usize, segment: &[u8]) -> Result<SotSegment, ParseError> {
     if segment.len() != 8 {
         return Err(ParseError::new(

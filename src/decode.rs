@@ -1,4 +1,4 @@
-use crate::codestream::{Codestream, QcdSegment, WaveletTransform};
+use crate::codestream::{Codestream, WaveletTransform};
 use crate::color::{
     ColorError, inverse_ict_sample, inverse_rct_sample, level_shift_and_clamp,
     level_shift_and_clamp_float,
@@ -142,9 +142,12 @@ pub fn decode_coefficient_planes(data: &[u8]) -> Result<DecodedCoefficientPlanes
         .ok_or_else(|| DecodeError::new("tile payload is outside codestream data"))?;
     let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers)
         .map_err(|err| DecodeError::new(err.to_string()))?;
-    let work_plan =
-        Tier1WorkPlan::from_packet_summary_with_qcd(&packet_summary, codestream.qcd.as_ref())
-            .map_err(|err| DecodeError::new(err.to_string()))?;
+    let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
+        &packet_summary,
+        codestream.qcd.as_ref(),
+        &codestream.qccs,
+    )
+    .map_err(|err| DecodeError::new(err.to_string()))?;
     let bound = work_plan
         .bind_segment_data(tile_data)
         .map_err(|err| DecodeError::new(err.to_string()))?;
@@ -211,9 +214,12 @@ pub fn decode_reversible_component_planes_with_discard(
         .ok_or_else(|| DecodeError::new("tile payload is outside codestream data"))?;
     let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers)
         .map_err(|err| DecodeError::new(err.to_string()))?;
-    let work_plan =
-        Tier1WorkPlan::from_packet_summary_with_qcd(&packet_summary, codestream.qcd.as_ref())
-            .map_err(|err| DecodeError::new(err.to_string()))?;
+    let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
+        &packet_summary,
+        codestream.qcd.as_ref(),
+        &codestream.qccs,
+    )
+    .map_err(|err| DecodeError::new(err.to_string()))?;
     let bound = work_plan
         .bind_segment_data(tile_data)
         .map_err(|err| DecodeError::new(err.to_string()))?;
@@ -326,9 +332,12 @@ fn decode_rgb48_with_backends(
         .ok_or_else(|| DecodeError::new("tile payload is outside codestream data"))?;
     let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers)
         .map_err(|err| DecodeError::new(err.to_string()))?;
-    let work_plan =
-        Tier1WorkPlan::from_packet_summary_with_qcd(&packet_summary, codestream.qcd.as_ref())
-            .map_err(|err| DecodeError::new(err.to_string()))?;
+    let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
+        &packet_summary,
+        codestream.qcd.as_ref(),
+        &codestream.qccs,
+    )
+    .map_err(|err| DecodeError::new(err.to_string()))?;
     let bound = work_plan
         .bind_segment_data(tile_data)
         .map_err(|err| DecodeError::new(err.to_string()))?;
@@ -380,15 +389,11 @@ fn decode_rgb48_with_backends(
             )
         }
         WaveletTransform::Irreversible97 => {
-            let qcd = codestream
-                .qcd
-                .as_ref()
-                .ok_or_else(|| DecodeError::new("irreversible 9/7 output requires QCD marker"))?;
             let component_planes = reconstruct_float_components(
                 &components,
                 target_resolution,
                 dwt_backend,
-                qcd,
+                &codestream,
                 precision,
                 cod.decomposition_levels,
             )?;
@@ -443,13 +448,21 @@ fn reconstruct_float_components(
     components: &[&ComponentSubbandPlanes],
     target_resolution: u8,
     dwt_backend: DwtBackend<'_>,
-    qcd: &QcdSegment,
+    codestream: &Codestream,
     precision: u8,
     decomposition_levels: u8,
 ) -> Result<Vec<PlaneF32>, DecodeError> {
     let float_components = components
         .iter()
         .map(|component| {
+            let qcd = codestream
+                .quantization_for_component(component.component)
+                .ok_or_else(|| {
+                    DecodeError::new(format!(
+                        "irreversible 9/7 output requires QCD/QCC marker for component {}",
+                        component.component
+                    ))
+                })?;
             ComponentFloatSubbandPlanes::from_component_with_qcd(
                 component,
                 qcd,

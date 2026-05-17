@@ -261,11 +261,11 @@ unclipped component-2 samples recoverable from FFmpeg's `rgb48le` output leaves
 387 / 4979 differing samples with component deltas in -2..2.
 
 Irreversible 9/7 codestreams now have a high-level CPU decode route for QCD
-scalar-expounded and scalar-derived quantization: steps are converted to float
-subband scales, then fed through CPU 9/7 reconstruction and float RGB48 packing.
-This is covered by unit tests but still needs a real irreversible sample and an
-OpenJPEG/FFmpeg diff before it becomes a local corpus baseline. QCC component
-overrides remain pending.
+scalar-expounded/scalar-derived quantization and QCC component overrides: steps
+are converted to per-component float subband scales, then fed through CPU 9/7
+reconstruction and float RGB48 packing. This is covered by unit tests but still
+needs a real irreversible sample and an OpenJPEG/FFmpeg diff before it becomes a
+local corpus baseline.
 
 The real-frame GPU DWT path is exposed through:
 

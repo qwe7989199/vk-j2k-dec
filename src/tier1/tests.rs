@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codestream::{CodeblockStyle, SubbandKind, SubbandLayout};
+    use crate::codestream::{
+        CodeblockStyle, QccSegment, QcdSegment, QuantizationStyle, SubbandKind, SubbandLayout,
+    };
     use crate::packet::{CodeblockSegmentRecord, PacketParseRecord};
 
     #[derive(Debug, Clone)]
@@ -726,6 +728,55 @@ mod tests {
             )
             .expect("exact decode");
         assert_eq!(exact.coefficient(0, 0), Some(128));
+    }
+
+    #[test]
+    fn work_plan_uses_component_quantization_override() {
+        let summary = TilePacketParseSummary {
+            consumed_bytes: 20,
+            packets: vec![PacketParseRecord {
+                offset: 0,
+                layer: 0,
+                resolution: 0,
+                component: 1,
+                present: true,
+                header_bytes: 1,
+                body_bytes: 8,
+                segments: vec![CodeblockSegmentRecord {
+                    component: 1,
+                    resolution: 0,
+                    subband: SubbandKind::Ll,
+                    codeblock_x: 0,
+                    codeblock_y: 0,
+                    codeblock_width: 4,
+                    codeblock_height: 4,
+                    newly_included: true,
+                    zero_bit_planes: Some(1),
+                    coding_passes: 1,
+                    body_offset: 1,
+                    byte_len: 8,
+                }],
+            }],
+        };
+        let qcd = QcdSegment {
+            guard_bits: 2,
+            style: QuantizationStyle::NoQuantization,
+            raw_steps: vec![0x28],
+        };
+        let qcc = QccSegment {
+            component: 1,
+            quantization: QcdSegment {
+                guard_bits: 1,
+                style: QuantizationStyle::NoQuantization,
+                raw_steps: vec![0x18],
+            },
+        };
+
+        let plan =
+            Tier1WorkPlan::from_packet_summary_with_quantization(&summary, Some(&qcd), &[qcc])
+                .expect("plan");
+
+        assert_eq!(plan.codeblocks[0].magnitude_bitplanes, 3);
     }
 
     #[test]
