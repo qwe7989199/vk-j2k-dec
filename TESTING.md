@@ -247,6 +247,7 @@ clamping, and `rgb48le` packing:
 
 ```text
 cargo run -- dump-component-plane target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 2 4 target\samples\ours_c2_lowres4.i32le
+cargo run -- diff-component-rgb48 target\samples\ours_c2_lowres4.i32le target\samples\ffmpeg_frame0_rgb48le_lowres4.raw 2 12
 ```
 
 Current local component-2 lowres-4 result:
@@ -257,8 +258,13 @@ dump-component-plane: component 2 120x68 12-bit discard 4, 8160 samples, 8160 no
 
 The component plane exceeds the signed 12-bit level-shift display range
 (-2048..2047), so raw RGB diffs include many clamped samples. Comparing only
-unclipped component-2 samples recoverable from FFmpeg's `rgb48le` output leaves
-387 / 4979 differing samples with component deltas in -2..2.
+unclipped samples recoverable from FFmpeg's `rgb48le` output gives:
+
+```text
+C0: 4679 comparable, 500 differing, max_abs 2, mean_abs 0.108570207309, clipped/saturated 3481
+C1: 4202 comparable, 427 differing, max_abs 2, mean_abs 0.103284150405, clipped/saturated 3958
+C2: 4979 comparable, 387 differing, max_abs 2, mean_abs 0.079935730066, clipped/saturated 3181
+```
 
 Irreversible 9/7 codestreams now have a high-level CPU decode route for QCD
 scalar-expounded/scalar-derived quantization and QCC component overrides: steps

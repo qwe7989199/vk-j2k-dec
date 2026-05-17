@@ -127,6 +127,34 @@ pub fn run() -> ExitCode {
             };
             raw::diff_rgb48_files(&actual, &reference)
         }
+        (Some("diff-component-plane"), Some(actual)) => {
+            let Some(reference) = args.next() else {
+                eprintln!("usage: {program} diff-component-plane <actual.i32le> <reference.i32le>");
+                return ExitCode::FAILURE;
+            };
+            raw::diff_component_plane_files(&actual, &reference)
+        }
+        (Some("diff-component-rgb48"), Some(actual)) => {
+            let Some(reference) = args.next() else {
+                eprintln!(
+                    "usage: {program} diff-component-rgb48 <actual.i32le> <reference.rgb48le> <component> <precision>"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(component) = args.next().and_then(|value| value.parse::<usize>().ok()) else {
+                eprintln!(
+                    "usage: {program} diff-component-rgb48 <actual.i32le> <reference.rgb48le> <component> <precision>"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(precision) = args.next().and_then(|value| value.parse::<u8>().ok()) else {
+                eprintln!(
+                    "usage: {program} diff-component-rgb48 <actual.i32le> <reference.rgb48le> <component> <precision>"
+                );
+                return ExitCode::FAILURE;
+            };
+            raw::diff_component_plane_rgb48_file(&actual, &reference, component, precision)
+        }
         (Some("dump-coeff-plane"), Some(path)) => {
             let Some(component) = args.next().and_then(|value| value.parse::<u16>().ok()) else {
                 eprintln!(
@@ -225,6 +253,10 @@ pub fn run() -> ExitCode {
                 "  {program} decode-rgb48-gpu <input.j2k> <discard-levels> <output.rgb48le> [idwt53.comp.spv] [color.comp.spv]"
             );
             eprintln!("  {program} diff-rgb48 <actual.rgb48le> <reference.rgb48le>");
+            eprintln!("  {program} diff-component-plane <actual.i32le> <reference.i32le>");
+            eprintln!(
+                "  {program} diff-component-rgb48 <actual.i32le> <reference.rgb48le> <component> <precision>"
+            );
             eprintln!(
                 "  {program} dump-coeff-plane <input.j2k> <component> <resolution> <LL|HL|LH|HH> <output.i32le>"
             );

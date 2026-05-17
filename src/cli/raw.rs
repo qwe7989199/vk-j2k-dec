@@ -169,6 +169,95 @@ pub fn diff_rgb48_files(actual: &str, reference: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+pub fn diff_component_plane_files(actual: &str, reference: &str) -> ExitCode {
+    let actual_bytes = match fs::read(actual) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("failed to read {actual}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reference_bytes = match fs::read(reference) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("failed to read {reference}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let actual_samples = match read_i32le_samples(&actual_bytes) {
+        Ok(samples) => samples,
+        Err(message) => {
+            eprintln!("diff-component-plane failed: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reference_samples = match read_i32le_samples(&reference_bytes) {
+        Ok(samples) => samples,
+        Err(message) => {
+            eprintln!("diff-component-plane failed: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let stats = match diff_i32_samples(&actual_samples, &reference_samples) {
+        Ok(stats) => stats,
+        Err(message) => {
+            eprintln!("diff-component-plane failed: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    print_i32_diff_stats("diff-component-plane", &stats);
+    ExitCode::SUCCESS
+}
+
+pub fn diff_component_plane_rgb48_file(
+    actual: &str,
+    reference: &str,
+    component: usize,
+    precision: u8,
+) -> ExitCode {
+    let actual_bytes = match fs::read(actual) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("failed to read {actual}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reference_bytes = match fs::read(reference) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("failed to read {reference}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let actual_samples = match read_i32le_samples(&actual_bytes) {
+        Ok(samples) => samples,
+        Err(message) => {
+            eprintln!("diff-component-rgb48 failed: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let stats = match diff_i32_samples_against_rgb48(
+        &actual_samples,
+        &reference_bytes,
+        component,
+        precision,
+    ) {
+        Ok(stats) => stats,
+        Err(message) => {
+            eprintln!("diff-component-rgb48 failed: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    print_i32_diff_stats("diff-component-rgb48", &stats.diff);
+    println!(
+        "  clipped_or_saturated {}, comparable {}, lowbit_misaligned {}",
+        stats.clipped_or_saturated, stats.comparable, stats.lowbit_misaligned
+    );
+    ExitCode::SUCCESS
+}
+
 pub fn dump_coeff_plane_file(
     input: &str,
     component: u16,
@@ -313,6 +402,27 @@ struct Rgb48DiffStats {
     channel_mean_abs: [f64; 3],
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct I32DiffStats {
+    samples: usize,
+    differing: u64,
+    max_abs: u32,
+    max_index: usize,
+    max_x: usize,
+    max_y: usize,
+    min_delta: i64,
+    max_delta: i64,
+    mean_abs: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ComponentRgb48DiffStats {
+    diff: I32DiffStats,
+    comparable: usize,
+    clipped_or_saturated: usize,
+    lowbit_misaligned: usize,
+}
+
 fn diff_rgb48(actual: &[u8], reference: &[u8]) -> Result<Rgb48DiffStats, String> {
     if actual.len() != reference.len() {
         return Err(format!(
@@ -387,8 +497,180 @@ fn diff_rgb48(actual: &[u8], reference: &[u8]) -> Result<Rgb48DiffStats, String>
     })
 }
 
+fn read_i32le_samples(bytes: &[u8]) -> Result<Vec<i32>, String> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(format!(
+            "i32le plane buffers must contain whole samples, got {} bytes",
+            bytes.len()
+        ));
+    }
+
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|bytes| i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .collect())
+}
+
+fn diff_i32_samples(actual: &[i32], reference: &[i32]) -> Result<I32DiffStats, String> {
+    if actual.len() != reference.len() {
+        return Err(format!(
+            "length mismatch: actual {} samples, reference {} samples",
+            actual.len(),
+            reference.len()
+        ));
+    }
+
+    Ok(diff_i32_indexed_sample_pairs(
+        actual
+            .iter()
+            .copied()
+            .zip(reference.iter().copied())
+            .enumerate()
+            .map(|(index, (actual, reference))| (index, actual, reference)),
+        actual.len(),
+        actual.len(),
+    ))
+}
+
+fn diff_i32_samples_against_rgb48(
+    actual: &[i32],
+    reference_rgb48: &[u8],
+    component: usize,
+    precision: u8,
+) -> Result<ComponentRgb48DiffStats, String> {
+    if component >= 3 {
+        return Err(format!("component must be 0, 1, or 2, got {component}"));
+    }
+    if precision == 0 || precision > 16 {
+        return Err(format!("precision must be in 1..=16, got {precision}"));
+    }
+    if !reference_rgb48.len().is_multiple_of(6) {
+        return Err(format!(
+            "rgb48 buffer must contain whole pixels, got {} bytes",
+            reference_rgb48.len()
+        ));
+    }
+    let pixels = reference_rgb48.len() / 6;
+    if actual.len() != pixels {
+        return Err(format!(
+            "length mismatch: actual {} component samples, reference {} pixels",
+            actual.len(),
+            pixels
+        ));
+    }
+
+    let shift = 16u8 - precision;
+    let low_mask = if shift == 0 { 0 } else { (1u16 << shift) - 1 };
+    let level_shift = 1i32 << (precision - 1);
+    let native_min = -level_shift;
+    let native_max = level_shift - 1;
+    let unsigned_max = (1i32 << precision) - 1;
+    let mut lowbit_misaligned = 0usize;
+    let mut clipped_or_saturated = 0usize;
+    let mut comparable = Vec::new();
+
+    for (index, actual_sample) in actual.iter().copied().enumerate() {
+        let byte_index = (index * 3 + component) * 2;
+        let packed =
+            u16::from_le_bytes([reference_rgb48[byte_index], reference_rgb48[byte_index + 1]]);
+        if packed & low_mask != 0 {
+            lowbit_misaligned += 1;
+        }
+        let reference_native = i32::from(packed >> shift) - level_shift;
+        let reference_unsigned = reference_native + level_shift;
+        if actual_sample < native_min
+            || actual_sample > native_max
+            || reference_unsigned == 0
+            || reference_unsigned == unsigned_max
+        {
+            clipped_or_saturated += 1;
+            continue;
+        }
+        comparable.push((index, actual_sample, reference_native));
+    }
+
+    let diff =
+        diff_i32_indexed_sample_pairs(comparable.iter().copied(), comparable.len(), actual.len());
+    Ok(ComponentRgb48DiffStats {
+        diff,
+        comparable: comparable.len(),
+        clipped_or_saturated,
+        lowbit_misaligned,
+    })
+}
+
+fn diff_i32_indexed_sample_pairs(
+    pairs: impl Iterator<Item = (usize, i32, i32)>,
+    samples: usize,
+    coordinate_samples: usize,
+) -> I32DiffStats {
+    let width = infer_plane_width(coordinate_samples);
+    let mut differing = 0u64;
+    let mut max_abs = 0u32;
+    let mut max_index = 0usize;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut min_delta = 0i64;
+    let mut max_delta = 0i64;
+    let mut sum_abs = 0u64;
+
+    for (index, actual, reference) in pairs {
+        let delta = i64::from(actual) - i64::from(reference);
+        let abs_delta = delta.unsigned_abs();
+        if delta != 0 {
+            differing += 1;
+        }
+        sum_abs += abs_delta;
+        min_delta = min_delta.min(delta);
+        max_delta = max_delta.max(delta);
+        if abs_delta > u64::from(max_abs) {
+            max_abs = abs_delta.min(u64::from(u32::MAX)) as u32;
+            max_index = index;
+            max_x = width.map(|value| index % value).unwrap_or(index);
+            max_y = width.map(|value| index / value).unwrap_or(0);
+        }
+    }
+
+    I32DiffStats {
+        samples,
+        differing,
+        max_abs,
+        max_index,
+        max_x,
+        max_y,
+        min_delta,
+        max_delta,
+        mean_abs: if samples == 0 {
+            0.0
+        } else {
+            sum_abs as f64 / samples as f64
+        },
+    }
+}
+
+fn print_i32_diff_stats(label: &str, stats: &I32DiffStats) {
+    println!(
+        "{label}: samples {}, differing {}, max_abs {} at sample {} (x {}, y {}), mean_abs {:.12}",
+        stats.samples,
+        stats.differing,
+        stats.max_abs,
+        stats.max_index,
+        stats.max_x,
+        stats.max_y,
+        stats.mean_abs
+    );
+    println!(
+        "  signed_delta min {} max {}",
+        stats.min_delta, stats.max_delta
+    );
+}
+
 fn infer_rgb48_width(pixels: usize) -> Option<usize> {
-    match pixels {
+    infer_plane_width(pixels)
+}
+
+fn infer_plane_width(samples: usize) -> Option<usize> {
+    match samples {
         value if value == 60 * 34 => Some(60),
         value if value == 120 * 68 => Some(120),
         value if value == 240 * 135 => Some(240),
@@ -405,5 +687,47 @@ fn channel_name(channel: usize) -> &'static str {
         1 => "G",
         2 => "B",
         _ => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn component_rgb48_diff_preserves_source_coordinates() {
+        let mut actual = vec![10i32; 120 * 68];
+        actual[2 * 120 + 29] = 12;
+        let mut reference = vec![0u8; 120 * 68 * 6];
+        for index in 0..120 * 68 {
+            let packed = ((2048u16 + 10) << 4).to_le_bytes();
+            let byte_index = (index * 3 + 2) * 2;
+            reference[byte_index..byte_index + 2].copy_from_slice(&packed);
+        }
+
+        let stats = diff_i32_samples_against_rgb48(&actual, &reference, 2, 12).expect("diff stats");
+
+        assert_eq!(stats.diff.max_abs, 2);
+        assert_eq!(stats.diff.max_index, 269);
+        assert_eq!(stats.diff.max_x, 29);
+        assert_eq!(stats.diff.max_y, 2);
+        assert_eq!(stats.lowbit_misaligned, 0);
+    }
+
+    #[test]
+    fn component_rgb48_diff_skips_clipped_samples() {
+        let actual = vec![-3000, 0, 3000];
+        let mut reference = Vec::new();
+        for sample in [0u16, 2048u16 << 4, 4095u16 << 4] {
+            reference.extend_from_slice(&sample.to_le_bytes());
+            reference.extend_from_slice(&sample.to_le_bytes());
+            reference.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let stats = diff_i32_samples_against_rgb48(&actual, &reference, 0, 12).expect("diff stats");
+
+        assert_eq!(stats.clipped_or_saturated, 2);
+        assert_eq!(stats.comparable, 1);
+        assert_eq!(stats.diff.differing, 0);
     }
 }
