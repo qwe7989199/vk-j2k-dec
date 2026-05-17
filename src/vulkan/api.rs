@@ -370,78 +370,30 @@ pub fn run_idwt53_smoke(shader_path: &str) -> Result<Idwt53SmokeResult, VulkanEr
         )
         .map_err(|err| VulkanError::new(format!("CPU inverse 5/3 level failed: {err}")))?;
 
-        let low_rows_seed = vec![0i32; 3 * 4];
-        let high_rows_seed = vec![0i32; 2 * 4];
+        let low_columns_seed = vec![0i32; 5 * 2];
+        let high_columns_seed = vec![0i32; 5 * 2];
         let level_seed = vec![0i32; expected_level.samples.len()];
         let ll_buffer = device.create_host_buffer(bytes_len::<i32>(ll.len())?)?;
         let hl_buffer = device.create_host_buffer(bytes_len::<i32>(hl.len())?)?;
         let lh_buffer = device.create_host_buffer(bytes_len::<i32>(lh.len())?)?;
         let hh_buffer = device.create_host_buffer(bytes_len::<i32>(hh.len())?)?;
-        let low_rows_buffer = device.create_host_buffer(bytes_len::<i32>(low_rows_seed.len())?)?;
-        let high_rows_buffer = device.create_host_buffer(bytes_len::<i32>(high_rows_seed.len())?)?;
+        let low_columns_buffer =
+            device.create_host_buffer(bytes_len::<i32>(low_columns_seed.len())?)?;
+        let high_columns_buffer =
+            device.create_host_buffer(bytes_len::<i32>(high_columns_seed.len())?)?;
         let level_output_buffer = device.create_host_buffer(bytes_len::<i32>(level_seed.len())?)?;
         ll_buffer.write_slice(&ll)?;
         hl_buffer.write_slice(&hl)?;
         lh_buffer.write_slice(&lh)?;
         hh_buffer.write_slice(&hh)?;
-        low_rows_buffer.write_slice(&low_rows_seed)?;
-        high_rows_buffer.write_slice(&high_rows_seed)?;
+        low_columns_buffer.write_slice(&low_columns_seed)?;
+        high_columns_buffer.write_slice(&high_columns_seed)?;
         level_output_buffer.write_slice(&level_seed)?;
 
-        let vertical_low_push = Idwt53PushConstants {
-            low_count: 2,
-            high_count: 2,
-            line_count: 3,
-            low_line_stride: 1,
-            low_sample_stride: 3,
-            high_line_stride: 1,
-            high_sample_stride: 3,
-            output_line_stride: 1,
-            output_sample_stride: 3,
-        };
-        dispatch_storage_shader(
-            device,
-            queue_family_index,
-            &spirv,
-            &[
-                ll_buffer.descriptor_info(),
-                lh_buffer.descriptor_info(),
-                low_rows_buffer.descriptor_info(),
-            ],
-            bytes_of(&vertical_low_push),
-            1,
-            1,
-        )?;
-
-        let vertical_high_push = Idwt53PushConstants {
-            low_count: 2,
-            high_count: 2,
-            line_count: 2,
-            low_line_stride: 1,
-            low_sample_stride: 2,
-            high_line_stride: 1,
-            high_sample_stride: 2,
-            output_line_stride: 1,
-            output_sample_stride: 2,
-        };
-        dispatch_storage_shader(
-            device,
-            queue_family_index,
-            &spirv,
-            &[
-                hl_buffer.descriptor_info(),
-                hh_buffer.descriptor_info(),
-                high_rows_buffer.descriptor_info(),
-            ],
-            bytes_of(&vertical_high_push),
-            1,
-            1,
-        )?;
-
-        let horizontal_push = Idwt53PushConstants {
+        let horizontal_low_push = Idwt53PushConstants {
             low_count: 3,
             high_count: 2,
-            line_count: 4,
+            line_count: 2,
             low_line_stride: 3,
             low_sample_stride: 1,
             high_line_stride: 2,
@@ -454,11 +406,61 @@ pub fn run_idwt53_smoke(shader_path: &str) -> Result<Idwt53SmokeResult, VulkanEr
             queue_family_index,
             &spirv,
             &[
-                low_rows_buffer.descriptor_info(),
-                high_rows_buffer.descriptor_info(),
+                ll_buffer.descriptor_info(),
+                hl_buffer.descriptor_info(),
+                low_columns_buffer.descriptor_info(),
+            ],
+            bytes_of(&horizontal_low_push),
+            1,
+            1,
+        )?;
+
+        let horizontal_high_push = Idwt53PushConstants {
+            low_count: 3,
+            high_count: 2,
+            line_count: 2,
+            low_line_stride: 3,
+            low_sample_stride: 1,
+            high_line_stride: 2,
+            high_sample_stride: 1,
+            output_line_stride: 5,
+            output_sample_stride: 1,
+        };
+        dispatch_storage_shader(
+            device,
+            queue_family_index,
+            &spirv,
+            &[
+                lh_buffer.descriptor_info(),
+                hh_buffer.descriptor_info(),
+                high_columns_buffer.descriptor_info(),
+            ],
+            bytes_of(&horizontal_high_push),
+            1,
+            1,
+        )?;
+
+        let vertical_push = Idwt53PushConstants {
+            low_count: 2,
+            high_count: 2,
+            line_count: 5,
+            low_line_stride: 1,
+            low_sample_stride: 5,
+            high_line_stride: 1,
+            high_sample_stride: 5,
+            output_line_stride: 1,
+            output_sample_stride: 5,
+        };
+        dispatch_storage_shader(
+            device,
+            queue_family_index,
+            &spirv,
+            &[
+                low_columns_buffer.descriptor_info(),
+                high_columns_buffer.descriptor_info(),
                 level_output_buffer.descriptor_info(),
             ],
-            bytes_of(&horizontal_push),
+            bytes_of(&vertical_push),
             1,
             1,
         )?;

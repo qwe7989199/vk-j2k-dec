@@ -49,6 +49,46 @@ pub fn run() -> ExitCode {
             tier1_smoke(&path, max_codeblocks)
         }
         (Some("tier1-subband-stats"), Some(path)) => tier1_subband_stats(&path),
+        (Some("tier1-codeblock-trace"), Some(path)) => {
+            let Some(component) = args.next().and_then(|value| value.parse::<u16>().ok()) else {
+                eprintln!(
+                    "usage: {program} tier1-codeblock-trace <input.j2k> <component> <resolution> <LL|HL|LH|HH> <codeblock-x> <codeblock-y>"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(resolution) = args.next().and_then(|value| value.parse::<u8>().ok()) else {
+                eprintln!(
+                    "usage: {program} tier1-codeblock-trace <input.j2k> <component> <resolution> <LL|HL|LH|HH> <codeblock-x> <codeblock-y>"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(subband) = args.next() else {
+                eprintln!(
+                    "usage: {program} tier1-codeblock-trace <input.j2k> <component> <resolution> <LL|HL|LH|HH> <codeblock-x> <codeblock-y>"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(codeblock_x) = args.next().and_then(|value| value.parse::<u32>().ok()) else {
+                eprintln!(
+                    "usage: {program} tier1-codeblock-trace <input.j2k> <component> <resolution> <LL|HL|LH|HH> <codeblock-x> <codeblock-y>"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(codeblock_y) = args.next().and_then(|value| value.parse::<u32>().ok()) else {
+                eprintln!(
+                    "usage: {program} tier1-codeblock-trace <input.j2k> <component> <resolution> <LL|HL|LH|HH> <codeblock-x> <codeblock-y>"
+                );
+                return ExitCode::FAILURE;
+            };
+            raw::trace_tier1_codeblock_file(
+                &path,
+                component,
+                resolution,
+                &subband,
+                codeblock_x,
+                codeblock_y,
+            )
+        }
         (Some("reconstruct-smoke"), Some(path)) => reconstruct_smoke(&path),
         (Some("decode-rgb48"), Some(path)) => {
             let Some(output) = args.next() else {
@@ -155,6 +195,45 @@ pub fn run() -> ExitCode {
             };
             raw::diff_component_plane_rgb48_file(&actual, &reference, component, precision)
         }
+        (Some("trace-component53-sample"), Some(path)) => {
+            let Some(component) = args.next().and_then(|value| value.parse::<usize>().ok()) else {
+                eprintln!(
+                    "usage: {program} trace-component53-sample <input.j2k> <component> <discard-levels> <x> <y> [max-deps]"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(discard_levels) = args.next().and_then(|value| value.parse::<u8>().ok())
+            else {
+                eprintln!(
+                    "usage: {program} trace-component53-sample <input.j2k> <component> <discard-levels> <x> <y> [max-deps]"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(x) = args.next().and_then(|value| value.parse::<u32>().ok()) else {
+                eprintln!(
+                    "usage: {program} trace-component53-sample <input.j2k> <component> <discard-levels> <x> <y> [max-deps]"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(y) = args.next().and_then(|value| value.parse::<u32>().ok()) else {
+                eprintln!(
+                    "usage: {program} trace-component53-sample <input.j2k> <component> <discard-levels> <x> <y> [max-deps]"
+                );
+                return ExitCode::FAILURE;
+            };
+            let max_dependencies = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(96);
+            raw::trace_component53_sample_file(
+                &path,
+                component,
+                discard_levels,
+                x,
+                y,
+                max_dependencies,
+            )
+        }
         (Some("dump-coeff-plane"), Some(path)) => {
             let Some(component) = args.next().and_then(|value| value.parse::<u16>().ok()) else {
                 eprintln!(
@@ -241,6 +320,9 @@ pub fn run() -> ExitCode {
             eprintln!("  {program} extract <container-or-bytestream> <index> <output.j2k>");
             eprintln!("  {program} tier1-smoke <input.j2k> [max_codeblocks]");
             eprintln!("  {program} tier1-subband-stats <input.j2k>");
+            eprintln!(
+                "  {program} tier1-codeblock-trace <input.j2k> <component> <resolution> <LL|HL|LH|HH> <codeblock-x> <codeblock-y>"
+            );
             eprintln!("  {program} reconstruct-smoke <input.j2k>");
             eprintln!("  {program} decode-rgb48 <input.j2k> <output.rgb48le>");
             eprintln!(
@@ -256,6 +338,9 @@ pub fn run() -> ExitCode {
             eprintln!("  {program} diff-component-plane <actual.i32le> <reference.i32le>");
             eprintln!(
                 "  {program} diff-component-rgb48 <actual.i32le> <reference.rgb48le> <component> <precision>"
+            );
+            eprintln!(
+                "  {program} trace-component53-sample <input.j2k> <component> <discard-levels> <x> <y> [max-deps]"
             );
             eprintln!(
                 "  {program} dump-coeff-plane <input.j2k> <component> <resolution> <LL|HL|LH|HH> <output.i32le>"

@@ -150,14 +150,14 @@ writing raw `rgb48le`.
 
 Current local full-resolution diff against FFmpeg after MQ context
 initialization, QCD-derived bitplane scheduling, corrected MQ MPS exchange,
-exact reversible Tier-1 coefficient reconstruction, and high-bit `rgb48le`
-packing:
+exact reversible Tier-1 coefficient reconstruction, FFmpeg-compatible
+horizontal-first integer 5/3 reconstruction, and high-bit `rgb48le` packing:
 
 ```text
-diff-rgb48: samples 6220800, differing 533125, max_abs 80 at sample 1417778 (x 272, y 246, channel B), mean_abs 1.479717078189
-  signed_delta min -80 max 80
-  channel_diff R=215703 G=160041 B=157381
-  channel_mean R=1.779521604938 G=1.337168209877 B=1.322461419753
+diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0 (x 0, y 0, channel R), mean_abs 0.000000000000
+  signed_delta min 0 max 0
+  channel_diff R=0 G=0 B=0
+  channel_mean R=0.000000000000 G=0.000000000000 B=0.000000000000
 ```
 
 The low-resolution LL-only path helps isolate Tier-1 from inverse DWT:
@@ -177,30 +177,31 @@ diff-rgb48: samples 6120, differing 0, max_abs 0 at sample 0 (x 0, y 0, channel 
   channel_mean R=0.000000000000 G=0.000000000000 B=0.000000000000
 ```
 
-This is a live correctness baseline, not a pass condition yet.
+This is a live correctness baseline and currently passes for the local frame.
 
-Current local low-resolution sweep after exact reversible Tier-1 reconstruction:
+Current local low-resolution sweep after exact reversible Tier-1 reconstruction
+and horizontal-first integer 5/3:
 
 | discard | output | differing samples | max_abs | mean_abs |
 | --- | --- | ---: | ---: | ---: |
 | 5 | 60x34 | 0 | 0 | 0.000000000000 |
-| 4 | 120x68 | 1414 | 32 | 0.941830065359 |
-| 3 | 240x135 | 7159 | 48 | 1.237695473251 |
-| 2 | 480x270 | 30761 | 48 | 1.351522633745 |
-| 1 | 960x540 | 130649 | 80 | 1.446347736626 |
-| 0 | 1920x1080 | 533125 | 80 | 1.479717078189 |
+| 4 | 120x68 | 0 | 0 | 0.000000000000 |
+| 3 | 240x135 | 0 | 0 | 0.000000000000 |
+| 2 | 480x270 | 0 | 0 | 0.000000000000 |
+| 1 | 960x540 | 0 | 0 | 0.000000000000 |
+| 0 | 1920x1080 | 0 | 0 | 0.000000000000 |
 
-The LL-only path is now exact, and the first remaining error appears when the
-first high-frequency 5/3 reconstruction level is included.
+The local reversible 5/3 frame is now bit-exact against FFmpeg at every
+available reduction level and at full resolution.
 
 `diff-rgb48` now reports the max-difference pixel coordinate, channel, and signed
 delta range. Regenerating the current lowres-4 output gives:
 
 ```text
-diff-rgb48: samples 24480, differing 1414, max_abs 32 at sample 809 (x 29, y 2, channel B), mean_abs 0.941830065359
-  signed_delta min -32 max 32
-  channel_diff R=528 G=462 B=424
-  channel_mean R=1.050980392157 G=0.921568627451 B=0.852941176471
+diff-rgb48: samples 24480, differing 0, max_abs 0 at sample 0 (x 0, y 0, channel R), mean_abs 0.000000000000
+  signed_delta min 0 max 0
+  channel_diff R=0 G=0 B=0
+  channel_mean R=0.000000000000 G=0.000000000000 B=0.000000000000
 ```
 
 Tier-1 coefficient planes can be dumped before inverse DWT for subband-level
@@ -221,8 +222,7 @@ dump-coeff-plane: component 0 R1 HH 60x34, 2040 samples, 387 nonzero, min -4580,
 ```
 
 Subband-level Tier-1 stats show that R1 high-band packet bodies are fully
-consumed by the MQ decoder, so the first lowres-4 mismatch is not caused by an
-obvious early stop in byte input:
+consumed by the MQ decoder:
 
 ```text
 cargo run -- tier1-subband-stats target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
@@ -253,18 +253,51 @@ cargo run -- diff-component-rgb48 target\samples\ours_c2_lowres4.i32le target\sa
 Current local component-2 lowres-4 result:
 
 ```text
-dump-component-plane: component 2 120x68 12-bit discard 4, 8160 samples, 8160 nonzero, min -3161, max 3300
+dump-component-plane: component 2 120x68 12-bit discard 4, 8160 samples, 8160 nonzero, min -3162, max 3299
 ```
 
 The component plane exceeds the signed 12-bit level-shift display range
 (-2048..2047), so raw RGB diffs include many clamped samples. Comparing only
-unclipped samples recoverable from FFmpeg's `rgb48le` output gives:
+unclipped samples recoverable from FFmpeg's `rgb48le` output is now exact:
 
 ```text
-C0: 4679 comparable, 500 differing, max_abs 2, mean_abs 0.108570207309, clipped/saturated 3481
-C1: 4202 comparable, 427 differing, max_abs 2, mean_abs 0.103284150405, clipped/saturated 3958
-C2: 4979 comparable, 387 differing, max_abs 2, mean_abs 0.079935730066, clipped/saturated 3181
+C0: 4679 comparable, 0 differing, max_abs 0, mean_abs 0.000000000000, clipped/saturated 3481
+C1: 4202 comparable, 0 differing, max_abs 0, mean_abs 0.000000000000, clipped/saturated 3958
+C2: 4979 comparable, 0 differing, max_abs 0, mean_abs 0.000000000000, clipped/saturated 3181
 ```
+
+The first lowres-4 component-domain maximum can be traced back through the
+final reversible 5/3 level:
+
+```text
+cargo run -- trace-component53-sample target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 2 4 29 2 128
+```
+
+Current local trace for C2 `(29,2)`:
+
+```text
+trace-component53-sample: component 2 discard 4 -> R1 120x68, sample (29,2) = 2035
+  coefficient dependencies: 15
+  touched codeblocks: 4
+    R0 LL cblk 0,0: 2 coeff
+    R1 HL cblk 0,0: 3 coeff
+    R1 LH cblk 0,0: 4 coeff
+    R1 HH cblk 0,0: 6 coeff
+```
+
+The touched R1 codeblocks can then be traced pass-by-pass:
+
+```text
+cargo run -- tier1-codeblock-trace target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 2 1 HH 0 0
+cargo run -- tier1-codeblock-trace target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 2 1 HL 0 0
+cargo run -- tier1-codeblock-trace target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 2 1 LH 0 0
+```
+
+All three current traces consume their full segment payloads (`452/452`,
+`621/621`, and `708/708` bytes respectively). The former lowres-4 mismatch was
+caused by the 2D integer 5/3 reconstruction order: FFmpeg reconstructs rows
+before columns, and those lifting steps are not exactly commutative after
+integer rounding.
 
 Irreversible 9/7 codestreams now have a high-level CPU decode route for QCD
 scalar-expounded/scalar-derived quantization and QCC component overrides: steps
@@ -289,13 +322,13 @@ diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0 (x 0, y 0, chann
   channel_mean R=0.000000000000 G=0.000000000000 B=0.000000000000
 ```
 
-GPU-DWT vs FFmpeg currently has the same diff as CPU-DWT vs FFmpeg:
+GPU-DWT vs FFmpeg is also bit-exact on the local frame:
 
 ```text
-diff-rgb48: samples 6220800, differing 533125, max_abs 80 at sample 1417778 (x 272, y 246, channel B), mean_abs 1.479717078189
-  signed_delta min -80 max 80
-  channel_diff R=215703 G=160041 B=157381
-  channel_mean R=1.779521604938 G=1.337168209877 B=1.322461419753
+diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0 (x 0, y 0, channel R), mean_abs 0.000000000000
+  signed_delta min 0 max 0
+  channel_diff R=0 G=0 B=0
+  channel_mean R=0.000000000000 G=0.000000000000 B=0.000000000000
 ```
 
 The real-frame GPU DWT plus GPU color/packing path is exposed through:
@@ -306,6 +339,15 @@ cargo run -- diff-rgb48 target\samples\ours_frame0_rgb48le_gpu.raw target\sample
 ```
 
 Current local GPU full path vs CPU full path diff:
+
+```text
+diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0 (x 0, y 0, channel R), mean_abs 0.000000000000
+  signed_delta min 0 max 0
+  channel_diff R=0 G=0 B=0
+  channel_mean R=0.000000000000 G=0.000000000000 B=0.000000000000
+```
+
+Current local GPU full path vs FFmpeg diff:
 
 ```text
 diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0 (x 0, y 0, channel R), mean_abs 0.000000000000

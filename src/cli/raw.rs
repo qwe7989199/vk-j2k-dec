@@ -1,10 +1,16 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::process::ExitCode;
 
-use vk_j2k_dec::codestream::SubbandKind;
+use vk_j2k_dec::codestream::{Codestream, SubbandKind, WaveletTransform};
 use vk_j2k_dec::decode::{
     decode_coefficient_planes, decode_reversible_component_planes_with_discard,
     decode_rgb48_with_discard, decode_rgb48_with_gpu_dwt, decode_rgb48_with_gpu_pipeline,
+};
+use vk_j2k_dec::packet::parse_lrcp_tile_packets;
+use vk_j2k_dec::reconstruct::{ComponentSubbandPlanes, ResolutionSubbandPlane};
+use vk_j2k_dec::tier1::{
+    CoefficientReconstruction, DecodedCodeblock, MqDecoder, Tier1CodingMode, Tier1WorkPlan,
 };
 
 pub fn decode_rgb48_file(input: &str, output: &str) -> ExitCode {
@@ -376,6 +382,319 @@ pub fn dump_component_plane_file(
     ExitCode::SUCCESS
 }
 
+pub fn trace_component53_sample_file(
+    input: &str,
+    component: usize,
+    discard_levels: u8,
+    x: u32,
+    y: u32,
+    max_dependencies: usize,
+) -> ExitCode {
+    let data = match fs::read(input) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("failed to read {input}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let decoded = match decode_coefficient_planes(&data) {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            eprintln!("trace-component53-sample failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(component_planes) = decoded
+        .components
+        .iter()
+        .find(|planes| planes.component as usize == component)
+    else {
+        eprintln!("trace-component53-sample failed: missing component {component}");
+        return ExitCode::FAILURE;
+    };
+    let max_resolution = component_planes
+        .planes
+        .iter()
+        .map(|plane| plane.resolution)
+        .max()
+        .unwrap_or(0);
+    if discard_levels > max_resolution {
+        eprintln!(
+            "trace-component53-sample failed: cannot discard {discard_levels} levels from {max_resolution} decomposition levels"
+        );
+        return ExitCode::FAILURE;
+    }
+    let target_resolution = max_resolution - discard_levels;
+    let Some((width, height)) = resolution_extent(component_planes, target_resolution) else {
+        eprintln!(
+            "trace-component53-sample failed: missing component {component} resolution {target_resolution}"
+        );
+        return ExitCode::FAILURE;
+    };
+    if x >= width || y >= height {
+        eprintln!(
+            "trace-component53-sample failed: sample {x},{y} outside component {component} R{target_resolution} extent {width}x{height}"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let reconstructed = match component_planes.inverse_5_3_until(target_resolution) {
+        Ok(plane) => plane,
+        Err(err) => {
+            eprintln!("trace-component53-sample failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let sample = reconstructed
+        .sample(x, y)
+        .expect("coordinate checked against reconstructed plane");
+    let mut dependencies = BTreeSet::new();
+    collect_component53_dependencies(component_planes, target_resolution, x, y, &mut dependencies);
+
+    println!(
+        "trace-component53-sample: component {component} discard {discard_levels} -> R{target_resolution} {width}x{height}, sample ({x},{y}) = {sample}"
+    );
+    println!("  coefficient dependencies: {}", dependencies.len());
+
+    let mut by_codeblock = BTreeMap::<(u8, SubbandKind, u32, u32), usize>::new();
+    for dependency in &dependencies {
+        if let Some(plane) =
+            find_resolution_subband(component_planes, dependency.resolution, dependency.subband)
+        {
+            let codeblock_x = dependency.x / plane.layout.codeblock_width;
+            let codeblock_y = dependency.y / plane.layout.codeblock_height;
+            *by_codeblock
+                .entry((
+                    dependency.resolution,
+                    dependency.subband,
+                    codeblock_x,
+                    codeblock_y,
+                ))
+                .or_default() += 1;
+        }
+    }
+    println!("  touched codeblocks: {}", by_codeblock.len());
+    for ((resolution, subband, codeblock_x, codeblock_y), count) in &by_codeblock {
+        println!("    R{resolution} {subband} cblk {codeblock_x},{codeblock_y}: {count} coeff");
+    }
+
+    for dependency in dependencies.iter().take(max_dependencies) {
+        match trace_dependency_value(component_planes, dependency) {
+            Some(value) => println!(
+                "    R{} {} ({},{}): {}",
+                dependency.resolution, dependency.subband, dependency.x, dependency.y, value
+            ),
+            None => println!(
+                "    R{} {} ({},{}): unavailable",
+                dependency.resolution, dependency.subband, dependency.x, dependency.y
+            ),
+        }
+    }
+    if dependencies.len() > max_dependencies {
+        println!(
+            "    ... {} more dependencies",
+            dependencies.len() - max_dependencies
+        );
+    }
+
+    ExitCode::SUCCESS
+}
+
+pub fn trace_tier1_codeblock_file(
+    input: &str,
+    component: u16,
+    resolution: u8,
+    subband: &str,
+    codeblock_x: u32,
+    codeblock_y: u32,
+) -> ExitCode {
+    let subband = match parse_subband(subband) {
+        Some(subband) => subband,
+        None => {
+            eprintln!("tier1-codeblock-trace failed: subband must be LL, HL, LH, or HH");
+            return ExitCode::FAILURE;
+        }
+    };
+    let data = match fs::read(input) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("failed to read {input}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let codestream = match Codestream::parse(&data) {
+        Ok(codestream) => codestream,
+        Err(err) => {
+            eprintln!("tier1-codeblock-trace failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(cod) = &codestream.cod else {
+        eprintln!("tier1-codeblock-trace failed: missing COD marker");
+        return ExitCode::FAILURE;
+    };
+    if codestream.tile_parts.len() != 1 {
+        eprintln!(
+            "tier1-codeblock-trace failed: only one tile-part is supported for now, found {}",
+            codestream.tile_parts.len()
+        );
+        return ExitCode::FAILURE;
+    }
+    let layouts = match codestream.tile_layouts() {
+        Ok(layouts) => layouts,
+        Err(err) => {
+            eprintln!("tier1-codeblock-trace failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tile_part = &codestream.tile_parts[0];
+    let Some(layout) = layouts
+        .iter()
+        .find(|layout| layout.tile_index == tile_part.tile_index)
+    else {
+        eprintln!(
+            "tier1-codeblock-trace failed: missing layout for tile {}",
+            tile_part.tile_index
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(tile_data) = data.get(tile_part.data_start..tile_part.data_end) else {
+        eprintln!("tier1-codeblock-trace failed: tile payload is outside codestream data");
+        return ExitCode::FAILURE;
+    };
+    let packet_summary = match parse_lrcp_tile_packets(tile_data, layout, cod.layers) {
+        Ok(summary) => summary,
+        Err(err) => {
+            eprintln!("tier1-codeblock-trace failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let work_plan = match Tier1WorkPlan::from_packet_summary_with_quantization(
+        &packet_summary,
+        codestream.qcd.as_ref(),
+        &codestream.qccs,
+    ) {
+        Ok(plan) => plan,
+        Err(err) => {
+            eprintln!("tier1-codeblock-trace failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bound = match work_plan.bind_segment_data(tile_data) {
+        Ok(bound) => bound,
+        Err(err) => {
+            eprintln!("tier1-codeblock-trace failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(codeblock) = bound.codeblocks.iter().find(|codeblock| {
+        codeblock.id.component == component
+            && codeblock.id.resolution == resolution
+            && codeblock.id.subband == subband
+            && codeblock.id.codeblock_x == codeblock_x
+            && codeblock.id.codeblock_y == codeblock_y
+    }) else {
+        eprintln!(
+            "tier1-codeblock-trace failed: missing C{component} R{resolution} {subband} cblk {codeblock_x},{codeblock_y}"
+        );
+        return ExitCode::FAILURE;
+    };
+    let execution = match codeblock.execution_plan(cod.codeblock_style_flags()) {
+        Ok(execution) => execution,
+        Err(err) => {
+            eprintln!("tier1-codeblock-trace failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if execution
+        .passes
+        .iter()
+        .any(|pass| pass.coding_mode == Tier1CodingMode::RawBypass)
+    {
+        eprintln!("tier1-codeblock-trace failed: raw-bypass passes are not traced yet");
+        return ExitCode::FAILURE;
+    }
+
+    let mut segment_data = Vec::with_capacity(codeblock.total_bytes());
+    for segment in &codeblock.segments {
+        segment_data.extend_from_slice(segment.data);
+    }
+    let mut mq = MqDecoder::with_data(&segment_data);
+    let mut decoded = match DecodedCodeblock::new_bound_with_reconstruction(
+        codeblock,
+        coefficient_reconstruction_for_wavelet(cod.transform),
+    ) {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            eprintln!("tier1-codeblock-trace failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!(
+        "tier1-codeblock-trace: C{component} R{resolution} {subband} cblk {codeblock_x},{codeblock_y} {}x{}, zbp {}, mbp {}, {} segment(s), {} byte(s), {} pass(es)",
+        codeblock.width,
+        codeblock.height,
+        codeblock.zero_bit_planes,
+        codeblock.magnitude_bitplanes,
+        codeblock.segments.len(),
+        codeblock.total_bytes(),
+        execution.passes.len()
+    );
+    for (segment_index, segment) in codeblock.segments.iter().enumerate() {
+        println!(
+            "  segment {segment_index}: packet {}, layer {}, {} byte(s), {} pass(es)",
+            segment.packet_index,
+            segment.layer,
+            segment.data.len(),
+            segment.coding_passes
+        );
+    }
+
+    for pass in execution.passes {
+        let summary = match decoded.decode_pass(pass.pass, &mut mq) {
+            Ok(summary) => summary,
+            Err(err) => {
+                eprintln!("tier1-codeblock-trace failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "  pass {:>2}: bp {:>2} {:>12}, packet {}, layer {}, seg {}:{}, visited {}, sig {}, sign {}, refine {}, run {}, uniform {}, became {}, consumed {}",
+            pass.pass.index,
+            pass.pass.bitplane,
+            pass.pass.kind,
+            pass.packet_index,
+            pass.layer,
+            pass.segment_index,
+            pass.segment_pass_index,
+            summary.visited,
+            summary.significance_bits,
+            summary.sign_bits,
+            summary.refinement_bits,
+            summary.run_length_bits,
+            summary.uniform_bits,
+            summary.became_significant,
+            mq.consumed_bytes()
+        );
+    }
+
+    let nonzero = decoded
+        .coefficients
+        .iter()
+        .filter(|coefficient| **coefficient != 0)
+        .count();
+    println!(
+        "  decoded: {} significant, {} nonzero, consumed {}/{} bytes",
+        decoded.state.significant_count(),
+        nonzero,
+        mq.consumed_bytes(),
+        segment_data.len()
+    );
+
+    ExitCode::SUCCESS
+}
+
 fn parse_subband(value: &str) -> Option<SubbandKind> {
     match value.to_ascii_uppercase().as_str() {
         "LL" => Some(SubbandKind::Ll),
@@ -383,6 +702,192 @@ fn parse_subband(value: &str) -> Option<SubbandKind> {
         "LH" => Some(SubbandKind::Lh),
         "HH" => Some(SubbandKind::Hh),
         _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TraceDependency {
+    resolution: u8,
+    subband: SubbandKind,
+    x: u32,
+    y: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Inverse53SourceIndices {
+    low: Vec<u32>,
+    high: Vec<u32>,
+}
+
+fn collect_component53_dependencies(
+    component: &ComponentSubbandPlanes,
+    resolution: u8,
+    x: u32,
+    y: u32,
+    dependencies: &mut BTreeSet<TraceDependency>,
+) {
+    if resolution == 0 {
+        dependencies.insert(TraceDependency {
+            resolution,
+            subband: SubbandKind::Ll,
+            x,
+            y,
+        });
+        return;
+    }
+
+    let Some((low_width, low_height)) = resolution_extent(component, resolution - 1) else {
+        return;
+    };
+    let Some(hl) = find_resolution_subband(component, resolution, SubbandKind::Hl) else {
+        return;
+    };
+    let Some(lh) = find_resolution_subband(component, resolution, SubbandKind::Lh) else {
+        return;
+    };
+
+    let x_sources = inverse_53_source_indices(x, low_width, hl.layout.width);
+    let y_sources = inverse_53_source_indices(y, low_height, lh.layout.height);
+
+    for low_y in &y_sources.low {
+        for low_x in &x_sources.low {
+            collect_component53_dependencies(
+                component,
+                resolution - 1,
+                *low_x,
+                *low_y,
+                dependencies,
+            );
+        }
+        for high_x in &x_sources.high {
+            dependencies.insert(TraceDependency {
+                resolution,
+                subband: SubbandKind::Hl,
+                x: *high_x,
+                y: *low_y,
+            });
+        }
+    }
+    for high_y in &y_sources.high {
+        for low_x in &x_sources.low {
+            dependencies.insert(TraceDependency {
+                resolution,
+                subband: SubbandKind::Lh,
+                x: *low_x,
+                y: *high_y,
+            });
+        }
+        for high_x in &x_sources.high {
+            dependencies.insert(TraceDependency {
+                resolution,
+                subband: SubbandKind::Hh,
+                x: *high_x,
+                y: *high_y,
+            });
+        }
+    }
+}
+
+fn inverse_53_source_indices(
+    output_index: u32,
+    low_len: u32,
+    high_len: u32,
+) -> Inverse53SourceIndices {
+    if low_len == 0 {
+        return Inverse53SourceIndices {
+            low: Vec::new(),
+            high: Vec::new(),
+        };
+    }
+    if high_len == 0 {
+        return Inverse53SourceIndices {
+            low: vec![output_index.min(low_len - 1)],
+            high: Vec::new(),
+        };
+    }
+
+    let mut low = BTreeSet::new();
+    let mut high = BTreeSet::new();
+    if output_index.is_multiple_of(2) {
+        let index = (output_index / 2).min(low_len - 1);
+        add_inverse_53_updated_low_sources(index, low_len, high_len, &mut low, &mut high);
+    } else {
+        let index = (output_index / 2).min(high_len - 1);
+        high.insert(index);
+        add_inverse_53_updated_low_sources(index, low_len, high_len, &mut low, &mut high);
+        add_inverse_53_updated_low_sources(
+            (index + 1).min(low_len - 1),
+            low_len,
+            high_len,
+            &mut low,
+            &mut high,
+        );
+    }
+
+    Inverse53SourceIndices {
+        low: low.into_iter().collect(),
+        high: high.into_iter().collect(),
+    }
+}
+
+fn add_inverse_53_updated_low_sources(
+    index: u32,
+    low_len: u32,
+    high_len: u32,
+    low: &mut BTreeSet<u32>,
+    high: &mut BTreeSet<u32>,
+) {
+    if index >= low_len {
+        return;
+    }
+    low.insert(index);
+    if high_len == 0 {
+        return;
+    }
+    high.insert(index.saturating_sub(1).min(high_len - 1));
+    high.insert(index.min(high_len - 1));
+}
+
+fn resolution_extent(component: &ComponentSubbandPlanes, resolution: u8) -> Option<(u32, u32)> {
+    if resolution == 0 {
+        let plane = find_resolution_subband(component, 0, SubbandKind::Ll)?;
+        return Some((plane.layout.width, plane.layout.height));
+    }
+    let hl = find_resolution_subband(component, resolution, SubbandKind::Hl)?;
+    let lh = find_resolution_subband(component, resolution, SubbandKind::Lh)?;
+    Some((
+        lh.layout.width + hl.layout.width,
+        hl.layout.height + lh.layout.height,
+    ))
+}
+
+fn find_resolution_subband(
+    component: &ComponentSubbandPlanes,
+    resolution: u8,
+    subband: SubbandKind,
+) -> Option<&ResolutionSubbandPlane> {
+    component
+        .planes
+        .iter()
+        .find(|plane| plane.resolution == resolution && plane.layout.kind == subband)
+}
+
+fn trace_dependency_value(
+    component: &ComponentSubbandPlanes,
+    dependency: &TraceDependency,
+) -> Option<i32> {
+    let plane = find_resolution_subband(component, dependency.resolution, dependency.subband)?;
+    plane.plane.coefficient(dependency.x, dependency.y)
+}
+
+fn coefficient_reconstruction_for_wavelet(
+    transform: WaveletTransform,
+) -> CoefficientReconstruction {
+    match transform {
+        WaveletTransform::Reversible53 => CoefficientReconstruction::Exact,
+        WaveletTransform::Irreversible97 | WaveletTransform::Unknown(_) => {
+            CoefficientReconstruction::Midpoint
+        }
     }
 }
 
@@ -729,5 +1234,27 @@ mod tests {
         assert_eq!(stats.clipped_or_saturated, 2);
         assert_eq!(stats.comparable, 1);
         assert_eq!(stats.diff.differing, 0);
+    }
+
+    #[test]
+    fn inverse_53_source_indices_tracks_interleaved_high_sample() {
+        let sources = inverse_53_source_indices(29, 60, 60);
+
+        assert_eq!(sources.low, vec![14, 15]);
+        assert_eq!(sources.high, vec![13, 14, 15]);
+    }
+
+    #[test]
+    fn inverse_53_source_indices_clamps_edge_neighbors() {
+        let first_low = inverse_53_source_indices(0, 3, 2);
+        let first_high = inverse_53_source_indices(1, 3, 2);
+        let last_low = inverse_53_source_indices(4, 3, 2);
+
+        assert_eq!(first_low.low, vec![0]);
+        assert_eq!(first_low.high, vec![0]);
+        assert_eq!(first_high.low, vec![0, 1]);
+        assert_eq!(first_high.high, vec![0, 1]);
+        assert_eq!(last_low.low, vec![2]);
+        assert_eq!(last_low.high, vec![1]);
     }
 }

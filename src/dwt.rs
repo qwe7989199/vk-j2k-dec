@@ -235,43 +235,43 @@ pub fn inverse_5_3_level(
 
     let width = ll.width + hl.width;
     let height = ll.height + lh.height;
-    let mut low_rows = vec![0; ll.width as usize * height as usize];
-    let mut high_rows = vec![0; hl.width as usize * height as usize];
+    let mut low_columns = vec![0; width as usize * ll.height as usize];
+    let mut high_columns = vec![0; width as usize * lh.height as usize];
 
-    for x in 0..ll.width as usize {
-        let low_column = (0..ll.height as usize)
-            .map(|y| ll.samples[y * ll.width as usize + x])
-            .collect::<Vec<_>>();
-        let high_column = (0..lh.height as usize)
-            .map(|y| lh.samples[y * lh.width as usize + x])
-            .collect::<Vec<_>>();
-        let column = inverse_5_3_1d(&low_column, &high_column)?;
-        for (y, value) in column.into_iter().enumerate() {
-            low_rows[y * ll.width as usize + x] = value;
-        }
-    }
-
-    for x in 0..hl.width as usize {
-        let low_column = (0..hl.height as usize)
-            .map(|y| hl.samples[y * hl.width as usize + x])
-            .collect::<Vec<_>>();
-        let high_column = (0..hh.height as usize)
-            .map(|y| hh.samples[y * hh.width as usize + x])
-            .collect::<Vec<_>>();
-        let column = inverse_5_3_1d(&low_column, &high_column)?;
-        for (y, value) in column.into_iter().enumerate() {
-            high_rows[y * hl.width as usize + x] = value;
-        }
-    }
-
-    let mut samples = Vec::with_capacity(width as usize * height as usize);
-    for y in 0..height as usize {
+    // Match FFmpeg's integer 5/3 order. Horizontal and vertical lifting are not
+    // exactly commutative once each 1D pass rounds intermediate values.
+    for y in 0..ll.height as usize {
         let low_offset = y * ll.width as usize;
         let high_offset = y * hl.width as usize;
-        samples.extend(inverse_5_3_1d(
-            &low_rows[low_offset..low_offset + ll.width as usize],
-            &high_rows[high_offset..high_offset + hl.width as usize],
-        )?);
+        let row = inverse_5_3_1d(
+            &ll.samples[low_offset..low_offset + ll.width as usize],
+            &hl.samples[high_offset..high_offset + hl.width as usize],
+        )?;
+        low_columns[y * width as usize..(y + 1) * width as usize].copy_from_slice(&row);
+    }
+
+    for y in 0..lh.height as usize {
+        let low_offset = y * lh.width as usize;
+        let high_offset = y * hh.width as usize;
+        let row = inverse_5_3_1d(
+            &lh.samples[low_offset..low_offset + lh.width as usize],
+            &hh.samples[high_offset..high_offset + hh.width as usize],
+        )?;
+        high_columns[y * width as usize..(y + 1) * width as usize].copy_from_slice(&row);
+    }
+
+    let mut samples = vec![0; width as usize * height as usize];
+    for x in 0..width as usize {
+        let low_column = (0..ll.height as usize)
+            .map(|y| low_columns[y * width as usize + x])
+            .collect::<Vec<_>>();
+        let high_column = (0..lh.height as usize)
+            .map(|y| high_columns[y * width as usize + x])
+            .collect::<Vec<_>>();
+        let column = inverse_5_3_1d(&low_column, &high_column)?;
+        for (y, value) in column.into_iter().enumerate() {
+            samples[y * width as usize + x] = value;
+        }
     }
 
     Ok(PlaneI32 {
@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn inverse_5_3_level_roundtrips_plane() {
+    fn inverse_5_3_level_matches_horizontal_first_integer_decode() {
         let original = PlaneI32 {
             width: 5,
             height: 4,
@@ -443,7 +443,14 @@ mod tests {
         )
         .expect("inverse level");
 
-        assert_eq!(reconstructed, original);
+        assert_eq!(
+            reconstructed.samples,
+            vec![
+                1, 6, 2, 9, 3, -5, 9, 7, 6, 0, 12, 11, -1, 4, 10, 3, 1, 1, -1, -1
+            ]
+        );
+        assert_eq!(reconstructed.width, original.width);
+        assert_eq!(reconstructed.height, original.height);
         assert_eq!(reconstructed.sample(4, 3), Some(-1));
         assert_eq!(reconstructed.sample(5, 3), None);
     }

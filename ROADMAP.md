@@ -45,8 +45,8 @@ The repository can start as one crate while the data model is still changing. Sp
 - Parse packet headers for the initial supported profile.
 - Decode codeblock bitstreams with a CPU Tier-1 path.
 - Build coefficient planes per component and subband.
-- Add CPU inverse DWT 5/3 and 9/7 reference implementations. Done for one-level references.
-- Split Tier-1 coefficient reconstruction into exact reversible output and midpoint irreversible output. Done; the local lowres-5 reversible baseline now matches FFmpeg exactly.
+- Add CPU inverse DWT 5/3 and 9/7 reference implementations. Done for one-level references. The reversible 5/3 CPU path now matches FFmpeg's horizontal-first integer reconstruction order.
+- Split Tier-1 coefficient reconstruction into exact reversible output and midpoint irreversible output. Done; the local reversible 5/3 frame matches FFmpeg exactly from lowres-5 through full resolution.
 - Compare decoded output against OpenJPEG.
 
 ### v0.3: Vulkan setup and buffer model
@@ -62,7 +62,7 @@ The repository can start as one crate while the data model is still changing. Sp
 
 ### v0.4: Vulkan inverse DWT
 
-- Implement inverse 5/3 lifting in compute. Initial 1D, strided column, and one-level 2D smoke paths are working.
+- Implement inverse 5/3 lifting in compute. Initial 1D, strided column, one-level 2D smoke, component-backend, and full-frame paths are working with the FFmpeg-compatible horizontal-first reconstruction order.
 - Implement inverse 9/7 lifting in compute. Initial 1D, strided column, one-level 2D smoke, and component-backend paths are working.
 - Validate against the CPU reference path. Done for 5/3 and 9/7 smoke paths.
 - Benchmark tile sizes, workgroup shapes, and memory layouts.
@@ -102,7 +102,7 @@ DCP-o-matic is a promising downstream target because JPEG 2000 decode performanc
 
 ## Immediate tasks
 
-- Continue CPU Tier-1: significance propagation, cleanup, magnitude refinement, sign contexts, and exact reversible coefficient reconstruction are in place; remaining work is full-resolution differential cleanup against FFmpeg/OpenJPEG.
+- Continue CPU Tier-1: significance propagation, cleanup, magnitude refinement, sign contexts, and exact reversible coefficient reconstruction are in place; the local reversible 5/3 frame is bit-exact against FFmpeg at all reduction levels and full resolution. Remaining differential work is broader corpus/OpenJPEG coverage and irreversible 9/7 samples.
 - Build coefficient planes from decoded codeblocks and feed the CPU/GPU reconstruction path.
 - Add irreversible 9/7 CPU reference and Vulkan smoke shader. Done.
 - Wire irreversible 9/7 into the high-level CPU decode path. Done for QCD scalar-expounded/scalar-derived codestreams and QCC component overrides; corpus validation still needs implementation.

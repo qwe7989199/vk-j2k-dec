@@ -144,14 +144,14 @@ fn run_idwt53_component_on_device(
 
         let output_width = current_width + hl.width;
         let output_height = current_height + lh.height;
-        let low_rows = vec![0i32; checked_plane_len(current_width, output_height)?];
-        let high_rows = vec![0i32; checked_plane_len(hl.width, output_height)?];
+        let low_columns = vec![0i32; checked_plane_len(output_width, current_height)?];
+        let high_columns = vec![0i32; checked_plane_len(output_width, lh.height)?];
         let output_seed = vec![0i32; checked_plane_len(output_width, output_height)?];
         let hl_buffer = create_i32_buffer(device, &hl.coefficients)?;
         let lh_buffer = create_i32_buffer(device, &lh.coefficients)?;
         let hh_buffer = create_i32_buffer(device, &hh.coefficients)?;
-        let low_rows_buffer = create_i32_buffer(device, &low_rows)?;
-        let high_rows_buffer = create_i32_buffer(device, &high_rows)?;
+        let low_columns_buffer = create_i32_buffer(device, &low_columns)?;
+        let high_columns_buffer = create_i32_buffer(device, &high_columns)?;
         let output_buffer = create_i32_buffer(device, &output_seed)?;
 
         dispatch_idwt_lines(
@@ -159,56 +159,56 @@ fn run_idwt53_component_on_device(
             queue_family_index,
             spirv,
             &current_buffer,
-            &lh_buffer,
-            &low_rows_buffer,
-            Idwt53PushConstants {
-                low_count: current_height,
-                high_count: lh.height,
-                line_count: current_width,
-                low_line_stride: 1,
-                low_sample_stride: current_width,
-                high_line_stride: 1,
-                high_sample_stride: lh.width,
-                output_line_stride: 1,
-                output_sample_stride: current_width,
-            },
-        )?;
-        dispatch_idwt_lines(
-            device,
-            queue_family_index,
-            spirv,
             &hl_buffer,
-            &hh_buffer,
-            &high_rows_buffer,
-            Idwt53PushConstants {
-                low_count: current_height,
-                high_count: hh.height,
-                line_count: hl.width,
-                low_line_stride: 1,
-                low_sample_stride: hl.width,
-                high_line_stride: 1,
-                high_sample_stride: hh.width,
-                output_line_stride: 1,
-                output_sample_stride: hl.width,
-            },
-        )?;
-        dispatch_idwt_lines(
-            device,
-            queue_family_index,
-            spirv,
-            &low_rows_buffer,
-            &high_rows_buffer,
-            &output_buffer,
+            &low_columns_buffer,
             Idwt53PushConstants {
                 low_count: current_width,
                 high_count: hl.width,
-                line_count: output_height,
+                line_count: current_height,
                 low_line_stride: current_width,
                 low_sample_stride: 1,
                 high_line_stride: hl.width,
                 high_sample_stride: 1,
                 output_line_stride: output_width,
                 output_sample_stride: 1,
+            },
+        )?;
+        dispatch_idwt_lines(
+            device,
+            queue_family_index,
+            spirv,
+            &lh_buffer,
+            &hh_buffer,
+            &high_columns_buffer,
+            Idwt53PushConstants {
+                low_count: current_width,
+                high_count: hh.width,
+                line_count: lh.height,
+                low_line_stride: lh.width,
+                low_sample_stride: 1,
+                high_line_stride: hh.width,
+                high_sample_stride: 1,
+                output_line_stride: output_width,
+                output_sample_stride: 1,
+            },
+        )?;
+        dispatch_idwt_lines(
+            device,
+            queue_family_index,
+            spirv,
+            &low_columns_buffer,
+            &high_columns_buffer,
+            &output_buffer,
+            Idwt53PushConstants {
+                low_count: current_height,
+                high_count: lh.height,
+                line_count: output_width,
+                low_line_stride: 1,
+                low_sample_stride: output_width,
+                high_line_stride: 1,
+                high_sample_stride: output_width,
+                output_line_stride: 1,
+                output_sample_stride: output_width,
             },
         )?;
 
