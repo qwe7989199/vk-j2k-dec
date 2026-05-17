@@ -54,6 +54,9 @@ pub struct DecodeTimings {
     pub gpu_setup_ms: f64,
     pub reconstruct_ms: f64,
     pub pack_ms: f64,
+    pub pack_shader_ms: f64,
+    pub pack_copy_ms: f64,
+    pub pack_readback_ms: f64,
     pub total_ms: f64,
 }
 
@@ -505,6 +508,9 @@ fn decode_rgb48_with_backends_profiled(
                 profile.timings.gpu_setup_ms = result.setup_ms;
                 profile.timings.reconstruct_ms = result.reconstruct_ms;
                 profile.timings.pack_ms = result.pack_ms;
+                profile.timings.pack_shader_ms = result.pack_shader_ms;
+                profile.timings.pack_copy_ms = result.pack_copy_ms;
+                profile.timings.pack_readback_ms = result.pack_readback_ms;
                 if result.width != expected_width || result.height != expected_height {
                     return Err(DecodeError::new(format!(
                         "GPU RGB48 pipeline produced {}x{}, expected {}x{}",
@@ -539,6 +545,9 @@ fn decode_rgb48_with_backends_profiled(
                 profile.timings.gpu_setup_ms = result.setup_ms;
                 profile.timings.reconstruct_ms = result.reconstruct_ms;
                 profile.timings.pack_ms = result.pack_ms;
+                profile.timings.pack_shader_ms = result.pack_shader_ms;
+                profile.timings.pack_copy_ms = result.pack_copy_ms;
+                profile.timings.pack_readback_ms = result.pack_readback_ms;
                 if result.width != expected_width || result.height != expected_height {
                     return Err(DecodeError::new(format!(
                         "GPU RGB48 pipeline produced {}x{}, expected {}x{}",

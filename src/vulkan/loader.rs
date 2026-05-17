@@ -280,6 +280,8 @@ impl VulkanInstance {
             bind_buffer_memory: self.load_device(device, "vkBindBufferMemory")?,
             map_memory: self.load_device(device, "vkMapMemory")?,
             unmap_memory: self.load_device(device, "vkUnmapMemory")?,
+            invalidate_mapped_memory_ranges: self
+                .load_device(device, "vkInvalidateMappedMemoryRanges")?,
             create_shader_module: self.load_device(device, "vkCreateShaderModule")?,
             destroy_shader_module: self.load_device(device, "vkDestroyShaderModule")?,
             create_descriptor_set_layout: self
@@ -303,6 +305,7 @@ impl VulkanInstance {
             cmd_bind_descriptor_sets: self.load_device(device, "vkCmdBindDescriptorSets")?,
             cmd_push_constants: self.load_device(device, "vkCmdPushConstants")?,
             cmd_dispatch: self.load_device(device, "vkCmdDispatch")?,
+            cmd_copy_buffer: self.load_device(device, "vkCmdCopyBuffer")?,
             create_fence: self.load_device(device, "vkCreateFence")?,
             destroy_fence: self.load_device(device, "vkDestroyFence")?,
             queue_submit: self.load_device(device, "vkQueueSubmit")?,

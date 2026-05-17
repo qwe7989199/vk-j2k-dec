@@ -5,6 +5,7 @@ const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: u32 = 2;
 const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: u32 = 3;
 const VK_STRUCTURE_TYPE_SUBMIT_INFO: u32 = 4;
 const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: u32 = 5;
+const VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE: u32 = 6;
 const VK_STRUCTURE_TYPE_FENCE_CREATE_INFO: u32 = 8;
 const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: u32 = 12;
 const VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: u32 = 16;
@@ -21,9 +22,13 @@ const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: u32 = 42;
 const VK_QUEUE_GRAPHICS_BIT: u32 = 0x0000_0001;
 const VK_QUEUE_COMPUTE_BIT: u32 = 0x0000_0002;
 const VK_QUEUE_TRANSFER_BIT: u32 = 0x0000_0004;
+const VK_BUFFER_USAGE_TRANSFER_SRC_BIT: u32 = 0x0000_0001;
+const VK_BUFFER_USAGE_TRANSFER_DST_BIT: u32 = 0x0000_0002;
 const VK_BUFFER_USAGE_STORAGE_BUFFER_BIT: u32 = 0x0000_0020;
+const VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT: u32 = 0x0000_0001;
 const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: u32 = 0x0000_0002;
 const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: u32 = 0x0000_0004;
+const VK_MEMORY_PROPERTY_HOST_CACHED_BIT: u32 = 0x0000_0008;
 const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: u32 = 7;
 const VK_SHADER_STAGE_COMPUTE_BIT: u32 = 0x0000_0020;
 const VK_PIPELINE_BIND_POINT_COMPUTE: u32 = 1;
@@ -91,6 +96,8 @@ type VkBindBufferMemory = unsafe extern "system" fn(VkDevice, VkBuffer, VkDevice
 type VkMapMemory =
     unsafe extern "system" fn(VkDevice, VkDeviceMemory, u64, u64, VkFlags, *mut *mut c_void) -> i32;
 type VkUnmapMemory = unsafe extern "system" fn(VkDevice, VkDeviceMemory);
+type VkInvalidateMappedMemoryRanges =
+    unsafe extern "system" fn(VkDevice, u32, *const VkMappedMemoryRange) -> i32;
 type VkCreateShaderModule = unsafe extern "system" fn(
     VkDevice,
     *const VkShaderModuleCreateInfo,
@@ -165,6 +172,8 @@ type VkCmdBindDescriptorSets = unsafe extern "system" fn(
 type VkCmdPushConstants =
     unsafe extern "system" fn(VkCommandBuffer, VkPipelineLayout, VkFlags, u32, u32, *const c_void);
 type VkCmdDispatch = unsafe extern "system" fn(VkCommandBuffer, u32, u32, u32);
+type VkCmdCopyBuffer =
+    unsafe extern "system" fn(VkCommandBuffer, VkBuffer, VkBuffer, u32, *const VkBufferCopy);
 type VkCreateFence = unsafe extern "system" fn(
     VkDevice,
     *const VkFenceCreateInfo,
@@ -435,6 +444,22 @@ struct VkSubmitInfo {
     p_command_buffers: *const VkCommandBuffer,
     signal_semaphore_count: u32,
     p_signal_semaphores: *const usize,
+}
+
+#[repr(C)]
+struct VkMappedMemoryRange {
+    s_type: u32,
+    p_next: *const c_void,
+    memory: VkDeviceMemory,
+    offset: u64,
+    size: u64,
+}
+
+#[repr(C)]
+struct VkBufferCopy {
+    src_offset: u64,
+    dst_offset: u64,
+    size: u64,
 }
 
 #[repr(C)]

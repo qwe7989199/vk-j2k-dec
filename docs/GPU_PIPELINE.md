@@ -64,13 +64,15 @@ Current validation on the RGB12 sample:
 diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0, mean_abs 0.000000000000
 ```
 
-The implementation currently submits one shader dispatch at a time and uses
-host-visible buffers for simple staging. That is correct but not the final
-performance shape. The next GPU milestones are:
+The reversible RGB48 path now keeps DWT and color output device-local through
+the final color shader, then copies the packed RGB48 buffer once into
+HOST_CACHED staging for CPU readback. On the local RTX 5060 sample this split is
+roughly 3.3 ms shader, 1.3 ms device-to-host copy, and 2.1 ms CPU map/read for
+the final 12.4 MB RGB48 buffer. The implementation still submits one shader
+dispatch at a time, so the next GPU milestones are:
 
-- keep intermediate DWT buffers device-local and avoid CPU readback between levels;
 - reuse descriptor layouts, pipelines, command pools, and command buffers;
-- keep DWT output on device for color conversion instead of re-uploading planes;
+- add persistent buffer pools for repeated full-frame decode;
 - wire irreversible 9/7 DWT into real-frame decode once a representative sample is available.
 
 ## Shader build

@@ -41,9 +41,7 @@ uint clamp_to_u16(int value) {
     return uint(clamp(shifted, 0, int(pc.output_max)));
 }
 
-uint rgb_sample_at(uint sample_index) {
-    uint index = sample_index / 3u;
-    uint channel = sample_index - index * 3u;
+void rgb_pixel_at(uint index, out uint r_out, out uint g_out, out uint b_out) {
     int r = c0[index];
     int g = c1[index];
     int b = c2[index];
@@ -57,24 +55,33 @@ uint rgb_sample_at(uint sample_index) {
         b = db + g;
     }
 
-    if (channel == 0u) {
-        return clamp_to_u16(r);
-    }
-    if (channel == 1u) {
-        return clamp_to_u16(g);
-    }
-    return clamp_to_u16(b);
+    r_out = clamp_to_u16(r);
+    g_out = clamp_to_u16(g);
+    b_out = clamp_to_u16(b);
 }
 
 void main() {
-    uint packed_index = gl_GlobalInvocationID.x;
-    uint low_sample = packed_index * 2u;
-    uint total_samples = pc.sample_count * 3u;
-    if (low_sample >= total_samples) {
+    uint pair_index = gl_GlobalInvocationID.x;
+    uint pixel0 = pair_index * 2u;
+    if (pixel0 >= pc.sample_count) {
         return;
     }
 
-    uint low = rgb_sample_at(low_sample);
-    uint high = low_sample + 1u < total_samples ? rgb_sample_at(low_sample + 1u) : 0u;
-    rgb16_packed[packed_index] = low | (high << 16u);
+    uint r0;
+    uint g0;
+    uint b0;
+    rgb_pixel_at(pixel0, r0, g0, b0);
+
+    uint r1 = 0u;
+    uint g1 = 0u;
+    uint b1 = 0u;
+    uint pixel1 = pixel0 + 1u;
+    if (pixel1 < pc.sample_count) {
+        rgb_pixel_at(pixel1, r1, g1, b1);
+    }
+
+    uint output_base = pair_index * 3u;
+    rgb16_packed[output_base] = r0 | (g0 << 16u);
+    rgb16_packed[output_base + 1u] = b0 | (r1 << 16u);
+    rgb16_packed[output_base + 2u] = g1 | (b1 << 16u);
 }

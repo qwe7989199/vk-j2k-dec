@@ -382,6 +382,7 @@ impl DecodedCodeblock {
         };
 
         let mut stripe_y = 0;
+        let width = self.width as usize;
         while stripe_y < self.height {
             let stripe_height = 4.min(self.height - stripe_y);
             for x in 0..self.width {
@@ -390,13 +391,8 @@ impl DecodedCodeblock {
                     summary.run_length_bits += 1;
                     if !any_significant {
                         for y_offset in 0..4 {
-                            self.apply_significance_decision(
-                                x,
-                                stripe_y + y_offset,
-                                pass.bitplane,
-                                false,
-                                None,
-                            )?;
+                            let index = (stripe_y + y_offset) as usize * width + x as usize;
+                            self.state.visited_in_bitplane[index] = 1;
                             summary.significance_bits += 1;
                             summary.visited += 1;
                         }
@@ -407,19 +403,23 @@ impl DecodedCodeblock {
                         | u8::from(reader.decode_context_bit(TIER1_UNIFORM_CONTEXT)?);
                     summary.uniform_bits += 2;
                     for y_offset in 0..run {
-                        self.apply_significance_decision(
-                            x,
-                            stripe_y + u32::from(y_offset),
-                            pass.bitplane,
-                            false,
-                            None,
-                        )?;
+                        let index =
+                            (stripe_y + u32::from(y_offset)) as usize * width + x as usize;
+                        self.state.visited_in_bitplane[index] = 1;
                         summary.significance_bits += 1;
                         summary.visited += 1;
                     }
 
                     let y = stripe_y + u32::from(run);
-                    self.decode_significant_sample(x, y, pass.bitplane, reader, &mut summary)?;
+                    let index = y as usize * width + x as usize;
+                    self.decode_significant_sample_unchecked(
+                        x,
+                        y,
+                        index,
+                        pass.bitplane,
+                        reader,
+                        &mut summary,
+                    )?;
 
                     for y_offset in u32::from(run) + 1..stripe_height {
                         self.decode_cleanup_sample(
@@ -457,42 +457,50 @@ impl DecodedCodeblock {
         reader: &mut impl Tier1DecisionReader,
         summary: &mut Tier1DecodedPassSummary,
     ) -> Result<(), Tier1DecodeError> {
-        if self.coding_operation(Tier1PassKind::Cleanup, x, y) != Some(Tier1CodingOperation::Cleanup)
-        {
+        let index = y as usize * self.width as usize + x as usize;
+        if self.state.visited_in_bitplane[index] != 0 || self.state.significant[index] != 0 {
             return Ok(());
         }
 
-        let context = self.significance_context(x, y).ok_or_else(|| {
-            Tier1DecodeError::new(format!("missing cleanup context for coefficient {x},{y}"))
-        })?;
+        let context = significance_context_label(
+            self.id.subband,
+            self.state
+                .significance_neighbors_unchecked(x as usize, y as usize),
+        );
         let is_significant = reader.decode_context_bit(context)?;
         if is_significant {
-            self.decode_significant_sample(x, y, bitplane, reader, summary)?;
+            self.decode_significant_sample_unchecked(x, y, index, bitplane, reader, summary)?;
         } else {
             summary.significance_bits += 1;
-            self.apply_significance_decision(x, y, bitplane, false, None)?;
+            self.state.visited_in_bitplane[index] = 1;
             summary.visited += 1;
         }
         Ok(())
     }
 
-    fn decode_significant_sample(
+    fn decode_significant_sample_unchecked(
         &mut self,
         x: u32,
         y: u32,
+        index: usize,
         bitplane: i32,
         reader: &mut impl Tier1DecisionReader,
         summary: &mut Tier1DecodedPassSummary,
     ) -> Result<(), Tier1DecodeError> {
-        let sign_context = self.sign_context(x, y).ok_or_else(|| {
-            Tier1DecodeError::new(format!("missing sign context for coefficient {x},{y}"))
-        })?;
+        let sign_context = self.state.sign_context_unchecked(x as usize, y as usize);
         let sign_bit = reader.decode_context_bit(sign_context.context)? ^ sign_context.xor_bit;
         summary.sign_bits += 1;
         summary.became_significant += 1;
         summary.significance_bits += 1;
         summary.visited += 1;
-        self.apply_significance_decision(x, y, bitplane, true, Some(sign_bit))
+
+        let magnitude =
+            significance_reconstruction_magnitude(self.id, bitplane, self.reconstruction)?;
+        self.coefficients[index] = if sign_bit { -magnitude } else { magnitude };
+        self.state
+            .mark_significant_at_index(index, x as usize, y as usize, sign_bit);
+        self.state.visited_in_bitplane[index] = 1;
+        Ok(())
     }
 
     fn cleanup_run_length_candidate(&self, x: u32, stripe_y: u32) -> bool {
@@ -840,9 +848,13 @@ impl CodeblockStatePlanes {
 
     pub fn sign_context_for(&self, x: u32, y: u32) -> Option<SignCodingContext> {
         self.index(x, y)?;
-        let horizontal = self.sign_contribution_unchecked(x as usize, y as usize, [(-1, 0), (1, 0)]);
-        let vertical = self.sign_contribution_unchecked(x as usize, y as usize, [(0, -1), (0, 1)]);
-        Some(SignCodingContext::from_contributions(horizontal, vertical))
+        Some(self.sign_context_unchecked(x as usize, y as usize))
+    }
+
+    fn sign_context_unchecked(&self, x: usize, y: usize) -> SignCodingContext {
+        let horizontal = self.sign_contribution_unchecked(x, y, [(-1, 0), (1, 0)]);
+        let vertical = self.sign_contribution_unchecked(x, y, [(0, -1), (0, 1)]);
+        SignCodingContext::from_contributions(horizontal, vertical)
     }
 
     pub fn magnitude_refinement_context(&self, x: u32, y: u32) -> Option<usize> {

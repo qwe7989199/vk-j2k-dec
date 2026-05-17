@@ -29,12 +29,22 @@ pub struct GpuRgb48ComponentsResult {
     pub setup_ms: f64,
     pub reconstruct_ms: f64,
     pub pack_ms: f64,
+    pub pack_shader_ms: f64,
+    pub pack_copy_ms: f64,
+    pub pack_readback_ms: f64,
 }
 
 struct GpuPlaneI32Buffer {
     width: u32,
     height: u32,
     buffer: HostBuffer,
+}
+
+struct GpuPackedRgb48Result {
+    samples: Vec<u16>,
+    shader_ms: f64,
+    copy_ms: f64,
+    readback_ms: f64,
 }
 
 pub struct VulkanRgb48Pipeline {
@@ -149,6 +159,9 @@ impl VulkanRgb48Pipeline {
             setup_ms: 0.0,
             reconstruct_ms,
             pack_ms,
+            pack_shader_ms: 0.0,
+            pack_copy_ms: 0.0,
+            pack_readback_ms: 0.0,
         })
     }
 
@@ -179,7 +192,7 @@ impl VulkanRgb48Pipeline {
             .ok_or_else(|| VulkanError::new("GPU RGB48 pipeline requires at least one plane"))?;
         let height = planes[0].height;
         let stage_start = std::time::Instant::now();
-        let samples = run_color_i32_buffers_on_device_with_program(
+        let packed = run_color_i32_buffers_on_device_with_program(
             &self.context.device,
             self.queue_family_index,
             color_i32_program,
@@ -194,10 +207,13 @@ impl VulkanRgb48Pipeline {
             queue_family_index: self.queue_family_index,
             width,
             height,
-            samples,
+            samples: packed.samples,
             setup_ms: 0.0,
             reconstruct_ms,
             pack_ms,
+            pack_shader_ms: packed.shader_ms,
+            pack_copy_ms: packed.copy_ms,
+            pack_readback_ms: packed.readback_ms,
         })
     }
 }
@@ -939,7 +955,7 @@ fn run_color_i32_buffers_on_device_with_program(
     component_planes: &[GpuPlaneI32Buffer],
     color_transform: u32,
     precision: u8,
-) -> Result<Vec<u16>, VulkanError> {
+) -> Result<GpuPackedRgb48Result, VulkanError> {
     if component_planes.len() != 3 {
         return Err(VulkanError::new(format!(
             "GPU integer color conversion requires 3 component planes, got {}",
@@ -969,8 +985,13 @@ fn run_color_i32_buffers_on_device_with_program(
     }
 
     let output_count = sample_count * 3;
-    let packed_output_count = output_count.div_ceil(2);
-    let output_buffer = create_empty_buffer::<u32>(device, packed_output_count)?;
+    let pixel_pair_count = sample_count.div_ceil(2);
+    let packed_output_count = pixel_pair_count * 3;
+    let output_byte_len = bytes_len::<u32>(packed_output_count)?;
+    let output_buffer = device.create_device_local_buffer(
+        output_byte_len,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+    )?;
     let output_max = (1u32 << precision) - 1;
     let push = ColorPushConstants {
         sample_count: sample_count as u32,
@@ -978,6 +999,7 @@ fn run_color_i32_buffers_on_device_with_program(
         output_max,
         level_shift: (1u32 << (precision - 1)) as f32,
     };
+    let shader_start = std::time::Instant::now();
     program.dispatch(
         device,
         queue_family_index,
@@ -988,10 +1010,31 @@ fn run_color_i32_buffers_on_device_with_program(
             output_buffer.descriptor_info(),
         ],
         bytes_of(&push),
-        (packed_output_count as u32).div_ceil(256),
+        (pixel_pair_count as u32).div_ceil(256),
         1,
     )?;
-    output_buffer.read_vec::<u16>(output_count)
+    let shader_ms = shader_start.elapsed().as_secs_f64() * 1000.0;
+
+    let staging_buffer =
+        device.create_host_cached_buffer(output_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+    let copy_start = std::time::Instant::now();
+    device.copy_buffer_to_host(
+        queue_family_index,
+        &output_buffer,
+        &staging_buffer,
+        output_byte_len,
+    )?;
+    let copy_ms = copy_start.elapsed().as_secs_f64() * 1000.0;
+
+    let readback_start = std::time::Instant::now();
+    let samples = staging_buffer.read_vec::<u16>(output_count)?;
+    let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
+    Ok(GpuPackedRgb48Result {
+        samples,
+        shader_ms,
+        copy_ms,
+        readback_ms,
+    })
 }
 
 fn run_color_float_slices_on_device_with_program(

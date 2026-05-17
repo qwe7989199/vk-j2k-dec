@@ -385,11 +385,10 @@ profile-rgb48: mode cpu, 1920x1080 12-bit, discard 0, 6220800 samples
     pack_ms 6.402
 ```
 
-Current local GPU full-path profile reuses compute pipelines within the frame
-and keeps reversible 5/3 component buffers on the GPU for integer RCT/packing,
-so the DWT output is no longer read back and reuploaded before color conversion.
-The remaining visible bottlenecks are per-frame Vulkan setup, CPU Tier-1, and
-final RGB48 readback/packing:
+Current local GPU full-path profile reuses compute pipelines within the frame,
+keeps reversible 5/3 component buffers on the GPU for integer RCT/packing, and
+uses a device-local color output plus HOST_CACHED staging readback. The remaining
+visible bottlenecks are per-frame Vulkan setup and CPU Tier-1:
 
 ```text
 profile-rgb48: mode gpu, 1920x1080 12-bit, discard 0, 6220800 samples
@@ -404,22 +403,22 @@ profile-rgb48: mode gpu, 1920x1080 12-bit, discard 0, 6220800 samples
 For repeated-frame timing, `profile-rgb48-bench` reads the codestream once,
 builds the persistent GPU pipeline once, then decodes the same in-memory frame
 multiple times and reports both all-run and warm-skip-one averages. Current
-local 10-iteration GPU bench after packed RGB48 readback and direct `u16`
-readback:
+local 10-iteration GPU bench after cleanup-pass inlining, packed RGB48 readback,
+device-local color output, and HOST_CACHED staging:
 
 ```text
 profile-rgb48-bench: mode gpu, 1920x1080 12-bit, discard 0, iterations 10, 6220800 samples
-  pipeline_setup_ms 221.954
-  avg_all_ms decode_total 354.095 tier1 259.244 gpu_setup 0.000 reconstruct 52.873 pack 40.684
-  avg_warm_skip1_ms decode_total 353.452 tier1 259.544 gpu_setup 0.000 reconstruct 52.249 pack 40.353
+  pipeline_setup_ms 229.770
+  avg_all_ms decode_total 272.371 tier1 206.936 gpu_setup 0.000 reconstruct 56.387 pack 7.902 pack_shader 3.311 pack_copy 1.395 pack_readback 2.076
+  avg_warm_skip1_ms decode_total 272.089 tier1 206.904 gpu_setup 0.000 reconstruct 56.230 pack 7.806 pack_shader 3.285 pack_copy 1.329 pack_readback 2.081
 ```
 
 The matching CPU 10-iteration bench reports:
 
 ```text
 profile-rgb48-bench: mode cpu, 1920x1080 12-bit, discard 0, iterations 10, 6220800 samples
-  avg_all_ms decode_total 431.707 tier1 333.067 gpu_setup 0.000 reconstruct 89.387 pack 6.868
-  avg_warm_skip1_ms decode_total 432.712 tier1 333.648 gpu_setup 0.000 reconstruct 89.762 pack 6.914
+  avg_all_ms decode_total 295.327 tier1 200.672 gpu_setup 0.000 reconstruct 85.541 pack 6.737 pack_shader 0.000 pack_copy 0.000 pack_readback 0.000
+  avg_warm_skip1_ms decode_total 293.491 tier1 198.959 gpu_setup 0.000 reconstruct 85.418 pack 6.736 pack_shader 0.000 pack_copy 0.000 pack_readback 0.000
 ```
 
 The low-resolution path now prunes unused high-resolution codeblocks before
@@ -439,7 +438,9 @@ The current hot-path wins come from cached Tier-1 significance-neighbor counts,
 byte-backed state planes, direct coefficient/state access in decode passes,
 avoiding an extra arithmetic-stream copy when binding concatenated codeblock
 segments, reusing Vulkan compute pipelines within the frame, avoiding output
-buffer zero-fills, and using an integer GPU color shader for reversible RCT.
+buffer zero-fills, inlining cleanup-pass hot paths, using an integer GPU color
+shader for reversible RCT, and reading RGB48 through a HOST_CACHED staging buffer
+instead of CPU-reading uncached host-visible storage memory.
 
 Current local release median timings, 6 runs with the first run discarded:
 
