@@ -367,6 +367,7 @@ an immediate bottleneck breakdown:
 cargo run --release -- profile-rgb48 target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 0 cpu target\samples\profile_cpu_full.rgb48le
 cargo run --release -- profile-rgb48 target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 4 cpu target\samples\profile_cpu_lowres4.rgb48le
 cargo run --release -- profile-rgb48 target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 0 gpu target\samples\profile_gpu_full.rgb48le
+cargo run --release -- profile-rgb48-bench target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 0 gpu 10 target\samples\bench_gpu_10.rgb48le
 ```
 
 Current local CPU full-resolution profile:
@@ -398,6 +399,26 @@ profile-rgb48: mode gpu, 1920x1080 12-bit, discard 0, 6220800 samples
     gpu_setup_ms 232.953
     reconstruct_ms 62.405
     pack_ms 104.193
+```
+
+For repeated-frame timing, `profile-rgb48-bench` reads the codestream once,
+builds the persistent GPU pipeline once, then decodes the same in-memory frame
+multiple times and reports both all-run and warm-skip-one averages. Current
+local 10-iteration GPU bench after packed RGB48 readback:
+
+```text
+profile-rgb48-bench: mode gpu, 1920x1080 12-bit, discard 0, iterations 10, 6220800 samples
+  pipeline_setup_ms 200.302
+  avg_all_ms decode_total 412.959 tier1 314.650 gpu_setup 0.000 reconstruct 52.471 pack 44.559
+  avg_warm_skip1_ms decode_total 411.919 tier1 314.855 gpu_setup 0.000 reconstruct 51.213 pack 44.589
+```
+
+The matching CPU 10-iteration bench reports:
+
+```text
+profile-rgb48-bench: mode cpu, 1920x1080 12-bit, discard 0, iterations 10, 6220800 samples
+  avg_all_ms decode_total 431.707 tier1 333.067 gpu_setup 0.000 reconstruct 89.387 pack 6.868
+  avg_warm_skip1_ms decode_total 432.712 tier1 333.648 gpu_setup 0.000 reconstruct 89.762 pack 6.914
 ```
 
 The low-resolution path now prunes unused high-resolution codeblocks before

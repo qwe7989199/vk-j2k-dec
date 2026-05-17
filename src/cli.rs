@@ -195,6 +195,48 @@ pub fn run() -> ExitCode {
                 &color_shader_path,
             )
         }
+        (Some("profile-rgb48-bench"), Some(path)) => {
+            let Some(discard_levels) = args.next().and_then(|value| value.parse::<u8>().ok())
+            else {
+                eprintln!(
+                    "usage: {program} profile-rgb48-bench <input.j2k> <discard-levels> <cpu|gpu-dwt|gpu> <iterations> <output.rgb48le> [idwt53.comp.spv] [color.comp.spv]"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(mode) = args.next() else {
+                eprintln!(
+                    "usage: {program} profile-rgb48-bench <input.j2k> <discard-levels> <cpu|gpu-dwt|gpu> <iterations> <output.rgb48le> [idwt53.comp.spv] [color.comp.spv]"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(iterations) = args.next().and_then(|value| value.parse::<usize>().ok()) else {
+                eprintln!(
+                    "usage: {program} profile-rgb48-bench <input.j2k> <discard-levels> <cpu|gpu-dwt|gpu> <iterations> <output.rgb48le> [idwt53.comp.spv] [color.comp.spv]"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(output) = args.next() else {
+                eprintln!(
+                    "usage: {program} profile-rgb48-bench <input.j2k> <discard-levels> <cpu|gpu-dwt|gpu> <iterations> <output.rgb48le> [idwt53.comp.spv] [color.comp.spv]"
+                );
+                return ExitCode::FAILURE;
+            };
+            let idwt53_shader_path = args
+                .next()
+                .unwrap_or_else(|| "target\\shaders\\idwt53_1d.comp.spv".to_string());
+            let color_shader_path = args
+                .next()
+                .unwrap_or_else(|| "target\\shaders\\color_convert.comp.spv".to_string());
+            raw::profile_rgb48_bench_file(
+                &path,
+                discard_levels,
+                &mode,
+                iterations,
+                &output,
+                &idwt53_shader_path,
+                &color_shader_path,
+            )
+        }
         (Some("diff-rgb48"), Some(actual)) => {
             let Some(reference) = args.next() else {
                 eprintln!("usage: {program} diff-rgb48 <actual.rgb48le> <reference.rgb48le>");
@@ -371,6 +413,9 @@ pub fn run() -> ExitCode {
             );
             eprintln!(
                 "  {program} profile-rgb48 <input.j2k> <discard-levels> <cpu|gpu-dwt|gpu> <output.rgb48le> [idwt53.comp.spv] [color.comp.spv]"
+            );
+            eprintln!(
+                "  {program} profile-rgb48-bench <input.j2k> <discard-levels> <cpu|gpu-dwt|gpu> <iterations> <output.rgb48le> [idwt53.comp.spv] [color.comp.spv]"
             );
             eprintln!("  {program} diff-rgb48 <actual.rgb48le> <reference.rgb48le>");
             eprintln!("  {program} diff-component-plane <actual.i32le> <reference.i32le>");

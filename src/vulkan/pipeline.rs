@@ -37,6 +37,171 @@ struct GpuPlaneI32Buffer {
     buffer: HostBuffer,
 }
 
+pub struct VulkanRgb48Pipeline {
+    idwt53_program: StorageComputeProgram,
+    color_i32_program: Option<StorageComputeProgram>,
+    color_program: StorageComputeProgram,
+    context: VulkanComputeContext,
+    device_name: String,
+    queue_family_index: u32,
+    setup_ms: f64,
+}
+
+impl VulkanRgb48Pipeline {
+    pub fn new(idwt53_shader_path: &str, color_shader_path: &str) -> Result<Self, VulkanError> {
+        let setup_start = std::time::Instant::now();
+        let idwt53_spirv = read_spirv(idwt53_shader_path)?;
+        let color_spirv = read_spirv(color_shader_path)?;
+        let color_i32_spirv = resolved_i32_color_shader_path(color_shader_path)
+            .map(|path| read_spirv(&path))
+            .transpose()?;
+        let (context, summary, queue_family_index) = create_compute_context()?;
+        let idwt53_program = StorageComputeProgram::new(
+            &context.device,
+            &idwt53_spirv,
+            3,
+            std::mem::size_of::<Idwt53PushConstants>() as u32,
+        )?;
+        let color_program = StorageComputeProgram::new(
+            &context.device,
+            &color_spirv,
+            4,
+            std::mem::size_of::<ColorPushConstants>() as u32,
+        )?;
+        let color_i32_program = color_i32_spirv
+            .as_deref()
+            .map(|spirv| {
+                StorageComputeProgram::new(
+                    &context.device,
+                    spirv,
+                    4,
+                    std::mem::size_of::<ColorPushConstants>() as u32,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            idwt53_program,
+            color_i32_program,
+            color_program,
+            context,
+            device_name: summary.name,
+            queue_family_index,
+            setup_ms: setup_start.elapsed().as_secs_f64() * 1000.0,
+        })
+    }
+
+    pub fn setup_ms(&self) -> f64 {
+        self.setup_ms
+    }
+
+    pub fn decode_reversible53_rgb48(
+        &self,
+        components: &[&ComponentSubbandPlanes],
+        target_resolution: u8,
+        color_transform: u32,
+        precision: u8,
+    ) -> Result<GpuRgb48ComponentsResult, VulkanError> {
+        if let Some(color_i32_program) = &self.color_i32_program {
+            return self.decode_reversible53_rgb48_i32(
+                components,
+                target_resolution,
+                color_i32_program,
+                color_transform,
+                precision,
+            );
+        }
+
+        let stage_start = std::time::Instant::now();
+        let mut planes = Vec::with_capacity(components.len());
+        for component in components {
+            planes.push(run_idwt53_component_on_device(
+                &self.context.device,
+                self.queue_family_index,
+                &self.idwt53_program,
+                component,
+                target_resolution,
+            )?);
+        }
+        let reconstruct_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
+
+        let width = planes
+            .first()
+            .map(|plane| plane.width)
+            .ok_or_else(|| VulkanError::new("GPU RGB48 pipeline requires at least one plane"))?;
+        let height = planes[0].height;
+        let stage_start = std::time::Instant::now();
+        let samples = run_color_components_on_device_with_program(
+            &self.context.device,
+            self.queue_family_index,
+            &self.color_program,
+            &planes,
+            color_transform,
+            precision,
+        )?;
+        let pack_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
+        self.context.device.wait_idle()?;
+        Ok(GpuRgb48ComponentsResult {
+            device_name: self.device_name.clone(),
+            queue_family_index: self.queue_family_index,
+            width,
+            height,
+            samples,
+            setup_ms: 0.0,
+            reconstruct_ms,
+            pack_ms,
+        })
+    }
+
+    fn decode_reversible53_rgb48_i32(
+        &self,
+        components: &[&ComponentSubbandPlanes],
+        target_resolution: u8,
+        color_i32_program: &StorageComputeProgram,
+        color_transform: u32,
+        precision: u8,
+    ) -> Result<GpuRgb48ComponentsResult, VulkanError> {
+        let stage_start = std::time::Instant::now();
+        let mut planes = Vec::with_capacity(components.len());
+        for component in components {
+            planes.push(run_idwt53_component_buffer_on_device(
+                &self.context.device,
+                self.queue_family_index,
+                &self.idwt53_program,
+                component,
+                target_resolution,
+            )?);
+        }
+        let reconstruct_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
+
+        let width = planes
+            .first()
+            .map(|plane| plane.width)
+            .ok_or_else(|| VulkanError::new("GPU RGB48 pipeline requires at least one plane"))?;
+        let height = planes[0].height;
+        let stage_start = std::time::Instant::now();
+        let samples = run_color_i32_buffers_on_device_with_program(
+            &self.context.device,
+            self.queue_family_index,
+            color_i32_program,
+            &planes,
+            color_transform,
+            precision,
+        )?;
+        let pack_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
+        self.context.device.wait_idle()?;
+        Ok(GpuRgb48ComponentsResult {
+            device_name: self.device_name.clone(),
+            queue_family_index: self.queue_family_index,
+            width,
+            height,
+            samples,
+            setup_ms: 0.0,
+            reconstruct_ms,
+            pack_ms,
+        })
+    }
+}
+
 pub fn run_idwt53_components(
     shader_path: &str,
     components: &[&ComponentSubbandPlanes],
@@ -77,120 +242,15 @@ pub fn run_idwt53_rgb48_components(
     color_transform: u32,
     precision: u8,
 ) -> Result<GpuRgb48ComponentsResult, VulkanError> {
-    let setup_start = std::time::Instant::now();
-    let idwt53_spirv = read_spirv(idwt53_shader_path)?;
-    if let Some(color_i32_shader_path) = resolved_i32_color_shader_path(color_shader_path) {
-        let color_i32_spirv = read_spirv(&color_i32_shader_path)?;
-        return with_compute_device(|device, summary, queue_family_index| {
-            let idwt53_program = StorageComputeProgram::new(
-                device,
-                &idwt53_spirv,
-                3,
-                std::mem::size_of::<Idwt53PushConstants>() as u32,
-            )?;
-            let color_i32_program = StorageComputeProgram::new(
-                device,
-                &color_i32_spirv,
-                4,
-                std::mem::size_of::<ColorPushConstants>() as u32,
-            )?;
-            let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
-            let stage_start = std::time::Instant::now();
-            let mut planes = Vec::with_capacity(components.len());
-            for component in components {
-                planes.push(run_idwt53_component_buffer_on_device(
-                    device,
-                    queue_family_index,
-                    &idwt53_program,
-                    component,
-                    target_resolution,
-                )?);
-            }
-            let reconstruct_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
-
-            let width = planes.first().map(|plane| plane.width).ok_or_else(|| {
-                VulkanError::new("GPU RGB48 pipeline requires at least one plane")
-            })?;
-            let height = planes[0].height;
-            let stage_start = std::time::Instant::now();
-            let samples = run_color_i32_buffers_on_device_with_program(
-                device,
-                queue_family_index,
-                &color_i32_program,
-                &planes,
-                color_transform,
-                precision,
-            )?;
-            let pack_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
-            device.wait_idle()?;
-            Ok(GpuRgb48ComponentsResult {
-                device_name: summary.name.clone(),
-                queue_family_index,
-                width,
-                height,
-                samples,
-                setup_ms,
-                reconstruct_ms,
-                pack_ms,
-            })
-        });
-    }
-
-    let color_spirv = read_spirv(color_shader_path)?;
-    with_compute_device(|device, summary, queue_family_index| {
-        let idwt53_program = StorageComputeProgram::new(
-            device,
-            &idwt53_spirv,
-            3,
-            std::mem::size_of::<Idwt53PushConstants>() as u32,
-        )?;
-        let color_program = StorageComputeProgram::new(
-            device,
-            &color_spirv,
-            4,
-            std::mem::size_of::<ColorPushConstants>() as u32,
-        )?;
-        let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
-        let stage_start = std::time::Instant::now();
-        let mut planes = Vec::with_capacity(components.len());
-        for component in components {
-            planes.push(run_idwt53_component_on_device(
-                device,
-                queue_family_index,
-                &idwt53_program,
-                component,
-                target_resolution,
-            )?);
-        }
-        let reconstruct_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
-
-        let width = planes
-            .first()
-            .map(|plane| plane.width)
-            .ok_or_else(|| VulkanError::new("GPU RGB48 pipeline requires at least one plane"))?;
-        let height = planes[0].height;
-        let stage_start = std::time::Instant::now();
-        let samples = run_color_components_on_device_with_program(
-            device,
-            queue_family_index,
-            &color_program,
-            &planes,
-            color_transform,
-            precision,
-        )?;
-        let pack_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
-        device.wait_idle()?;
-        Ok(GpuRgb48ComponentsResult {
-            device_name: summary.name.clone(),
-            queue_family_index,
-            width,
-            height,
-            samples,
-            setup_ms,
-            reconstruct_ms,
-            pack_ms,
-        })
-    })
+    let pipeline = VulkanRgb48Pipeline::new(idwt53_shader_path, color_shader_path)?;
+    let mut result = pipeline.decode_reversible53_rgb48(
+        components,
+        target_resolution,
+        color_transform,
+        precision,
+    )?;
+    result.setup_ms = pipeline.setup_ms();
+    Ok(result)
 }
 
 pub fn run_idwt97_components(
@@ -909,7 +969,8 @@ fn run_color_i32_buffers_on_device_with_program(
     }
 
     let output_count = sample_count * 3;
-    let output_buffer = create_empty_buffer::<u32>(device, output_count)?;
+    let packed_output_count = output_count.div_ceil(2);
+    let output_buffer = create_empty_buffer::<u32>(device, packed_output_count)?;
     let output_max = (1u32 << precision) - 1;
     let push = ColorPushConstants {
         sample_count: sample_count as u32,
@@ -927,18 +988,18 @@ fn run_color_i32_buffers_on_device_with_program(
             output_buffer.descriptor_info(),
         ],
         bytes_of(&push),
-        push.sample_count.div_ceil(256),
+        (packed_output_count as u32).div_ceil(256),
         1,
     )?;
-    let output = output_buffer.read_vec::<u32>(output_count)?;
-    output
-        .into_iter()
-        .map(|sample| {
-            u16::try_from(sample).map_err(|_| {
-                VulkanError::new(format!("GPU integer color output sample {sample} exceeds u16"))
-            })
-        })
-        .collect()
+    let output = output_buffer.read_vec::<u32>(packed_output_count)?;
+    let mut samples = Vec::with_capacity(output_count);
+    for packed in output {
+        samples.push((packed & 0xffff) as u16);
+        if samples.len() < output_count {
+            samples.push((packed >> 16) as u16);
+        }
+    }
+    Ok(samples)
 }
 
 fn run_color_float_slices_on_device_with_program(

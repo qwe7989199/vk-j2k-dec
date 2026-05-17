@@ -8,13 +8,14 @@ use vk_j2k_dec::decode::{
     DecodeProfile, decode_coefficient_planes, decode_reversible_component_planes_with_discard,
     decode_rgb48_with_discard, decode_rgb48_with_discard_profiled, decode_rgb48_with_gpu_dwt,
     decode_rgb48_with_gpu_dwt_profiled, decode_rgb48_with_gpu_pipeline,
-    decode_rgb48_with_gpu_pipeline_profiled,
+    decode_rgb48_with_gpu_pipeline_profiled, decode_rgb48_with_persistent_gpu_pipeline_profiled,
 };
 use vk_j2k_dec::packet::parse_lrcp_tile_packets;
 use vk_j2k_dec::reconstruct::{ComponentSubbandPlanes, ResolutionSubbandPlane};
 use vk_j2k_dec::tier1::{
     CoefficientReconstruction, DecodedCodeblock, MqDecoder, Tier1CodingMode, Tier1WorkPlan,
 };
+use vk_j2k_dec::vulkan::VulkanRgb48Pipeline;
 
 pub fn decode_rgb48_file(input: &str, output: &str) -> ExitCode {
     decode_rgb48_file_with_discard(input, 0, output)
@@ -191,6 +192,122 @@ pub fn profile_rgb48_file(
     print_decode_profile(&decoded.profile);
     println!("  write_ms {:.3}", write_ms);
     println!("  cli_total_ms {:.3}", total_ms);
+    ExitCode::SUCCESS
+}
+
+pub fn profile_rgb48_bench_file(
+    input: &str,
+    discard_levels: u8,
+    mode: &str,
+    iterations: usize,
+    output: &str,
+    idwt53_shader_path: &str,
+    color_shader_path: &str,
+) -> ExitCode {
+    if iterations == 0 {
+        eprintln!("profile-rgb48-bench failed: iterations must be greater than 0");
+        return ExitCode::FAILURE;
+    }
+
+    let read_start = Instant::now();
+    let data = match fs::read(input) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("failed to read {input}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let read_ms = elapsed_ms(read_start);
+
+    let pipeline = if mode == "gpu" {
+        match VulkanRgb48Pipeline::new(idwt53_shader_path, color_shader_path) {
+            Ok(pipeline) => Some(pipeline),
+            Err(err) => {
+                eprintln!("profile-rgb48-bench failed: GPU pipeline setup failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let pipeline_setup_ms = pipeline
+        .as_ref()
+        .map(VulkanRgb48Pipeline::setup_ms)
+        .unwrap_or(0.0);
+
+    let mut profiles = Vec::with_capacity(iterations);
+    let mut last_image = None;
+    let bench_start = Instant::now();
+    for iteration in 0..iterations {
+        let decoded = match (mode, pipeline.as_ref()) {
+            ("cpu", _) => decode_rgb48_with_discard_profiled(&data, discard_levels),
+            ("gpu-dwt", _) => {
+                decode_rgb48_with_gpu_dwt_profiled(&data, discard_levels, idwt53_shader_path)
+            }
+            ("gpu", Some(pipeline)) => {
+                decode_rgb48_with_persistent_gpu_pipeline_profiled(&data, discard_levels, pipeline)
+            }
+            ("gpu", None) => unreachable!("GPU pipeline setup checked above"),
+            (other, _) => {
+                eprintln!(
+                    "profile-rgb48-bench failed: mode must be cpu, gpu-dwt, or gpu, got {other}"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let decoded = match decoded {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                eprintln!(
+                    "profile-rgb48-bench failed on iteration {}: {err}",
+                    iteration + 1
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "  iter {:>2}: decode_total_ms {:.3} tier1_ms {:.3} gpu_setup_ms {:.3} reconstruct_ms {:.3} pack_ms {:.3}",
+            iteration + 1,
+            decoded.profile.timings.total_ms,
+            decoded.profile.timings.tier1_decode_ms,
+            decoded.profile.timings.gpu_setup_ms,
+            decoded.profile.timings.reconstruct_ms,
+            decoded.profile.timings.pack_ms
+        );
+        profiles.push(decoded.profile);
+        last_image = Some(decoded.image);
+    }
+    let bench_ms = elapsed_ms(bench_start);
+
+    let Some(image) = last_image else {
+        eprintln!("profile-rgb48-bench failed: no decode iterations completed");
+        return ExitCode::FAILURE;
+    };
+    let write_start = Instant::now();
+    let bytes = image.to_le_bytes();
+    if let Err(err) = fs::write(output, bytes) {
+        eprintln!("failed to write {output}: {err}");
+        return ExitCode::FAILURE;
+    }
+    let write_ms = elapsed_ms(write_start);
+
+    println!(
+        "profile-rgb48-bench: mode {mode}, {}x{} {}-bit, discard {}, iterations {}, {} samples -> {output}",
+        image.width,
+        image.height,
+        image.precision,
+        discard_levels,
+        iterations,
+        image.samples.len()
+    );
+    println!("  read_once_ms {:.3}", read_ms);
+    println!("  pipeline_setup_ms {:.3}", pipeline_setup_ms);
+    println!("  bench_loop_ms {:.3}", bench_ms);
+    println!("  write_last_ms {:.3}", write_ms);
+    print_profile_average("avg_all", &profiles);
+    if profiles.len() > 1 {
+        print_profile_average("avg_warm_skip1", &profiles[1..]);
+    }
     ExitCode::SUCCESS
 }
 
@@ -795,6 +912,38 @@ fn print_decode_profile(profile: &DecodeProfile) {
     println!("    gpu_setup_ms {:.3}", profile.timings.gpu_setup_ms);
     println!("    reconstruct_ms {:.3}", profile.timings.reconstruct_ms);
     println!("    pack_ms {:.3}", profile.timings.pack_ms);
+}
+
+fn print_profile_average(label: &str, profiles: &[DecodeProfile]) {
+    let count = profiles.len() as f64;
+    let sum = profiles
+        .iter()
+        .fold(DecodeProfile::default(), |mut acc, profile| {
+            acc.timings.total_ms += profile.timings.total_ms;
+            acc.timings.parse_ms += profile.timings.parse_ms;
+            acc.timings.layout_ms += profile.timings.layout_ms;
+            acc.timings.packet_ms += profile.timings.packet_ms;
+            acc.timings.work_plan_ms += profile.timings.work_plan_ms;
+            acc.timings.bind_ms += profile.timings.bind_ms;
+            acc.timings.tier1_decode_ms += profile.timings.tier1_decode_ms;
+            acc.timings.gpu_setup_ms += profile.timings.gpu_setup_ms;
+            acc.timings.reconstruct_ms += profile.timings.reconstruct_ms;
+            acc.timings.pack_ms += profile.timings.pack_ms;
+            acc
+        });
+    println!(
+        "  {label}_ms decode_total {:.3} parse {:.3} layout {:.3} packet {:.3} work_plan {:.3} bind {:.3} tier1 {:.3} gpu_setup {:.3} reconstruct {:.3} pack {:.3}",
+        sum.timings.total_ms / count,
+        sum.timings.parse_ms / count,
+        sum.timings.layout_ms / count,
+        sum.timings.packet_ms / count,
+        sum.timings.work_plan_ms / count,
+        sum.timings.bind_ms / count,
+        sum.timings.tier1_decode_ms / count,
+        sum.timings.gpu_setup_ms / count,
+        sum.timings.reconstruct_ms / count,
+        sum.timings.pack_ms / count
+    );
 }
 
 fn elapsed_ms(start: Instant) -> f64 {

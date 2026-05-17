@@ -17,8 +17,8 @@ layout(std430, set = 0, binding = 2) readonly buffer Component2 {
     int c2[];
 };
 
-layout(std430, set = 0, binding = 3) writeonly buffer OutputRgb16 {
-    uint rgb16[];
+layout(std430, set = 0, binding = 3) writeonly buffer OutputRgb16Packed {
+    uint rgb16_packed[];
 };
 
 layout(push_constant) uniform PushConstants {
@@ -41,12 +41,9 @@ uint clamp_to_u16(int value) {
     return uint(clamp(shifted, 0, int(pc.output_max)));
 }
 
-void main() {
-    uint index = gl_GlobalInvocationID.x;
-    if (index >= pc.sample_count) {
-        return;
-    }
-
+uint rgb_sample_at(uint sample_index) {
+    uint index = sample_index / 3u;
+    uint channel = sample_index - index * 3u;
     int r = c0[index];
     int g = c1[index];
     int b = c2[index];
@@ -60,8 +57,24 @@ void main() {
         b = db + g;
     }
 
-    uint base = index * 3u;
-    rgb16[base + 0u] = clamp_to_u16(r);
-    rgb16[base + 1u] = clamp_to_u16(g);
-    rgb16[base + 2u] = clamp_to_u16(b);
+    if (channel == 0u) {
+        return clamp_to_u16(r);
+    }
+    if (channel == 1u) {
+        return clamp_to_u16(g);
+    }
+    return clamp_to_u16(b);
+}
+
+void main() {
+    uint packed_index = gl_GlobalInvocationID.x;
+    uint low_sample = packed_index * 2u;
+    uint total_samples = pc.sample_count * 3u;
+    if (low_sample >= total_samples) {
+        return;
+    }
+
+    uint low = rgb_sample_at(low_sample);
+    uint high = low_sample + 1u < total_samples ? rgb_sample_at(low_sample + 1u) : 0u;
+    rgb16_packed[packed_index] = low | (high << 16u);
 }

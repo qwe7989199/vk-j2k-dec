@@ -12,7 +12,7 @@ use crate::reconstruct::{
 };
 use crate::tier1::{CoefficientReconstruction, Tier1WorkPlan};
 use crate::vulkan::{
-    run_color_components, run_color_float_components, run_idwt53_components,
+    VulkanRgb48Pipeline, run_color_components, run_color_float_components, run_idwt53_components,
     run_idwt53_rgb48_components, run_idwt97_float_components,
 };
 
@@ -187,6 +187,19 @@ pub fn decode_rgb48_with_gpu_pipeline_profiled(
     )
 }
 
+pub fn decode_rgb48_with_persistent_gpu_pipeline_profiled(
+    data: &[u8],
+    discard_levels: u8,
+    pipeline: &VulkanRgb48Pipeline,
+) -> Result<ProfiledDecodedRgb48, DecodeError> {
+    decode_rgb48_with_backends_profiled(
+        data,
+        discard_levels,
+        DwtBackend::PersistentGpu { pipeline },
+        ColorBackend::Cpu,
+    )
+}
+
 pub fn decode_coefficient_planes(data: &[u8]) -> Result<DecodedCoefficientPlanes, DecodeError> {
     let codestream = Codestream::parse(data).map_err(|err| DecodeError::new(err.to_string()))?;
     let cod = codestream
@@ -330,10 +343,11 @@ pub fn decode_reversible_component_planes_with_discard(
     })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 enum DwtBackend<'a> {
     Cpu,
     Gpu { idwt53_shader_path: &'a str },
+    PersistentGpu { pipeline: &'a VulkanRgb48Pipeline },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -477,6 +491,35 @@ fn decode_rgb48_with_backends_profiled(
 
     let (width, height, samples) = match cod.transform {
         WaveletTransform::Reversible53 => {
+            if let DwtBackend::PersistentGpu { pipeline } = dwt_backend {
+                let color_transform =
+                    gpu_color_transform_value(cod.multiple_component_transform, cod.transform)?;
+                let result = pipeline
+                    .decode_reversible53_rgb48(
+                        &components,
+                        target_resolution,
+                        color_transform,
+                        precision,
+                    )
+                    .map_err(|err| DecodeError::new(format!("GPU RGB48 pipeline failed: {err}")))?;
+                profile.timings.gpu_setup_ms = result.setup_ms;
+                profile.timings.reconstruct_ms = result.reconstruct_ms;
+                profile.timings.pack_ms = result.pack_ms;
+                if result.width != expected_width || result.height != expected_height {
+                    return Err(DecodeError::new(format!(
+                        "GPU RGB48 pipeline produced {}x{}, expected {}x{}",
+                        result.width, result.height, expected_width, expected_height
+                    )));
+                }
+                return finish_profiled_rgb48(
+                    result.width,
+                    result.height,
+                    precision,
+                    result.samples,
+                    profile,
+                    total_start,
+                );
+            }
             if let (
                 DwtBackend::Gpu { idwt53_shader_path },
                 ColorBackend::Gpu { color_shader_path },
@@ -555,6 +598,21 @@ fn decode_rgb48_with_backends_profiled(
         WaveletTransform::Unknown(_) => unreachable!("unsupported transform checked above"),
     };
 
+    finish_profiled_rgb48(width, height, precision, samples, profile, total_start)
+}
+
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+fn finish_profiled_rgb48(
+    width: u32,
+    height: u32,
+    precision: u8,
+    samples: Vec<u16>,
+    mut profile: DecodeProfile,
+    total_start: Instant,
+) -> Result<ProfiledDecodedRgb48, DecodeError> {
     profile.output_samples = samples.len();
     profile.timings.total_ms = elapsed_ms(total_start);
 
@@ -567,10 +625,6 @@ fn decode_rgb48_with_backends_profiled(
         },
         profile,
     })
-}
-
-fn elapsed_ms(start: Instant) -> f64 {
-    start.elapsed().as_secs_f64() * 1000.0
 }
 
 fn reconstruct_components(
@@ -592,6 +646,9 @@ fn reconstruct_components(
                 .map(|result| result.planes)
                 .map_err(|err| DecodeError::new(format!("GPU inverse 5/3 failed: {err}")))
         }
+        DwtBackend::PersistentGpu { .. } => Err(DecodeError::new(
+            "persistent GPU backend must use the fused RGB48 pipeline",
+        )),
     }
 }
 
@@ -638,6 +695,9 @@ fn reconstruct_float_components(
                 .map(|result| result.planes)
                 .map_err(|err| DecodeError::new(format!("GPU inverse 9/7 failed: {err}")))
         }
+        DwtBackend::PersistentGpu { .. } => Err(DecodeError::new(
+            "persistent GPU backend currently supports only reversible RGB48",
+        )),
     }
 }
 
