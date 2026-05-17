@@ -90,9 +90,14 @@ pub fn enumerate_devices() -> Result<Vec<VulkanDeviceSummary>, VulkanError> {
     result
 }
 
-fn with_compute_device<T>(
-    run: impl FnOnce(&VulkanDevice, &VulkanDeviceSummary, u32) -> Result<T, VulkanError>,
-) -> Result<T, VulkanError> {
+struct VulkanComputeContext {
+    device: VulkanDevice,
+    instance: VulkanInstance,
+    loader: VulkanLoader,
+}
+
+fn create_compute_context() -> Result<(VulkanComputeContext, VulkanDeviceSummary, u32), VulkanError>
+{
     let loader = VulkanLoader::open()?;
     let instance = loader.create_instance()?;
     let (physical_device, summary) = instance.select_compute_device()?;
@@ -101,7 +106,24 @@ fn with_compute_device<T>(
         .ok_or_else(|| VulkanError::new("selected Vulkan device has no compute queue"))?
         .index;
     let device = instance.create_compute_device(physical_device, queue_family_index)?;
-    run(&device, &summary, queue_family_index)
+    Ok((
+        VulkanComputeContext {
+            device,
+            instance,
+            loader,
+        },
+        summary,
+        queue_family_index,
+    ))
+}
+
+fn with_compute_device<T>(
+    run: impl FnOnce(&VulkanDevice, &VulkanDeviceSummary, u32) -> Result<T, VulkanError>,
+) -> Result<T, VulkanError> {
+    let (context, summary, queue_family_index) = create_compute_context()?;
+    let _keep_instance_alive = context.instance.instance;
+    let _keep_loader_alive = context.loader.module;
+    run(&context.device, &summary, queue_family_index)
 }
 
 fn dispatch_storage_shader(

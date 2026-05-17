@@ -708,7 +708,7 @@ impl Drop for FenceHandle {
     }
 }
 
-impl Drop for VulkanInstance<'_> {
+impl Drop for VulkanInstance {
     fn drop(&mut self) {
         unsafe {
             (self.destroy_instance)(self.instance, ptr::null());

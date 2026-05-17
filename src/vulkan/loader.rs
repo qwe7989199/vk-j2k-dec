@@ -40,7 +40,7 @@ impl VulkanLoader {
         Ok(unsafe { std::mem::transmute_copy::<unsafe extern "system" fn(), T>(&pointer) })
     }
 
-    fn create_instance(&self) -> Result<VulkanInstance<'_>, VulkanError> {
+    fn create_instance(&self) -> Result<VulkanInstance, VulkanError> {
         let vk_create_instance = self.load::<VkCreateInstance>(0, "vkCreateInstance")?;
         let app_name = CString::new("vk-j2k-dec").expect("static string");
         let app_info = VkApplicationInfo {
@@ -71,7 +71,6 @@ impl VulkanLoader {
         }
 
         Ok(VulkanInstance {
-            loader: self,
             instance,
             destroy_instance: self.load(instance, "vkDestroyInstance")?,
             get_device_proc_addr: self.load(instance, "vkGetDeviceProcAddr")?,
@@ -94,8 +93,7 @@ impl Drop for VulkanLoader {
     }
 }
 
-struct VulkanInstance<'a> {
-    loader: &'a VulkanLoader,
+struct VulkanInstance {
     instance: VkInstance,
     destroy_instance: VkDestroyInstance,
     get_device_proc_addr: VkGetDeviceProcAddr,
@@ -106,7 +104,7 @@ struct VulkanInstance<'a> {
     create_device: VkCreateDevice,
 }
 
-impl VulkanInstance<'_> {
+impl VulkanInstance {
     fn load_device<T>(&self, device: VkDevice, name: &str) -> Result<T, VulkanError>
     where
         T: Copy,
@@ -123,7 +121,6 @@ impl VulkanInstance<'_> {
     }
 
     fn enumerate_devices(&self) -> Result<Vec<VulkanDeviceSummary>, VulkanError> {
-        let _keep_loader_alive = self.loader.module;
         let mut count = 0u32;
         let status = unsafe {
             (self.enumerate_physical_devices)(self.instance, &mut count, ptr::null_mut())
