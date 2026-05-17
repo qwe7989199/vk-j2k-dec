@@ -531,7 +531,7 @@ impl VulkanDevice {
         )
     }
 
-    fn copy_buffer_to_host(
+    fn copy_buffer(
         &self,
         queue_family_index: u32,
         source: &HostBuffer,

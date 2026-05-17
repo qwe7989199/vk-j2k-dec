@@ -350,9 +350,12 @@ fn run_idwt53_component_on_device(
     Ok(crate::dwt::PlaneI32 {
         width: plane.width,
         height: plane.height,
-        samples: plane
-            .buffer
-            .read_vec::<i32>(checked_plane_len(plane.width, plane.height)?)?,
+        samples: read_device_i32_buffer(
+            device,
+            queue_family_index,
+            &plane.buffer,
+            checked_plane_len(plane.width, plane.height)?,
+        )?,
     })
 }
 
@@ -368,7 +371,7 @@ fn run_idwt53_component_buffer_on_device(
         .ok_or_else(|| VulkanError::new("GPU IDWT missing resolution 0 LL plane"))?;
     let mut current_width = ll.width;
     let mut current_height = ll.height;
-    let mut current_buffer = create_i32_buffer(device, &ll.coefficients)?;
+    let mut current_buffer = create_i32_device_buffer(device, queue_family_index, &ll.coefficients)?;
 
     if target_resolution == 0 {
         return Ok(GpuPlaneI32Buffer {
@@ -403,15 +406,19 @@ fn run_idwt53_component_buffer_on_device(
 
         let output_width = current_width + hl.width;
         let output_height = current_height + lh.height;
-        let hl_buffer = create_i32_buffer(device, &hl.coefficients)?;
-        let lh_buffer = create_i32_buffer(device, &lh.coefficients)?;
-        let hh_buffer = create_i32_buffer(device, &hh.coefficients)?;
-        let low_columns_buffer =
-            create_empty_buffer::<i32>(device, checked_plane_len(output_width, current_height)?)?;
+        let hl_buffer = create_i32_device_buffer(device, queue_family_index, &hl.coefficients)?;
+        let lh_buffer = create_i32_device_buffer(device, queue_family_index, &lh.coefficients)?;
+        let hh_buffer = create_i32_device_buffer(device, queue_family_index, &hh.coefficients)?;
+        let low_columns_buffer = create_empty_device_buffer::<i32>(
+            device,
+            checked_plane_len(output_width, current_height)?,
+        )?;
         let high_columns_buffer =
-            create_empty_buffer::<i32>(device, checked_plane_len(output_width, lh.height)?)?;
-        let output_buffer =
-            create_empty_buffer::<i32>(device, checked_plane_len(output_width, output_height)?)?;
+            create_empty_device_buffer::<i32>(device, checked_plane_len(output_width, lh.height)?)?;
+        let output_buffer = create_empty_device_buffer::<i32>(
+            device,
+            checked_plane_len(output_width, output_height)?,
+        )?;
 
         dispatch_idwt_lines(
             device,
@@ -777,6 +784,21 @@ fn create_i32_buffer(device: &VulkanDevice, values: &[i32]) -> Result<HostBuffer
     Ok(buffer)
 }
 
+fn create_i32_device_buffer(
+    device: &VulkanDevice,
+    queue_family_index: u32,
+    values: &[i32],
+) -> Result<HostBuffer, VulkanError> {
+    let byte_len = bytes_len::<i32>(values.len())?;
+    let staging = create_i32_buffer(device, values)?;
+    let buffer = device.create_device_local_buffer(
+        byte_len,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    )?;
+    device.copy_buffer(queue_family_index, &staging, &buffer, byte_len)?;
+    Ok(buffer)
+}
+
 pub fn run_color_components(
     shader_path: &str,
     component_planes: &[crate::dwt::PlaneI32],
@@ -1018,7 +1040,7 @@ fn run_color_i32_buffers_on_device_with_program(
     let staging_buffer =
         device.create_host_cached_buffer(output_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
     let copy_start = std::time::Instant::now();
-    device.copy_buffer_to_host(
+    device.copy_buffer(
         queue_family_index,
         &output_buffer,
         &staging_buffer,
@@ -1098,6 +1120,28 @@ fn create_f32_buffer(device: &VulkanDevice, values: &[f32]) -> Result<HostBuffer
 
 fn create_empty_buffer<T>(device: &VulkanDevice, count: usize) -> Result<HostBuffer, VulkanError> {
     device.create_host_buffer(bytes_len::<T>(count)?)
+}
+
+fn create_empty_device_buffer<T>(
+    device: &VulkanDevice,
+    count: usize,
+) -> Result<HostBuffer, VulkanError> {
+    device.create_device_local_buffer(
+        bytes_len::<T>(count)?,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+    )
+}
+
+fn read_device_i32_buffer(
+    device: &VulkanDevice,
+    queue_family_index: u32,
+    source: &HostBuffer,
+    count: usize,
+) -> Result<Vec<i32>, VulkanError> {
+    let byte_len = bytes_len::<i32>(count)?;
+    let staging = device.create_host_cached_buffer(byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+    device.copy_buffer(queue_family_index, source, &staging, byte_len)?;
+    staging.read_vec::<i32>(count)
 }
 
 fn create_f32_buffer_from_i32(

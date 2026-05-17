@@ -404,14 +404,14 @@ For repeated-frame timing, `profile-rgb48-bench` reads the codestream once,
 builds the persistent GPU pipeline once, then decodes the same in-memory frame
 multiple times and reports both all-run and warm-skip-one averages. Current
 local 10-iteration GPU bench after cleanup-pass inlining, parallel Tier-1
-codeblock decode, packed RGB48 readback, device-local color output, and
+codeblock decode, device-local DWT/color buffers, packed RGB48 readback, and
 HOST_CACHED staging:
 
 ```text
 profile-rgb48-bench: mode gpu, 1920x1080 12-bit, discard 0, iterations 10, 6220800 samples
-  pipeline_setup_ms 208.573
-  avg_all_ms decode_total 107.920 tier1 40.839 gpu_setup 0.000 reconstruct 57.985 pack 7.943 pack_shader 3.368 pack_copy 1.355 pack_readback 2.098
-  avg_warm_skip1_ms decode_total 107.501 tier1 40.725 gpu_setup 0.000 reconstruct 57.741 pack 7.878 pack_shader 3.336 pack_copy 1.297 pack_readback 2.100
+  pipeline_setup_ms 236.069
+  avg_all_ms decode_total 93.881 tier1 39.846 gpu_setup 0.000 reconstruct 48.004 pack 4.862 pack_shader 0.509 pack_copy 1.362 pack_readback 2.053
+  avg_warm_skip1_ms decode_total 94.102 tier1 39.980 gpu_setup 0.000 reconstruct 48.162 pack 4.781 pack_shader 0.507 pack_copy 1.263 pack_readback 2.054
 ```
 
 The matching CPU 10-iteration bench reports:
@@ -451,7 +451,9 @@ buffer zero-fills, inlining cleanup-pass hot paths, using an integer GPU color
 shader for reversible RCT, and reading RGB48 through a HOST_CACHED staging buffer
 instead of CPU-reading uncached host-visible storage memory. The high-level
 decode path now also uses the existing parallel Tier-1 codeblock decoder before
-serially placing decoded codeblocks into component planes.
+serially placing decoded codeblocks into component planes. The reversible GPU
+DWT path uploads subband coefficient planes once into device-local storage and
+keeps intermediate DWT buffers device-local through color conversion.
 
 Current local release median timings, 6 runs with the first run discarded:
 
