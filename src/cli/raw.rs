@@ -792,6 +792,7 @@ fn print_decode_profile(profile: &DecodeProfile) {
     println!("    work_plan_ms {:.3}", profile.timings.work_plan_ms);
     println!("    bind_ms {:.3}", profile.timings.bind_ms);
     println!("    tier1_decode_ms {:.3}", profile.timings.tier1_decode_ms);
+    println!("    gpu_setup_ms {:.3}", profile.timings.gpu_setup_ms);
     println!("    reconstruct_ms {:.3}", profile.timings.reconstruct_ms);
     println!("    pack_ms {:.3}", profile.timings.pack_ms);
 }

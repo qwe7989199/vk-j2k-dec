@@ -51,6 +51,7 @@ pub struct DecodeTimings {
     pub work_plan_ms: f64,
     pub bind_ms: f64,
     pub tier1_decode_ms: f64,
+    pub gpu_setup_ms: f64,
     pub reconstruct_ms: f64,
     pub pack_ms: f64,
     pub total_ms: f64,
@@ -492,6 +493,7 @@ fn decode_rgb48_with_backends_profiled(
                     precision,
                 )
                 .map_err(|err| DecodeError::new(format!("GPU RGB48 pipeline failed: {err}")))?;
+                profile.timings.gpu_setup_ms = result.setup_ms;
                 profile.timings.reconstruct_ms = result.reconstruct_ms;
                 profile.timings.pack_ms = result.pack_ms;
                 if result.width != expected_width || result.height != expected_height {

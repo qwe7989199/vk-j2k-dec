@@ -113,29 +113,94 @@ fn dispatch_storage_shader(
     groups_x: u32,
     groups_y: u32,
 ) -> Result<(), VulkanError> {
-    let descriptor_set_layout =
-        device.create_storage_descriptor_set_layout(descriptors.len() as u32)?;
-    let pipeline_layout =
-        device.create_pipeline_layout(descriptor_set_layout.handle, push_constants.len() as u32)?;
-    let shader_module = device.create_shader_module(spirv)?;
-    let pipeline = device.create_compute_pipeline(shader_module.handle, pipeline_layout.handle)?;
+    let program = StorageComputeProgram::new(
+        device,
+        spirv,
+        descriptors.len() as u32,
+        push_constants.len() as u32,
+    )?;
+    program.dispatch(
+        device,
+        queue_family_index,
+        descriptors,
+        push_constants,
+        groups_x,
+        groups_y,
+    )
+}
+
+struct StorageComputeProgram {
+    descriptor_set_layout: DescriptorSetLayoutHandle,
+    pipeline_layout: PipelineLayoutHandle,
+    _shader_module: ShaderModuleHandle,
+    pipeline: PipelineHandle,
+    binding_count: u32,
+    push_constant_size: u32,
+}
+
+impl StorageComputeProgram {
+    fn new(
+        device: &VulkanDevice,
+        spirv: &[u32],
+        binding_count: u32,
+        push_constant_size: u32,
+    ) -> Result<Self, VulkanError> {
+        let descriptor_set_layout = device.create_storage_descriptor_set_layout(binding_count)?;
+        let pipeline_layout =
+            device.create_pipeline_layout(descriptor_set_layout.handle, push_constant_size)?;
+        let shader_module = device.create_shader_module(spirv)?;
+        let pipeline = device.create_compute_pipeline(shader_module.handle, pipeline_layout.handle)?;
+        Ok(Self {
+            descriptor_set_layout,
+            pipeline_layout,
+            _shader_module: shader_module,
+            pipeline,
+            binding_count,
+            push_constant_size,
+        })
+    }
+
+    fn dispatch(
+        &self,
+        device: &VulkanDevice,
+        queue_family_index: u32,
+        descriptors: &[VkDescriptorBufferInfo],
+        push_constants: &[u8],
+        groups_x: u32,
+        groups_y: u32,
+    ) -> Result<(), VulkanError> {
+        if descriptors.len() as u32 != self.binding_count {
+            return Err(VulkanError::new(format!(
+                "compute program expected {} descriptors, got {}",
+                self.binding_count,
+                descriptors.len()
+            )));
+        }
+        if push_constants.len() as u32 != self.push_constant_size {
+            return Err(VulkanError::new(format!(
+                "compute program expected {} push-constant bytes, got {}",
+                self.push_constant_size,
+                push_constants.len()
+            )));
+        }
     let descriptor_pool = device.create_descriptor_pool(descriptors.len() as u32)?;
     let descriptor_set =
-        device.allocate_descriptor_set(descriptor_pool.handle, descriptor_set_layout.handle)?;
+            device.allocate_descriptor_set(descriptor_pool.handle, self.descriptor_set_layout.handle)?;
     device.update_storage_descriptor_set(descriptor_set, descriptors);
     let command_pool = device.create_command_pool(queue_family_index)?;
     let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
     device.record_storage_dispatch(
         command_buffer,
         StorageDispatch {
-            pipeline: pipeline.handle,
-            pipeline_layout: pipeline_layout.handle,
+                pipeline: self.pipeline.handle,
+                pipeline_layout: self.pipeline_layout.handle,
             descriptor_set,
             push_constants,
             groups: [groups_x, groups_y, 1],
         },
     )?;
     device.submit_and_wait(command_buffer)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -724,8 +789,19 @@ pub fn run_idwt97_smoke(shader_path: &str) -> Result<Idwt97SmokeResult, VulkanEr
         )?;
 
         let component = idwt97_smoke_component()?;
-        let component_output_plane =
-            run_idwt97_component_on_device(device, queue_family_index, &spirv, &component, 1)?;
+        let idwt97_program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            3,
+            std::mem::size_of::<Idwt53PushConstants>() as u32,
+        )?;
+        let component_output_plane = run_idwt97_component_on_device(
+            device,
+            queue_family_index,
+            &idwt97_program,
+            &component,
+            1,
+        )?;
         let component_ll = vec![4.0f32, -3.0, 12.0, 1.0, 5.0, 9.0];
         let component_hl = vec![7.0f32, -5.0, 2.0, 3.0];
         let component_lh = vec![6.0f32, 8.0, -4.0, 0.0, 11.0, -7.0];
@@ -875,6 +951,18 @@ pub fn run_irreversible_smoke(
     let idwt97_spirv = read_spirv(idwt97_shader_path)?;
     let color_spirv = read_spirv(color_shader_path)?;
     with_compute_device(|device, summary, queue_family_index| {
+        let idwt97_program = StorageComputeProgram::new(
+            device,
+            &idwt97_spirv,
+            3,
+            std::mem::size_of::<Idwt53PushConstants>() as u32,
+        )?;
+        let color_program = StorageComputeProgram::new(
+            device,
+            &color_spirv,
+            4,
+            std::mem::size_of::<ColorPushConstants>() as u32,
+        )?;
         let components = vec![
             scaled_idwt97_smoke_component(1)?,
             scaled_idwt97_smoke_component(2)?,
@@ -902,7 +990,7 @@ pub fn run_irreversible_smoke(
             gpu_planes.push(run_idwt97_float_component_on_device(
                 device,
                 queue_family_index,
-                &idwt97_spirv,
+                &idwt97_program,
                 component,
                 1,
             )?);
@@ -922,10 +1010,10 @@ pub fn run_irreversible_smoke(
                 .map_err(|err| {
                     VulkanError::new(format!("CPU irreversible smoke color pack failed: {err}"))
                 })?;
-        let gpu_samples = run_color_float_components_on_device(
+        let gpu_samples = run_color_float_components_on_device_with_program(
             device,
             queue_family_index,
-            &color_spirv,
+            &color_program,
             &gpu_planes,
             2,
             12,
@@ -1158,10 +1246,16 @@ pub fn run_color_smoke(shader_path: &str) -> Result<ColorSmokeResult, VulkanErro
                 samples: vec![5.0, 2048.0],
             },
         ];
-        let float_component_output = run_color_float_components_on_device(
+        let color_program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            4,
+            std::mem::size_of::<ColorPushConstants>() as u32,
+        )?;
+        let float_component_output = run_color_float_components_on_device_with_program(
             device,
             queue_family_index,
-            &spirv,
+            &color_program,
             &float_component_planes,
             0,
             12,

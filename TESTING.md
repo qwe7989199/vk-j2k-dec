@@ -374,28 +374,30 @@ Current local CPU full-resolution profile:
 ```text
 profile-rgb48: mode cpu, 1920x1080 12-bit, discard 0, 6220800 samples
   input_bytes 99657, tile_bytes 99516, codeblocks decoded 879/879 (skipped 0), passes 25206, nonzero 119556
-  decode_total_ms 419.794
-    packet_ms 0.584
-    work_plan_ms 0.203
-    bind_ms 0.053
-    tier1_decode_ms 325.135
-    reconstruct_ms 85.339
-    pack_ms 6.273
+  decode_total_ms 416.984
+    packet_ms 0.445
+    work_plan_ms 0.181
+    bind_ms 0.044
+    tier1_decode_ms 321.333
+    gpu_setup_ms 0.000
+    reconstruct_ms 87.045
+    pack_ms 6.402
 ```
 
-Current local GPU full-path profile uses a fused reversible 5/3 DWT plus
-color/packing call so those GPU-parallel stages share one Vulkan device/context.
-It still uses transient buffers and reads reconstructed component planes back
-before color conversion, so reconstruction, packing, and readback remain the
-dominant GPU-path bottleneck rather than arithmetic decode:
+Current local GPU full-path profile reuses compute pipelines within the frame
+and keeps reversible 5/3 component buffers on the GPU for integer RCT/packing,
+so the DWT output is no longer read back and reuploaded before color conversion.
+The remaining visible bottlenecks are per-frame Vulkan setup, CPU Tier-1, and
+final RGB48 readback/packing:
 
 ```text
 profile-rgb48: mode gpu, 1920x1080 12-bit, discard 0, 6220800 samples
   input_bytes 99657, tile_bytes 99516, codeblocks decoded 879/879 (skipped 0), passes 25206, nonzero 119556
-  decode_total_ms 1543.753
-    tier1_decode_ms 319.783
-    reconstruct_ms 922.592
-    pack_ms 121.072
+  decode_total_ms 732.788
+    tier1_decode_ms 320.046
+    gpu_setup_ms 232.953
+    reconstruct_ms 62.405
+    pack_ms 104.193
 ```
 
 The low-resolution path now prunes unused high-resolution codeblocks before
@@ -404,16 +406,18 @@ Tier-1 decode:
 ```text
 profile-rgb48: mode cpu, 120x68 12-bit, discard 4, 24480 samples
   input_bytes 99657, tile_bytes 99516, codeblocks decoded 12/879 (skipped 867), passes 432, nonzero 10883
-  decode_total_ms 7.761
-    tier1_decode_ms 6.728
-    reconstruct_ms 0.280
-    pack_ms 0.035
+  decode_total_ms 7.989
+    tier1_decode_ms 6.825
+    gpu_setup_ms 0.000
+    reconstruct_ms 0.366
+    pack_ms 0.040
 ```
 
-The current Tier-1 hot-path win comes from cached significance-neighbor counts,
-byte-backed state planes, direct coefficient/state access in decode passes, and
+The current hot-path wins come from cached Tier-1 significance-neighbor counts,
+byte-backed state planes, direct coefficient/state access in decode passes,
 avoiding an extra arithmetic-stream copy when binding concatenated codeblock
-segments.
+segments, reusing Vulkan compute pipelines within the frame, avoiding output
+buffer zero-fills, and using an integer GPU color shader for reversible RCT.
 
 Current local release median timings, 6 runs with the first run discarded:
 
@@ -439,6 +443,7 @@ compiled shaders\dequant.comp.glsl -> target\shaders\dequant.comp.spv
 compiled shaders\idwt53_1d.comp.glsl -> target\shaders\idwt53_1d.comp.spv
 compiled shaders\idwt97_1d.comp.glsl -> target\shaders\idwt97_1d.comp.spv
 compiled shaders\color_convert.comp.glsl -> target\shaders\color_convert.comp.spv
+compiled shaders\color_convert_i32.comp.glsl -> target\shaders\color_convert_i32.comp.spv
 ```
 
 Device enumeration:

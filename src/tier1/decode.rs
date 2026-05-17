@@ -584,14 +584,93 @@ impl Tier1BoundWorkPlan<'_> {
         codeblock_style: CodeblockStyle,
         reconstruction: CoefficientReconstruction,
     ) -> Result<Tier1DecodeResult, Tier1DecodeError> {
+        let worker_count = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .min(self.codeblocks.len());
+        if worker_count > 1 && self.codeblocks.len() >= 64 {
+            return self.decode_arithmetic_passes_parallel(
+                codeblock_style,
+                reconstruction,
+                worker_count,
+            );
+        }
+
         let mut codeblocks = Vec::with_capacity(self.codeblocks.len());
         let mut decoded_passes = 0;
         for codeblock in &self.codeblocks {
-            let decoded =
-                codeblock.decode_arithmetic_passes_with_reconstruction(codeblock_style, reconstruction)?;
+            let decoded = codeblock
+                .decode_arithmetic_passes_with_reconstruction(codeblock_style, reconstruction)?;
             decoded_passes += decoded.decoded_passes;
             codeblocks.push(decoded);
         }
+        Ok(Tier1DecodeResult {
+            codeblocks,
+            decoded_passes,
+            pending_passes: 0,
+        })
+    }
+
+    fn decode_arithmetic_passes_parallel(
+        &self,
+        codeblock_style: CodeblockStyle,
+        reconstruction: CoefficientReconstruction,
+        worker_count: usize,
+    ) -> Result<Tier1DecodeResult, Tier1DecodeError> {
+        let next_codeblock = std::sync::atomic::AtomicUsize::new(0);
+        let mut partials = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..worker_count {
+                let next_codeblock = &next_codeblock;
+                handles.push(scope.spawn(move || {
+                    let mut decoded = Vec::new();
+                    let mut decoded_passes = 0;
+                    loop {
+                        let index = next_codeblock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(codeblock) = self.codeblocks.get(index) else {
+                            break;
+                        };
+                        let codeblock = codeblock.decode_arithmetic_passes_with_reconstruction(
+                            codeblock_style,
+                            reconstruction,
+                        )?;
+                        decoded_passes += codeblock.decoded_passes;
+                        decoded.push((index, codeblock));
+                    }
+                    Ok::<_, Tier1DecodeError>((decoded, decoded_passes))
+                }));
+            }
+
+            for handle in handles {
+                let partial = handle
+                    .join()
+                    .map_err(|_| Tier1DecodeError::new("Tier-1 worker thread panicked"))??;
+                partials.push(partial);
+            }
+            Ok::<_, Tier1DecodeError>(())
+        })?;
+
+        let mut decoded_passes = 0;
+        let mut ordered = vec![None; self.codeblocks.len()];
+        for (decoded, passes) in partials {
+            decoded_passes += passes;
+            for (index, codeblock) in decoded {
+                ordered[index] = Some(codeblock);
+            }
+        }
+        let codeblocks = ordered
+            .into_iter()
+            .enumerate()
+            .map(|(index, codeblock)| {
+                codeblock.ok_or_else(|| {
+                    Tier1DecodeError::new(format!(
+                        "Tier-1 parallel decode missed codeblock index {index}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(Tier1DecodeResult {
             codeblocks,
             decoded_passes,

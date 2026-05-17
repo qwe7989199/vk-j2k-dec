@@ -26,8 +26,15 @@ pub struct GpuRgb48ComponentsResult {
     pub width: u32,
     pub height: u32,
     pub samples: Vec<u16>,
+    pub setup_ms: f64,
     pub reconstruct_ms: f64,
     pub pack_ms: f64,
+}
+
+struct GpuPlaneI32Buffer {
+    width: u32,
+    height: u32,
+    buffer: HostBuffer,
 }
 
 pub fn run_idwt53_components(
@@ -37,12 +44,18 @@ pub fn run_idwt53_components(
 ) -> Result<Idwt53ComponentsResult, VulkanError> {
     let spirv = read_spirv(shader_path)?;
     with_compute_device(|device, summary, queue_family_index| {
+        let program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            3,
+            std::mem::size_of::<Idwt53PushConstants>() as u32,
+        )?;
         let mut planes = Vec::with_capacity(components.len());
         for component in components {
             planes.push(run_idwt53_component_on_device(
                 device,
                 queue_family_index,
-                &spirv,
+                &program,
                 component,
                 target_resolution,
             )?);
@@ -64,16 +77,87 @@ pub fn run_idwt53_rgb48_components(
     color_transform: u32,
     precision: u8,
 ) -> Result<GpuRgb48ComponentsResult, VulkanError> {
+    let setup_start = std::time::Instant::now();
     let idwt53_spirv = read_spirv(idwt53_shader_path)?;
+    if let Some(color_i32_shader_path) = resolved_i32_color_shader_path(color_shader_path) {
+        let color_i32_spirv = read_spirv(&color_i32_shader_path)?;
+        return with_compute_device(|device, summary, queue_family_index| {
+            let idwt53_program = StorageComputeProgram::new(
+                device,
+                &idwt53_spirv,
+                3,
+                std::mem::size_of::<Idwt53PushConstants>() as u32,
+            )?;
+            let color_i32_program = StorageComputeProgram::new(
+                device,
+                &color_i32_spirv,
+                4,
+                std::mem::size_of::<ColorPushConstants>() as u32,
+            )?;
+            let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
+            let stage_start = std::time::Instant::now();
+            let mut planes = Vec::with_capacity(components.len());
+            for component in components {
+                planes.push(run_idwt53_component_buffer_on_device(
+                    device,
+                    queue_family_index,
+                    &idwt53_program,
+                    component,
+                    target_resolution,
+                )?);
+            }
+            let reconstruct_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
+
+            let width = planes.first().map(|plane| plane.width).ok_or_else(|| {
+                VulkanError::new("GPU RGB48 pipeline requires at least one plane")
+            })?;
+            let height = planes[0].height;
+            let stage_start = std::time::Instant::now();
+            let samples = run_color_i32_buffers_on_device_with_program(
+                device,
+                queue_family_index,
+                &color_i32_program,
+                &planes,
+                color_transform,
+                precision,
+            )?;
+            let pack_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
+            device.wait_idle()?;
+            Ok(GpuRgb48ComponentsResult {
+                device_name: summary.name.clone(),
+                queue_family_index,
+                width,
+                height,
+                samples,
+                setup_ms,
+                reconstruct_ms,
+                pack_ms,
+            })
+        });
+    }
+
     let color_spirv = read_spirv(color_shader_path)?;
     with_compute_device(|device, summary, queue_family_index| {
+        let idwt53_program = StorageComputeProgram::new(
+            device,
+            &idwt53_spirv,
+            3,
+            std::mem::size_of::<Idwt53PushConstants>() as u32,
+        )?;
+        let color_program = StorageComputeProgram::new(
+            device,
+            &color_spirv,
+            4,
+            std::mem::size_of::<ColorPushConstants>() as u32,
+        )?;
+        let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
         let stage_start = std::time::Instant::now();
         let mut planes = Vec::with_capacity(components.len());
         for component in components {
             planes.push(run_idwt53_component_on_device(
                 device,
                 queue_family_index,
-                &idwt53_spirv,
+                &idwt53_program,
                 component,
                 target_resolution,
             )?);
@@ -86,10 +170,10 @@ pub fn run_idwt53_rgb48_components(
             .ok_or_else(|| VulkanError::new("GPU RGB48 pipeline requires at least one plane"))?;
         let height = planes[0].height;
         let stage_start = std::time::Instant::now();
-        let samples = run_color_components_on_device(
+        let samples = run_color_components_on_device_with_program(
             device,
             queue_family_index,
-            &color_spirv,
+            &color_program,
             &planes,
             color_transform,
             precision,
@@ -102,6 +186,7 @@ pub fn run_idwt53_rgb48_components(
             width,
             height,
             samples,
+            setup_ms,
             reconstruct_ms,
             pack_ms,
         })
@@ -115,12 +200,18 @@ pub fn run_idwt97_components(
 ) -> Result<Idwt97ComponentsResult, VulkanError> {
     let spirv = read_spirv(shader_path)?;
     with_compute_device(|device, summary, queue_family_index| {
+        let program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            3,
+            std::mem::size_of::<Idwt53PushConstants>() as u32,
+        )?;
         let mut planes = Vec::with_capacity(components.len());
         for component in components {
             planes.push(run_idwt97_component_on_device(
                 device,
                 queue_family_index,
-                &spirv,
+                &program,
                 component,
                 target_resolution,
             )?);
@@ -141,12 +232,18 @@ pub fn run_idwt97_float_components(
 ) -> Result<Idwt97ComponentsResult, VulkanError> {
     let spirv = read_spirv(shader_path)?;
     with_compute_device(|device, summary, queue_family_index| {
+        let program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            3,
+            std::mem::size_of::<Idwt53PushConstants>() as u32,
+        )?;
         let mut planes = Vec::with_capacity(components.len());
         for component in components {
             planes.push(run_idwt97_float_component_on_device(
                 device,
                 queue_family_index,
-                &spirv,
+                &program,
                 component,
                 target_resolution,
             )?);
@@ -163,10 +260,33 @@ pub fn run_idwt97_float_components(
 fn run_idwt53_component_on_device(
     device: &VulkanDevice,
     queue_family_index: u32,
-    spirv: &[u32],
+    program: &StorageComputeProgram,
     component: &ComponentSubbandPlanes,
     target_resolution: u8,
 ) -> Result<crate::dwt::PlaneI32, VulkanError> {
+    let plane = run_idwt53_component_buffer_on_device(
+        device,
+        queue_family_index,
+        program,
+        component,
+        target_resolution,
+    )?;
+    Ok(crate::dwt::PlaneI32 {
+        width: plane.width,
+        height: plane.height,
+        samples: plane
+            .buffer
+            .read_vec::<i32>(checked_plane_len(plane.width, plane.height)?)?,
+    })
+}
+
+fn run_idwt53_component_buffer_on_device(
+    device: &VulkanDevice,
+    queue_family_index: u32,
+    program: &StorageComputeProgram,
+    component: &ComponentSubbandPlanes,
+    target_resolution: u8,
+) -> Result<GpuPlaneI32Buffer, VulkanError> {
     let ll = component
         .plane(0, SubbandKind::Ll)
         .ok_or_else(|| VulkanError::new("GPU IDWT missing resolution 0 LL plane"))?;
@@ -175,10 +295,10 @@ fn run_idwt53_component_on_device(
     let mut current_buffer = create_i32_buffer(device, &ll.coefficients)?;
 
     if target_resolution == 0 {
-        return Ok(crate::dwt::PlaneI32 {
+        return Ok(GpuPlaneI32Buffer {
             width: current_width,
             height: current_height,
-            samples: current_buffer.read_vec::<i32>(ll.coefficients.len())?,
+            buffer: current_buffer,
         });
     }
 
@@ -207,20 +327,20 @@ fn run_idwt53_component_on_device(
 
         let output_width = current_width + hl.width;
         let output_height = current_height + lh.height;
-        let low_columns = vec![0i32; checked_plane_len(output_width, current_height)?];
-        let high_columns = vec![0i32; checked_plane_len(output_width, lh.height)?];
-        let output_seed = vec![0i32; checked_plane_len(output_width, output_height)?];
         let hl_buffer = create_i32_buffer(device, &hl.coefficients)?;
         let lh_buffer = create_i32_buffer(device, &lh.coefficients)?;
         let hh_buffer = create_i32_buffer(device, &hh.coefficients)?;
-        let low_columns_buffer = create_i32_buffer(device, &low_columns)?;
-        let high_columns_buffer = create_i32_buffer(device, &high_columns)?;
-        let output_buffer = create_i32_buffer(device, &output_seed)?;
+        let low_columns_buffer =
+            create_empty_buffer::<i32>(device, checked_plane_len(output_width, current_height)?)?;
+        let high_columns_buffer =
+            create_empty_buffer::<i32>(device, checked_plane_len(output_width, lh.height)?)?;
+        let output_buffer =
+            create_empty_buffer::<i32>(device, checked_plane_len(output_width, output_height)?)?;
 
         dispatch_idwt_lines(
             device,
             queue_family_index,
-            spirv,
+            program,
             &current_buffer,
             &hl_buffer,
             &low_columns_buffer,
@@ -239,7 +359,7 @@ fn run_idwt53_component_on_device(
         dispatch_idwt_lines(
             device,
             queue_family_index,
-            spirv,
+            program,
             &lh_buffer,
             &hh_buffer,
             &high_columns_buffer,
@@ -258,7 +378,7 @@ fn run_idwt53_component_on_device(
         dispatch_idwt_lines(
             device,
             queue_family_index,
-            spirv,
+            program,
             &low_columns_buffer,
             &high_columns_buffer,
             &output_buffer,
@@ -280,17 +400,17 @@ fn run_idwt53_component_on_device(
         current_buffer = output_buffer;
     }
 
-    Ok(crate::dwt::PlaneI32 {
+    Ok(GpuPlaneI32Buffer {
         width: current_width,
         height: current_height,
-        samples: current_buffer.read_vec::<i32>(checked_plane_len(current_width, current_height)?)?,
+        buffer: current_buffer,
     })
 }
 
 fn run_idwt97_component_on_device(
     device: &VulkanDevice,
     queue_family_index: u32,
-    spirv: &[u32],
+    program: &StorageComputeProgram,
     component: &ComponentSubbandPlanes,
     target_resolution: u8,
 ) -> Result<crate::dwt::PlaneF32, VulkanError> {
@@ -339,20 +459,20 @@ fn run_idwt97_component_on_device(
 
         let output_width = current_width + hl.width;
         let output_height = current_height + lh.height;
-        let low_rows = vec![0.0f32; checked_plane_len(current_width, output_height)?];
-        let high_rows = vec![0.0f32; checked_plane_len(hl.width, output_height)?];
-        let output_seed = vec![0.0f32; checked_plane_len(output_width, output_height)?];
         let hl_buffer = create_f32_buffer_from_i32(device, &hl.coefficients)?;
         let lh_buffer = create_f32_buffer_from_i32(device, &lh.coefficients)?;
         let hh_buffer = create_f32_buffer_from_i32(device, &hh.coefficients)?;
-        let low_rows_buffer = create_f32_buffer(device, &low_rows)?;
-        let high_rows_buffer = create_f32_buffer(device, &high_rows)?;
-        let output_buffer = create_f32_buffer(device, &output_seed)?;
+        let low_rows_buffer =
+            create_empty_buffer::<f32>(device, checked_plane_len(current_width, output_height)?)?;
+        let high_rows_buffer =
+            create_empty_buffer::<f32>(device, checked_plane_len(hl.width, output_height)?)?;
+        let output_buffer =
+            create_empty_buffer::<f32>(device, checked_plane_len(output_width, output_height)?)?;
 
         dispatch_idwt_lines(
             device,
             queue_family_index,
-            spirv,
+            program,
             &current_buffer,
             &lh_buffer,
             &low_rows_buffer,
@@ -371,7 +491,7 @@ fn run_idwt97_component_on_device(
         dispatch_idwt_lines(
             device,
             queue_family_index,
-            spirv,
+            program,
             &hl_buffer,
             &hh_buffer,
             &high_rows_buffer,
@@ -390,7 +510,7 @@ fn run_idwt97_component_on_device(
         dispatch_idwt_lines(
             device,
             queue_family_index,
-            spirv,
+            program,
             &low_rows_buffer,
             &high_rows_buffer,
             &output_buffer,
@@ -422,7 +542,7 @@ fn run_idwt97_component_on_device(
 fn run_idwt97_float_component_on_device(
     device: &VulkanDevice,
     queue_family_index: u32,
-    spirv: &[u32],
+    program: &StorageComputeProgram,
     component: &ComponentFloatSubbandPlanes,
     target_resolution: u8,
 ) -> Result<crate::dwt::PlaneF32, VulkanError> {
@@ -472,20 +592,20 @@ fn run_idwt97_float_component_on_device(
 
         let output_width = current_width + hl.width;
         let output_height = current_height + lh.height;
-        let low_rows = vec![0.0f32; checked_plane_len(current_width, output_height)?];
-        let high_rows = vec![0.0f32; checked_plane_len(hl.width, output_height)?];
-        let output_seed = vec![0.0f32; checked_plane_len(output_width, output_height)?];
         let hl_buffer = create_f32_buffer(device, &hl.samples)?;
         let lh_buffer = create_f32_buffer(device, &lh.samples)?;
         let hh_buffer = create_f32_buffer(device, &hh.samples)?;
-        let low_rows_buffer = create_f32_buffer(device, &low_rows)?;
-        let high_rows_buffer = create_f32_buffer(device, &high_rows)?;
-        let output_buffer = create_f32_buffer(device, &output_seed)?;
+        let low_rows_buffer =
+            create_empty_buffer::<f32>(device, checked_plane_len(current_width, output_height)?)?;
+        let high_rows_buffer =
+            create_empty_buffer::<f32>(device, checked_plane_len(hl.width, output_height)?)?;
+        let output_buffer =
+            create_empty_buffer::<f32>(device, checked_plane_len(output_width, output_height)?)?;
 
         dispatch_idwt_lines(
             device,
             queue_family_index,
-            spirv,
+            program,
             &current_buffer,
             &lh_buffer,
             &low_rows_buffer,
@@ -504,7 +624,7 @@ fn run_idwt97_float_component_on_device(
         dispatch_idwt_lines(
             device,
             queue_family_index,
-            spirv,
+            program,
             &hl_buffer,
             &hh_buffer,
             &high_rows_buffer,
@@ -523,7 +643,7 @@ fn run_idwt97_float_component_on_device(
         dispatch_idwt_lines(
             device,
             queue_family_index,
-            spirv,
+            program,
             &low_rows_buffer,
             &high_rows_buffer,
             &output_buffer,
@@ -555,16 +675,15 @@ fn run_idwt97_float_component_on_device(
 fn dispatch_idwt_lines(
     device: &VulkanDevice,
     queue_family_index: u32,
-    spirv: &[u32],
+    program: &StorageComputeProgram,
     low_buffer: &HostBuffer,
     high_buffer: &HostBuffer,
     output_buffer: &HostBuffer,
     push: Idwt53PushConstants,
 ) -> Result<(), VulkanError> {
-    dispatch_storage_shader(
+    program.dispatch(
         device,
         queue_family_index,
-        spirv,
         &[
             low_buffer.descriptor_info(),
             high_buffer.descriptor_info(),
@@ -590,10 +709,16 @@ pub fn run_color_components(
 ) -> Result<ColorComponentsResult, VulkanError> {
     let spirv = read_spirv(shader_path)?;
     with_compute_device(|device, summary, queue_family_index| {
-        let samples = run_color_components_on_device(
+        let program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            4,
+            std::mem::size_of::<ColorPushConstants>() as u32,
+        )?;
+        let samples = run_color_components_on_device_with_program(
             device,
             queue_family_index,
-            &spirv,
+            &program,
             component_planes,
             color_transform,
             precision,
@@ -615,10 +740,16 @@ pub fn run_color_float_components(
 ) -> Result<ColorComponentsResult, VulkanError> {
     let spirv = read_spirv(shader_path)?;
     with_compute_device(|device, summary, queue_family_index| {
-        let samples = run_color_float_components_on_device(
+        let program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            4,
+            std::mem::size_of::<ColorPushConstants>() as u32,
+        )?;
+        let samples = run_color_float_components_on_device_with_program(
             device,
             queue_family_index,
-            &spirv,
+            &program,
             component_planes,
             color_transform,
             precision,
@@ -632,10 +763,10 @@ pub fn run_color_float_components(
     })
 }
 
-fn run_color_components_on_device(
+fn run_color_components_on_device_with_program(
     device: &VulkanDevice,
     queue_family_index: u32,
-    spirv: &[u32],
+    program: &StorageComputeProgram,
     component_planes: &[crate::dwt::PlaneI32],
     color_transform: u32,
     precision: u8,
@@ -682,20 +813,20 @@ fn run_color_components_on_device(
         .iter()
         .map(|sample| *sample as f32)
         .collect::<Vec<_>>();
-    run_color_float_slices_on_device(
+    run_color_float_slices_on_device_with_program(
         device,
         queue_family_index,
-        spirv,
+        program,
         [&c0, &c1, &c2],
         color_transform,
         precision,
     )
 }
 
-fn run_color_float_components_on_device(
+fn run_color_float_components_on_device_with_program(
     device: &VulkanDevice,
     queue_family_index: u32,
-    spirv: &[u32],
+    program: &StorageComputeProgram,
     component_planes: &[crate::dwt::PlaneF32],
     color_transform: u32,
     precision: u8,
@@ -727,10 +858,10 @@ fn run_color_float_components_on_device(
         }
     }
 
-    run_color_float_slices_on_device(
+    run_color_float_slices_on_device_with_program(
         device,
         queue_family_index,
-        spirv,
+        program,
         [
             &component_planes[0].samples,
             &component_planes[1].samples,
@@ -741,10 +872,79 @@ fn run_color_float_components_on_device(
     )
 }
 
-fn run_color_float_slices_on_device(
+fn run_color_i32_buffers_on_device_with_program(
     device: &VulkanDevice,
     queue_family_index: u32,
-    spirv: &[u32],
+    program: &StorageComputeProgram,
+    component_planes: &[GpuPlaneI32Buffer],
+    color_transform: u32,
+    precision: u8,
+) -> Result<Vec<u16>, VulkanError> {
+    if component_planes.len() != 3 {
+        return Err(VulkanError::new(format!(
+            "GPU integer color conversion requires 3 component planes, got {}",
+            component_planes.len()
+        )));
+    }
+    if color_transform > 1 {
+        return Err(VulkanError::new(format!(
+            "GPU integer color conversion supports only none/RCT, got mode {color_transform}"
+        )));
+    }
+    if precision == 0 || precision > 16 {
+        return Err(VulkanError::new(format!(
+            "GPU integer color conversion cannot pack precision {precision}"
+        )));
+    }
+    let width = component_planes[0].width;
+    let height = component_planes[0].height;
+    let sample_count = checked_plane_len(width, height)?;
+    for (index, plane) in component_planes.iter().enumerate() {
+        if plane.width != width || plane.height != height {
+            return Err(VulkanError::new(format!(
+                "GPU integer color component {index} has {}x{}, expected {}x{}",
+                plane.width, plane.height, width, height
+            )));
+        }
+    }
+
+    let output_count = sample_count * 3;
+    let output_buffer = create_empty_buffer::<u32>(device, output_count)?;
+    let output_max = (1u32 << precision) - 1;
+    let push = ColorPushConstants {
+        sample_count: sample_count as u32,
+        color_transform,
+        output_max,
+        level_shift: (1u32 << (precision - 1)) as f32,
+    };
+    program.dispatch(
+        device,
+        queue_family_index,
+        &[
+            component_planes[0].buffer.descriptor_info(),
+            component_planes[1].buffer.descriptor_info(),
+            component_planes[2].buffer.descriptor_info(),
+            output_buffer.descriptor_info(),
+        ],
+        bytes_of(&push),
+        push.sample_count.div_ceil(256),
+        1,
+    )?;
+    let output = output_buffer.read_vec::<u32>(output_count)?;
+    output
+        .into_iter()
+        .map(|sample| {
+            u16::try_from(sample).map_err(|_| {
+                VulkanError::new(format!("GPU integer color output sample {sample} exceeds u16"))
+            })
+        })
+        .collect()
+}
+
+fn run_color_float_slices_on_device_with_program(
+    device: &VulkanDevice,
+    queue_family_index: u32,
+    program: &StorageComputeProgram,
     components: [&[f32]; 3],
     color_transform: u32,
     precision: u8,
@@ -758,11 +958,11 @@ fn run_color_float_slices_on_device(
             )));
         }
     }
-    let output_seed = vec![0u32; sample_count * 3];
     let c0_buffer = create_f32_buffer(device, components[0])?;
     let c1_buffer = create_f32_buffer(device, components[1])?;
     let c2_buffer = create_f32_buffer(device, components[2])?;
-    let output_buffer = create_u32_buffer(device, &output_seed)?;
+    let output_count = sample_count * 3;
+    let output_buffer = create_empty_buffer::<u32>(device, output_count)?;
     let output_max = (1u32 << precision) - 1;
     let push = ColorPushConstants {
         sample_count: sample_count as u32,
@@ -770,10 +970,9 @@ fn run_color_float_slices_on_device(
         output_max,
         level_shift: (1u32 << (precision - 1)) as f32,
     };
-    dispatch_storage_shader(
+    program.dispatch(
         device,
         queue_family_index,
-        spirv,
         &[
             c0_buffer.descriptor_info(),
             c1_buffer.descriptor_info(),
@@ -784,7 +983,7 @@ fn run_color_float_slices_on_device(
         push.sample_count.div_ceil(256),
         1,
     )?;
-    let output = output_buffer.read_vec::<u32>(output_seed.len())?;
+    let output = output_buffer.read_vec::<u32>(output_count)?;
     output
         .into_iter()
         .map(|sample| {
@@ -801,15 +1000,16 @@ fn create_f32_buffer(device: &VulkanDevice, values: &[f32]) -> Result<HostBuffer
     Ok(buffer)
 }
 
-fn create_f32_buffer_from_i32(device: &VulkanDevice, values: &[i32]) -> Result<HostBuffer, VulkanError> {
-    let floats = values.iter().map(|value| *value as f32).collect::<Vec<_>>();
-    create_f32_buffer(device, &floats)
+fn create_empty_buffer<T>(device: &VulkanDevice, count: usize) -> Result<HostBuffer, VulkanError> {
+    device.create_host_buffer(bytes_len::<T>(count)?)
 }
 
-fn create_u32_buffer(device: &VulkanDevice, values: &[u32]) -> Result<HostBuffer, VulkanError> {
-    let buffer = device.create_host_buffer(bytes_len::<u32>(values.len())?)?;
-    buffer.write_slice(values)?;
-    Ok(buffer)
+fn create_f32_buffer_from_i32(
+    device: &VulkanDevice,
+    values: &[i32],
+) -> Result<HostBuffer, VulkanError> {
+    let floats = values.iter().map(|value| *value as f32).collect::<Vec<_>>();
+    create_f32_buffer(device, &floats)
 }
 
 fn checked_plane_len(width: u32, height: u32) -> Result<usize, VulkanError> {
@@ -817,4 +1017,12 @@ fn checked_plane_len(width: u32, height: u32) -> Result<usize, VulkanError> {
         .checked_mul(height)
         .map(|count| count as usize)
         .ok_or_else(|| VulkanError::new(format!("GPU plane dimensions overflow: {width}x{height}")))
+}
+
+fn resolved_i32_color_shader_path(color_shader_path: &str) -> Option<String> {
+    let path = std::path::Path::new(color_shader_path);
+    let candidate = path.with_file_name("color_convert_i32.comp.spv");
+    candidate
+        .is_file()
+        .then(|| candidate.to_string_lossy().into_owned())
 }
