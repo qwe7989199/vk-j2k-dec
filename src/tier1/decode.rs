@@ -538,16 +538,19 @@ impl BoundCompressedCodeblock<'_> {
         codeblock_style: CodeblockStyle,
         reconstruction: CoefficientReconstruction,
     ) -> Result<DecodedCodeblock, Tier1DecodeError> {
-        let execution = self.execution_plan(codeblock_style)?;
-        if let Some(raw_pass) = execution
-            .passes
-            .iter()
-            .find(|pass| pass.coding_mode == Tier1CodingMode::RawBypass)
-        {
-            return Err(Tier1DecodeError::new(format!(
-                "codeblock {:?} contains raw bypass pass {}",
-                self.id, raw_pass.pass.index
-            )));
+        let pass_count = self.total_coding_passes();
+        for pass_index in 0..pass_count {
+            let pass = tier1_pass_for_index(
+                self.magnitude_bitplanes,
+                self.zero_bit_planes,
+                pass_index,
+            );
+            if coding_mode_for_pass(pass, codeblock_style) == Tier1CodingMode::RawBypass {
+                return Err(Tier1DecodeError::new(format!(
+                    "codeblock {:?} contains raw bypass pass {}",
+                    self.id, pass.index
+                )));
+            }
         }
 
         let mut decoded = DecodedCodeblock::new_bound_with_reconstruction(self, reconstruction)?;
@@ -560,8 +563,13 @@ impl BoundCompressedCodeblock<'_> {
             }
             MqDecoder::with_owned_data(data)
         };
-        for pass in execution.passes {
-            decoded.decode_pass(pass.pass, &mut mq)?;
+        for pass_index in 0..pass_count {
+            let pass = tier1_pass_for_index(
+                self.magnitude_bitplanes,
+                self.zero_bit_planes,
+                pass_index,
+            );
+            decoded.decode_pass(pass, &mut mq)?;
         }
         decoded.decoder_bytes_consumed = mq.consumed_bytes();
         Ok(decoded)

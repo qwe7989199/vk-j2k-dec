@@ -234,28 +234,40 @@ pub fn build_pass_schedule_for_codeblock(
     pass_count: u32,
 ) -> Vec<Tier1Pass> {
     let mut passes = Vec::with_capacity(pass_count as usize);
-    let first_bitplane = magnitude_bitplanes as i32 - zero_bit_planes as i32 - 1;
 
     for index in 0..pass_count {
-        let (bitplane, kind) = if index == 0 {
-            (first_bitplane, Tier1PassKind::Cleanup)
-        } else {
-            let bitplane = first_bitplane - 1 - ((index - 1) / 3) as i32;
-            match (index - 1) % 3 {
-                0 => (bitplane, Tier1PassKind::SignificancePropagation),
-                1 => (bitplane, Tier1PassKind::MagnitudeRefinement),
-                _ => (bitplane, Tier1PassKind::Cleanup),
-            }
-        };
-
-        passes.push(Tier1Pass {
+        passes.push(tier1_pass_for_index(
+            magnitude_bitplanes,
+            zero_bit_planes,
             index,
-            bitplane,
-            kind,
-        });
+        ));
     }
 
     passes
+}
+
+pub fn tier1_pass_for_index(
+    magnitude_bitplanes: u32,
+    zero_bit_planes: u32,
+    index: u32,
+) -> Tier1Pass {
+    let first_bitplane = magnitude_bitplanes as i32 - zero_bit_planes as i32 - 1;
+    let (bitplane, kind) = if index == 0 {
+        (first_bitplane, Tier1PassKind::Cleanup)
+    } else {
+        let bitplane = first_bitplane - 1 - ((index - 1) / 3) as i32;
+        match (index - 1) % 3 {
+            0 => (bitplane, Tier1PassKind::SignificancePropagation),
+            1 => (bitplane, Tier1PassKind::MagnitudeRefinement),
+            _ => (bitplane, Tier1PassKind::Cleanup),
+        }
+    };
+
+    Tier1Pass {
+        index,
+        bitplane,
+        kind,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
