@@ -175,13 +175,13 @@ impl DecodedCodeblock {
         is_significant: bool,
         is_negative: Option<bool>,
     ) -> Result<(), Tier1DecodeError> {
-        self.index(x, y).ok_or_else(|| {
+        let index = self.index(x, y).ok_or_else(|| {
             Tier1DecodeError::new(format!(
                 "coefficient coordinate {x},{y} outside {}x{} codeblock",
                 self.width, self.height
             ))
         })?;
-        self.state.mark_visited_in_bitplane(x, y)?;
+        self.state.visited_in_bitplane[index] = 1;
         if !is_significant {
             return Ok(());
         }
@@ -192,8 +192,9 @@ impl DecodedCodeblock {
         let magnitude =
             significance_reconstruction_magnitude(self.id, bitplane, self.reconstruction)?;
         let value = if is_negative { -magnitude } else { magnitude };
-        self.coefficients[y as usize * self.width as usize + x as usize] = value;
-        self.state.mark_significant(x, y, is_negative)
+        self.coefficients[index] = value;
+        self.state.mark_significant_at_index(index, x as usize, y as usize, is_negative);
+        Ok(())
     }
 
     pub fn apply_magnitude_refinement_bit(
@@ -549,13 +550,16 @@ impl BoundCompressedCodeblock<'_> {
             )));
         }
 
-        let mut data = Vec::with_capacity(self.total_bytes());
-        for segment in &self.segments {
-            data.extend_from_slice(segment.data);
-        }
-
         let mut decoded = DecodedCodeblock::new_bound_with_reconstruction(self, reconstruction)?;
-        let mut mq = MqDecoder::with_owned_data(data);
+        let mut mq = if self.segments.len() == 1 {
+            MqDecoder::with_data(self.segments[0].data)
+        } else {
+            let mut data = Vec::with_capacity(self.total_bytes());
+            for segment in &self.segments {
+                data.extend_from_slice(segment.data);
+            }
+            MqDecoder::with_owned_data(data)
+        };
         for pass in execution.passes {
             decoded.decode_pass(pass.pass, &mut mq)?;
         }
@@ -644,12 +648,22 @@ impl CodeblockStatePlanes {
                 self.width, self.height
             ))
         })?;
+        self.mark_significant_at_index(index, x as usize, y as usize, is_negative);
+        Ok(())
+    }
+
+    fn mark_significant_at_index(
+        &mut self,
+        index: usize,
+        x: usize,
+        y: usize,
+        is_negative: bool,
+    ) {
         if self.significant[index] == 0 {
-            self.update_neighbor_counts_for_significant(x as usize, y as usize);
+            self.update_neighbor_counts_for_significant(x, y);
         }
         self.significant[index] = 1;
         self.sign[index] = u8::from(is_negative);
-        Ok(())
     }
 
     pub fn mark_magnitude_refined(&mut self, x: u32, y: u32) -> Result<(), Tier1DecodeError> {
