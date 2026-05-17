@@ -41,13 +41,13 @@ impl TileCoefficientPlanes {
             .enumerate()
             .map(|(component, layout)| ComponentSubbandPlanes::new(component as u16, layout))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut decoded_codeblocks = 0usize;
-        let mut decoded_passes = 0u32;
+        let decoded = work_plan
+            .decode_arithmetic_passes_with_reconstruction(codeblock_style, reconstruction)?;
+        let decoded_codeblocks = decoded.codeblocks.len();
+        let decoded_passes = decoded.decoded_passes;
         let mut nonzero_coefficients = 0usize;
 
-        for codeblock in &work_plan.codeblocks {
-            let decoded = codeblock
-                .decode_arithmetic_passes_with_reconstruction(codeblock_style, reconstruction)?;
+        for decoded in &decoded.codeblocks {
             let component = components
                 .get_mut(decoded.id.component as usize)
                 .ok_or_else(|| {
@@ -61,9 +61,7 @@ impl TileCoefficientPlanes {
                 .iter()
                 .filter(|coefficient| **coefficient != 0)
                 .count();
-            decoded_passes += decoded.decoded_passes;
             component.place_codeblock(&decoded)?;
-            decoded_codeblocks += 1;
         }
 
         Ok(Self {

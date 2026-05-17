@@ -403,22 +403,31 @@ profile-rgb48: mode gpu, 1920x1080 12-bit, discard 0, 6220800 samples
 For repeated-frame timing, `profile-rgb48-bench` reads the codestream once,
 builds the persistent GPU pipeline once, then decodes the same in-memory frame
 multiple times and reports both all-run and warm-skip-one averages. Current
-local 10-iteration GPU bench after cleanup-pass inlining, packed RGB48 readback,
-device-local color output, and HOST_CACHED staging:
+local 10-iteration GPU bench after cleanup-pass inlining, parallel Tier-1
+codeblock decode, packed RGB48 readback, device-local color output, and
+HOST_CACHED staging:
 
 ```text
 profile-rgb48-bench: mode gpu, 1920x1080 12-bit, discard 0, iterations 10, 6220800 samples
-  pipeline_setup_ms 229.770
-  avg_all_ms decode_total 272.371 tier1 206.936 gpu_setup 0.000 reconstruct 56.387 pack 7.902 pack_shader 3.311 pack_copy 1.395 pack_readback 2.076
-  avg_warm_skip1_ms decode_total 272.089 tier1 206.904 gpu_setup 0.000 reconstruct 56.230 pack 7.806 pack_shader 3.285 pack_copy 1.329 pack_readback 2.081
+  pipeline_setup_ms 208.573
+  avg_all_ms decode_total 107.920 tier1 40.839 gpu_setup 0.000 reconstruct 57.985 pack 7.943 pack_shader 3.368 pack_copy 1.355 pack_readback 2.098
+  avg_warm_skip1_ms decode_total 107.501 tier1 40.725 gpu_setup 0.000 reconstruct 57.741 pack 7.878 pack_shader 3.336 pack_copy 1.297 pack_readback 2.100
 ```
 
 The matching CPU 10-iteration bench reports:
 
 ```text
 profile-rgb48-bench: mode cpu, 1920x1080 12-bit, discard 0, iterations 10, 6220800 samples
-  avg_all_ms decode_total 295.327 tier1 200.672 gpu_setup 0.000 reconstruct 85.541 pack 6.737 pack_shader 0.000 pack_copy 0.000 pack_readback 0.000
-  avg_warm_skip1_ms decode_total 293.491 tier1 198.959 gpu_setup 0.000 reconstruct 85.418 pack 6.736 pack_shader 0.000 pack_copy 0.000 pack_readback 0.000
+  avg_all_ms decode_total 145.411 tier1 40.907 gpu_setup 0.000 reconstruct 95.049 pack 7.172 pack_shader 0.000 pack_copy 0.000 pack_readback 0.000
+  avg_warm_skip1_ms decode_total 145.507 tier1 41.047 gpu_setup 0.000 reconstruct 95.008 pack 7.181 pack_shader 0.000 pack_copy 0.000 pack_readback 0.000
+```
+
+The comparable FFmpeg native JPEG2000 10-frame loop against the same in-memory
+frame source, writing RGB48 output to `NUL`, reports about 119 ms/frame:
+
+```text
+ffmpeg -hide_banner -v info -benchmark -stream_loop 9 -i target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k -frames:v 10 -pix_fmt rgb48le -f rawvideo NUL
+bench: utime=1.141s stime=0.078s rtime=1.192s
 ```
 
 The low-resolution path now prunes unused high-resolution codeblocks before
@@ -440,7 +449,9 @@ avoiding an extra arithmetic-stream copy when binding concatenated codeblock
 segments, reusing Vulkan compute pipelines within the frame, avoiding output
 buffer zero-fills, inlining cleanup-pass hot paths, using an integer GPU color
 shader for reversible RCT, and reading RGB48 through a HOST_CACHED staging buffer
-instead of CPU-reading uncached host-visible storage memory.
+instead of CPU-reading uncached host-visible storage memory. The high-level
+decode path now also uses the existing parallel Tier-1 codeblock decoder before
+serially placing decoded codeblocks into component planes.
 
 Current local release median timings, 6 runs with the first run discarded:
 

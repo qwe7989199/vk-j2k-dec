@@ -68,8 +68,11 @@ The reversible RGB48 path now keeps DWT and color output device-local through
 the final color shader, then copies the packed RGB48 buffer once into
 HOST_CACHED staging for CPU readback. On the local RTX 5060 sample this split is
 roughly 3.3 ms shader, 1.3 ms device-to-host copy, and 2.1 ms CPU map/read for
-the final 12.4 MB RGB48 buffer. The implementation still submits one shader
-dispatch at a time, so the next GPU milestones are:
+the final 12.4 MB RGB48 buffer. With the high-level path using parallel Tier-1
+codeblock decode, the same frame currently averages about 108 ms/frame through
+the persistent GPU RGB48 benchmark, compared with about 119 ms/frame for the
+local FFmpeg native JPEG2000 RGB48 loop. The implementation still submits one
+shader dispatch at a time, so the next GPU milestones are:
 
 - reuse descriptor layouts, pipelines, command pools, and command buffers;
 - add persistent buffer pools for repeated full-frame decode;
