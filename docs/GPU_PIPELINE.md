@@ -124,9 +124,9 @@ device-local RGB48 fast-path bench:
 
 ```text
 vulkan tier1_cleanup_pass+scatter bench: setup 2.155 ms, hot_dispatch 599.086 ms total / 59.909 ms avg, readback 10.313 ms
-vulkan full RGB48 hot bench: setup_once 674.278 ms, 814.522 ms total / 81.452 ms avg, 12.28 fps
-  avg breakdown: tier1_cleanup_pass 61.291 ms, scatter 0.218 ms, idwt_dispatch 3.878 ms, idwt_alloc 4.514 ms, color_shader 0.414 ms, color_copy 1.275 ms, color_readback 1.998 ms
-cpu full RGB48 reference: 1398.946 ms total / 139.895 ms avg, 7.15 fps; GPU speedup 1.72x
+vulkan full RGB48 hot bench: setup_once 713.990 ms, 647.097 ms total / 64.710 ms avg, 15.45 fps
+  avg breakdown: tier1_cleanup_pass 59.720 ms, scatter 0.249 ms, idwt_dispatch 0.990 ms, idwt_alloc 0.000 ms, color_shader 0.118 ms, color_copy 1.030 ms, color_readback 2.094 ms
+cpu full RGB48 reference: 1429.653 ms total / 142.965 ms avg, 6.99 fps; GPU speedup 2.21x
 cpu tier1 reference: 2677.652 ms total / 267.765 ms avg, hot GPU speedup 4.43x
 ```
 
@@ -154,6 +154,9 @@ planes device-local through inverse 5/3 and integer color packing, then reads
 back the packed RGB48 frame for validation. The hot full-chain bench avoids CPU
 coefficient placement and intermediate coefficient-plane transfers; the
 remaining dominant cost is the one-invocation-per-codeblock Tier-1 cleanup pass.
+The bench now preallocates scattered-IDWT scratch/output buffers, pre-records
+IDWT and color command buffers, and reuses the RGB48 device/staging buffers
+across iterations.
 
 The next implementation step is turning this smoke/bench path into a reusable
 high-level `profile-rgb48-bench` mode with persistent DWT scratch buffers and

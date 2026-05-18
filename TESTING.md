@@ -381,9 +381,9 @@ tier1 gpu plan: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
 tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 iteration(s)
   tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
     vulkan tier1_cleanup_pass+scatter bench: device NVIDIA GeForce RTX 5060, queue 2, setup 2.155 ms, hot_dispatch 599.086 ms total / 59.909 ms avg, readback 10.313 ms
-    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 674.278 ms, 814.522 ms total / 81.452 ms avg, 12.28 fps
-      avg breakdown: tier1_cleanup_pass 61.291 ms, scatter 0.218 ms, idwt_dispatch 3.878 ms, idwt_alloc 4.514 ms, color_shader 0.414 ms, color_copy 1.275 ms, color_readback 1.998 ms, summary_readback_once 0.274 ms
-      cpu full RGB48 reference: 1398.946 ms total / 139.895 ms avg, 7.15 fps; GPU speedup 1.72x
+    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 713.990 ms, 647.097 ms total / 64.710 ms avg, 15.45 fps
+      avg breakdown: tier1_cleanup_pass 59.720 ms, scatter 0.249 ms, idwt_dispatch 0.990 ms, idwt_alloc 0.000 ms, color_shader 0.118 ms, color_copy 1.030 ms, color_readback 2.094 ms, summary_readback_once 0.425 ms
+      cpu full RGB48 reference: 1429.653 ms total / 142.965 ms avg, 6.99 fps; GPU speedup 2.21x
     vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 1.782 ms, hot_dispatch 603.860 ms total / 60.386 ms avg, readback 4.231 ms
     gpu cleanup+scatter vs cpu reference: 4.47x hot speedup
     cpu tier1 reference: 2677.652 ms total / 267.765 ms avg, hot GPU speedup 4.43x, first nonzero 2040, checksum 0xfffe2412
@@ -503,18 +503,18 @@ color packing, and RGB48 readback each iteration:
 ```text
 tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 iteration(s)
   tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
-    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 674.278 ms, 814.522 ms total / 81.452 ms avg, 12.28 fps
-      avg breakdown: tier1_cleanup_pass 61.291 ms, scatter 0.218 ms, idwt_dispatch 3.878 ms, idwt_alloc 4.514 ms, color_shader 0.414 ms, color_copy 1.275 ms, color_readback 1.998 ms, summary_readback_once 0.274 ms
-      cpu full RGB48 reference: 1398.946 ms total / 139.895 ms avg, 7.15 fps; GPU speedup 1.72x
+    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 713.990 ms, 647.097 ms total / 64.710 ms avg, 15.45 fps
+      avg breakdown: tier1_cleanup_pass 59.720 ms, scatter 0.249 ms, idwt_dispatch 0.990 ms, idwt_alloc 0.000 ms, color_shader 0.118 ms, color_copy 1.030 ms, color_readback 2.094 ms, summary_readback_once 0.425 ms
+      cpu full RGB48 reference: 1429.653 ms total / 142.965 ms avg, 6.99 fps; GPU speedup 2.21x
 ```
 
 The comparable FFmpeg native JPEG2000 10-frame loop against the same frame
-source, writing wrapped frames to `null`, reports about 124.5 ms/frame
-(~8.03 fps) on the local machine:
+source, writing wrapped frames to `null`, reports about 125.9 ms/frame
+(~7.94 fps) on the local machine:
 
 ```text
 ffmpeg -hide_banner -benchmark -v info -stream_loop 9 -i target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k -f null -
-bench: utime=1.156s stime=0.062s rtime=1.245s
+bench: utime=1.156s stime=0.078s rtime=1.259s
 ```
 
 The low-resolution path now prunes unused high-resolution codeblocks before

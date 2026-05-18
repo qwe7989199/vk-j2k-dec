@@ -53,6 +53,13 @@ struct GpuPlaneI32Buffer {
     buffer: HostBuffer,
 }
 
+#[derive(Clone, Copy)]
+struct GpuPlaneI32BufferRef<'a> {
+    width: u32,
+    height: u32,
+    buffer: &'a HostBuffer,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct GpuDwtProfile {
     upload_ms: f64,
@@ -1389,6 +1396,32 @@ fn run_color_i32_buffers_on_device_with_program(
     queue_family_index: u32,
     program: &StorageComputeProgram,
     component_planes: &[GpuPlaneI32Buffer],
+    color_transform: u32,
+    precision: u8,
+) -> Result<GpuPackedRgb48Result, VulkanError> {
+    let refs = component_planes
+        .iter()
+        .map(|plane| GpuPlaneI32BufferRef {
+            width: plane.width,
+            height: plane.height,
+            buffer: &plane.buffer,
+        })
+        .collect::<Vec<_>>();
+    run_color_i32_buffer_refs_on_device_with_program(
+        device,
+        queue_family_index,
+        program,
+        &refs,
+        color_transform,
+        precision,
+    )
+}
+
+fn run_color_i32_buffer_refs_on_device_with_program(
+    device: &VulkanDevice,
+    queue_family_index: u32,
+    program: &StorageComputeProgram,
+    component_planes: &[GpuPlaneI32BufferRef<'_>],
     color_transform: u32,
     precision: u8,
 ) -> Result<GpuPackedRgb48Result, VulkanError> {

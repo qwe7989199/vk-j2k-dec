@@ -1673,6 +1673,358 @@ pub fn run_tier1_cleanup_scatter_rgb48_smoke(
     })
 }
 
+struct ReusableScatteredIdwt53Component {
+    component: u16,
+    width: u32,
+    height: u32,
+    levels: Vec<ReusableScatteredIdwt53Level>,
+    _descriptor_pool: DescriptorPoolHandle,
+    _command_pool: CommandPoolHandle,
+    command_buffer: VkCommandBuffer,
+}
+
+struct ReusableScatteredIdwt53Level {
+    current_width: u32,
+    current_height: u32,
+    hl: crate::gpu::GpuTier1ScatterPlane,
+    lh: crate::gpu::GpuTier1ScatterPlane,
+    hh: crate::gpu::GpuTier1ScatterPlane,
+    output_width: u32,
+    low_columns_buffer: HostBuffer,
+    high_columns_buffer: HostBuffer,
+    output_buffer: HostBuffer,
+}
+
+impl ReusableScatteredIdwt53Component {
+    fn new(
+        device: &VulkanDevice,
+        queue_family_index: u32,
+        program: &StorageComputeProgram,
+        plane_buffer: &HostBuffer,
+        planes: &[crate::gpu::GpuTier1ScatterPlane],
+        component: u16,
+        target_resolution: u8,
+    ) -> Result<Self, VulkanError> {
+        let ll = require_scattered_plane(planes, component, 0, SubbandKind::Ll)?;
+        let mut current_width = ll.width;
+        let mut current_height = ll.height;
+        if target_resolution == 0 {
+            return Err(VulkanError::new(
+                "GPU scattered IDWT currently requires target resolution above 0",
+            ));
+        }
+
+        let mut levels = Vec::with_capacity(target_resolution as usize);
+        for resolution in 1..=target_resolution {
+            let hl = require_scattered_plane(planes, component, resolution, SubbandKind::Hl)?;
+            let lh = require_scattered_plane(planes, component, resolution, SubbandKind::Lh)?;
+            let hh = require_scattered_plane(planes, component, resolution, SubbandKind::Hh)?;
+            if lh.width != current_width || hl.height != current_height {
+                return Err(VulkanError::new(format!(
+                    "GPU scattered IDWT r{resolution} low/high dimensions do not match current {}x{}: HL {}x{}, LH {}x{}",
+                    current_width, current_height, hl.width, hl.height, lh.width, lh.height
+                )));
+            }
+            if hh.width != hl.width || hh.height != lh.height {
+                return Err(VulkanError::new(format!(
+                    "GPU scattered IDWT r{resolution} HH dimensions {}x{} do not match HL/LH high extents {}x{}",
+                    hh.width, hh.height, hl.width, lh.height
+                )));
+            }
+
+            let output_width = current_width + hl.width;
+            let output_height = current_height + lh.height;
+            let low_columns_buffer = create_empty_device_buffer::<i32>(
+                device,
+                checked_plane_len(output_width, current_height)?,
+            )?;
+            let high_columns_buffer =
+                create_empty_device_buffer::<i32>(device, checked_plane_len(output_width, lh.height)?)?;
+            let output_buffer = create_empty_device_buffer::<i32>(
+                device,
+                checked_plane_len(output_width, output_height)?,
+            )?;
+            levels.push(ReusableScatteredIdwt53Level {
+                current_width,
+                current_height,
+                hl,
+                lh,
+                hh,
+                output_width,
+                low_columns_buffer,
+                high_columns_buffer,
+                output_buffer,
+            });
+            current_width = output_width;
+            current_height = output_height;
+        }
+
+        let dispatch_count = levels.len() * 3;
+        let descriptor_pool =
+            device.create_descriptor_pool(3 * dispatch_count as u32, dispatch_count as u32)?;
+        let mut descriptor_sets = Vec::with_capacity(dispatch_count);
+        let mut pushes = Vec::with_capacity(dispatch_count);
+        let mut groups = Vec::with_capacity(dispatch_count);
+        for (index, level) in levels.iter().enumerate() {
+            let current_source = if index == 0 {
+                plane_buffer
+            } else {
+                &levels[index - 1].output_buffer
+            };
+            let current_offset = if index == 0 { ll.plane_offset } else { 0 };
+            let level_dispatches = [
+                IdwtOffsetLineDispatch {
+                    low_buffer: current_source,
+                    high_buffer: plane_buffer,
+                    output_buffer: &level.low_columns_buffer,
+                    push: Idwt53OffsetPushConstants {
+                        low_count: level.current_width,
+                        high_count: level.hl.width,
+                        line_count: level.current_height,
+                        low_line_stride: level.current_width,
+                        low_sample_stride: 1,
+                        high_line_stride: level.hl.width,
+                        high_sample_stride: 1,
+                        output_line_stride: level.output_width,
+                        output_sample_stride: 1,
+                        low_offset: current_offset,
+                        high_offset: level.hl.plane_offset,
+                        output_offset: 0,
+                    },
+                },
+                IdwtOffsetLineDispatch {
+                    low_buffer: plane_buffer,
+                    high_buffer: plane_buffer,
+                    output_buffer: &level.high_columns_buffer,
+                    push: Idwt53OffsetPushConstants {
+                        low_count: level.current_width,
+                        high_count: level.hh.width,
+                        line_count: level.lh.height,
+                        low_line_stride: level.lh.width,
+                        low_sample_stride: 1,
+                        high_line_stride: level.hh.width,
+                        high_sample_stride: 1,
+                        output_line_stride: level.output_width,
+                        output_sample_stride: 1,
+                        low_offset: level.lh.plane_offset,
+                        high_offset: level.hh.plane_offset,
+                        output_offset: 0,
+                    },
+                },
+                IdwtOffsetLineDispatch {
+                    low_buffer: &level.low_columns_buffer,
+                    high_buffer: &level.high_columns_buffer,
+                    output_buffer: &level.output_buffer,
+                    push: Idwt53OffsetPushConstants {
+                        low_count: level.current_height,
+                        high_count: level.lh.height,
+                        line_count: level.output_width,
+                        low_line_stride: 1,
+                        low_sample_stride: level.output_width,
+                        high_line_stride: 1,
+                        high_sample_stride: level.output_width,
+                        output_line_stride: 1,
+                        output_sample_stride: level.output_width,
+                        low_offset: 0,
+                        high_offset: 0,
+                        output_offset: 0,
+                    },
+                },
+            ];
+            for dispatch in level_dispatches {
+                let descriptors = [
+                    dispatch.low_buffer.descriptor_info(),
+                    dispatch.high_buffer.descriptor_info(),
+                    dispatch.output_buffer.descriptor_info(),
+                ];
+                let descriptor_set = device.allocate_descriptor_set(
+                    descriptor_pool.handle,
+                    program.descriptor_set_layout.handle,
+                )?;
+                device.update_storage_descriptor_set(descriptor_set, &descriptors);
+                descriptor_sets.push(descriptor_set);
+                pushes.push(dispatch.push);
+                groups.push([
+                    (dispatch.push.low_count + dispatch.push.high_count).div_ceil(16),
+                    dispatch.push.line_count.div_ceil(16),
+                    1,
+                ]);
+            }
+        }
+        let command_pool = device.create_command_pool(queue_family_index)?;
+        let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
+        let storage_dispatches = pushes
+            .iter()
+            .zip(&descriptor_sets)
+            .zip(&groups)
+            .map(|((push, descriptor_set), groups)| StorageDispatch {
+                pipeline: program.pipeline.handle,
+                pipeline_layout: program.pipeline_layout.handle,
+                descriptor_set: *descriptor_set,
+                push_constants: bytes_of(push),
+                groups: *groups,
+            })
+            .collect::<Vec<_>>();
+        device.record_storage_dispatches(command_buffer, &storage_dispatches)?;
+
+        Ok(Self {
+            component,
+            width: current_width,
+            height: current_height,
+            levels,
+            _descriptor_pool: descriptor_pool,
+            _command_pool: command_pool,
+            command_buffer,
+        })
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        device: &VulkanDevice,
+    ) -> Result<GpuPlaneI32BufferRef<'a>, VulkanError> {
+        device.submit_and_wait(self.command_buffer)?;
+        let Some(output_buffer) = self.levels.last().map(|level| &level.output_buffer) else {
+            return Err(VulkanError::new(format!(
+                "GPU scattered IDWT for component {} produced no output",
+                self.component
+            )));
+        };
+        Ok(GpuPlaneI32BufferRef {
+            width: self.width,
+            height: self.height,
+            buffer: output_buffer,
+        })
+    }
+}
+
+struct ReusableRgb48Packer {
+    output_count: usize,
+    output_byte_len: u64,
+    output_buffer: HostBuffer,
+    staging_buffer: HostBuffer,
+    _descriptor_pool: DescriptorPoolHandle,
+    _command_pool: CommandPoolHandle,
+    command_buffer: VkCommandBuffer,
+}
+
+impl ReusableRgb48Packer {
+    fn new(
+        device: &VulkanDevice,
+        queue_family_index: u32,
+        program: &StorageComputeProgram,
+        component_planes: &[ReusableScatteredIdwt53Component],
+        color_transform: u32,
+        precision: u8,
+    ) -> Result<Self, VulkanError> {
+        if component_planes.len() != 3 {
+            return Err(VulkanError::new(format!(
+                "GPU integer color conversion requires 3 component planes, got {}",
+                component_planes.len()
+            )));
+        }
+        if color_transform > 1 {
+            return Err(VulkanError::new(format!(
+                "GPU integer color conversion supports only none/RCT, got mode {color_transform}"
+            )));
+        }
+        if precision == 0 || precision > 16 {
+            return Err(VulkanError::new(format!(
+                "GPU integer color conversion cannot pack precision {precision}"
+            )));
+        }
+        let width = component_planes[0].width;
+        let height = component_planes[0].height;
+        let sample_count = checked_plane_len(width, height)?;
+        for (index, plane) in component_planes.iter().enumerate() {
+            if plane.width != width || plane.height != height {
+                return Err(VulkanError::new(format!(
+                    "GPU integer color component {index} has {}x{}, expected {}x{}",
+                    plane.width, plane.height, width, height
+                )));
+            }
+        }
+        let output_count = sample_count * 3;
+        let pixel_pair_count = sample_count.div_ceil(2);
+        let packed_output_count = pixel_pair_count * 3;
+        let output_byte_len = bytes_len::<u32>(packed_output_count)?;
+        let output_buffer = device.create_device_local_buffer(
+            output_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        )?;
+        let staging_buffer =
+            device.create_host_cached_buffer(output_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+        let mut descriptors = Vec::with_capacity(4);
+        for (index, plane) in component_planes.iter().enumerate() {
+            let Some(output) = plane.levels.last().map(|level| &level.output_buffer) else {
+                return Err(VulkanError::new(format!(
+                    "GPU integer color component {index} has no IDWT output buffer"
+                )));
+            };
+            descriptors.push(output.descriptor_info());
+        }
+        descriptors.push(output_buffer.descriptor_info());
+        let descriptor_pool = device.create_descriptor_pool(4, 1)?;
+        let descriptor_set =
+            device.allocate_descriptor_set(descriptor_pool.handle, program.descriptor_set_layout.handle)?;
+        device.update_storage_descriptor_set(descriptor_set, &descriptors);
+        let command_pool = device.create_command_pool(queue_family_index)?;
+        let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
+        let output_max = (1u32 << precision) - 1;
+        let push = ColorPushConstants {
+            sample_count: sample_count as u32,
+            color_transform,
+            output_max,
+            level_shift: (1u32 << (precision - 1)) as f32,
+        };
+        let storage_dispatch = StorageDispatch {
+            pipeline: program.pipeline.handle,
+            pipeline_layout: program.pipeline_layout.handle,
+            descriptor_set,
+            push_constants: bytes_of(&push),
+            groups: [(pixel_pair_count as u32).div_ceil(256), 1, 1],
+        };
+        device.record_storage_dispatches(command_buffer, &[storage_dispatch])?;
+        Ok(Self {
+            output_count,
+            output_byte_len,
+            output_buffer,
+            staging_buffer,
+            _descriptor_pool: descriptor_pool,
+            _command_pool: command_pool,
+            command_buffer,
+        })
+    }
+
+    fn pack(
+        &self,
+        device: &VulkanDevice,
+        queue_family_index: u32,
+    ) -> Result<GpuPackedRgb48Result, VulkanError> {
+        let shader_start = std::time::Instant::now();
+        device.submit_and_wait(self.command_buffer)?;
+        let shader_ms = shader_start.elapsed().as_secs_f64() * 1000.0;
+
+        let copy_start = std::time::Instant::now();
+        device.copy_buffer(
+            queue_family_index,
+            &self.output_buffer,
+            &self.staging_buffer,
+            self.output_byte_len,
+        )?;
+        let copy_ms = copy_start.elapsed().as_secs_f64() * 1000.0;
+
+        let readback_start = std::time::Instant::now();
+        let samples = self.staging_buffer.read_vec::<u16>(self.output_count)?;
+        let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
+        Ok(GpuPackedRgb48Result {
+            samples,
+            shader_ms,
+            copy_ms,
+            readback_ms,
+        })
+    }
+}
+
 pub fn run_tier1_cleanup_scatter_rgb48_bench(
     cleanup_shader_path: &str,
     scatter_shader_path: &str,
@@ -1764,6 +2116,34 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
             bytes_len::<i32>(output_coefficients)?,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         )?;
+        let mut component_ids = scatter_planes
+            .iter()
+            .map(|plane| plane.component)
+            .collect::<Vec<_>>();
+        component_ids.sort_unstable();
+        component_ids.dedup();
+        let idwt_components = component_ids
+            .iter()
+            .map(|component| {
+                ReusableScatteredIdwt53Component::new(
+                    device,
+                    queue_family_index,
+                    &idwt53_program,
+                    &plane_buffer,
+                    scatter_planes,
+                    *component,
+                    target_resolution,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let rgb48_packer = ReusableRgb48Packer::new(
+            device,
+            queue_family_index,
+            &color_program,
+            &idwt_components,
+            color_transform,
+            precision,
+        )?;
         let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
 
         let cleanup_push = Tier1CleanupSmokePushConstants {
@@ -1772,17 +2152,11 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
         let scatter_push = Tier1ScatterSmokePushConstants {
             codeblock_count: scatter_records.len() as u32,
         };
-        let mut component_ids = scatter_planes
-            .iter()
-            .map(|plane| plane.component)
-            .collect::<Vec<_>>();
-        component_ids.sort_unstable();
-        component_ids.dedup();
 
         let mut cleanup_dispatch_ms = 0.0;
         let mut scatter_dispatch_ms = 0.0;
         let mut idwt_dispatch_ms = 0.0;
-        let mut idwt_alloc_ms = 0.0;
+        let idwt_alloc_ms = 0.0;
         let mut color_shader_ms = 0.0;
         let mut color_copy_ms = 0.0;
         let mut color_readback_ms = 0.0;
@@ -1820,31 +2194,13 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
             )?;
             scatter_dispatch_ms += scatter_dispatch_start.elapsed().as_secs_f64() * 1000.0;
 
-            let mut dwt_profile = GpuDwtProfile::default();
-            let mut output_buffers = Vec::with_capacity(component_ids.len());
-            for component in &component_ids {
-                output_buffers.push(run_idwt53_scattered_component_on_device(
-                    device,
-                    queue_family_index,
-                    &idwt53_program,
-                    &plane_buffer,
-                    scatter_planes,
-                    *component,
-                    target_resolution,
-                    &mut dwt_profile,
-                )?);
+            let idwt_dispatch_start = std::time::Instant::now();
+            for component in &idwt_components {
+                component.dispatch(device)?;
             }
-            idwt_dispatch_ms += dwt_profile.dispatch_ms;
-            idwt_alloc_ms += dwt_profile.alloc_ms;
+            idwt_dispatch_ms += idwt_dispatch_start.elapsed().as_secs_f64() * 1000.0;
 
-            let packed = run_color_i32_buffers_on_device_with_program(
-                device,
-                queue_family_index,
-                &color_program,
-                &output_buffers,
-                color_transform,
-                precision,
-            )?;
+            let packed = rgb48_packer.pack(device, queue_family_index)?;
             color_shader_ms += packed.shader_ms;
             color_copy_ms += packed.copy_ms;
             color_readback_ms += packed.readback_ms;
