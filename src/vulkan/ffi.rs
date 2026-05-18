@@ -19,6 +19,7 @@ const VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET: u32 = 35;
 const VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO: u32 = 39;
 const VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: u32 = 40;
 const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: u32 = 42;
+const VK_STRUCTURE_TYPE_MEMORY_BARRIER: u32 = 44;
 const VK_QUEUE_GRAPHICS_BIT: u32 = 0x0000_0001;
 const VK_QUEUE_COMPUTE_BIT: u32 = 0x0000_0002;
 const VK_QUEUE_TRANSFER_BIT: u32 = 0x0000_0004;
@@ -31,6 +32,9 @@ const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: u32 = 0x0000_0004;
 const VK_MEMORY_PROPERTY_HOST_CACHED_BIT: u32 = 0x0000_0008;
 const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: u32 = 7;
 const VK_SHADER_STAGE_COMPUTE_BIT: u32 = 0x0000_0020;
+const VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT: u32 = 0x0000_0800;
+const VK_ACCESS_SHADER_READ_BIT: u32 = 0x0000_0020;
+const VK_ACCESS_SHADER_WRITE_BIT: u32 = 0x0000_0040;
 const VK_PIPELINE_BIND_POINT_COMPUTE: u32 = 1;
 const VK_COMMAND_BUFFER_LEVEL_PRIMARY: u32 = 0;
 const VK_WHOLE_SIZE: u64 = !0;
@@ -97,6 +101,8 @@ type VkMapMemory =
     unsafe extern "system" fn(VkDevice, VkDeviceMemory, u64, u64, VkFlags, *mut *mut c_void) -> i32;
 type VkUnmapMemory = unsafe extern "system" fn(VkDevice, VkDeviceMemory);
 type VkInvalidateMappedMemoryRanges =
+    unsafe extern "system" fn(VkDevice, u32, *const VkMappedMemoryRange) -> i32;
+type VkFlushMappedMemoryRanges =
     unsafe extern "system" fn(VkDevice, u32, *const VkMappedMemoryRange) -> i32;
 type VkCreateShaderModule = unsafe extern "system" fn(
     VkDevice,
@@ -174,6 +180,18 @@ type VkCmdPushConstants =
 type VkCmdDispatch = unsafe extern "system" fn(VkCommandBuffer, u32, u32, u32);
 type VkCmdCopyBuffer =
     unsafe extern "system" fn(VkCommandBuffer, VkBuffer, VkBuffer, u32, *const VkBufferCopy);
+type VkCmdPipelineBarrier = unsafe extern "system" fn(
+    VkCommandBuffer,
+    u32,
+    u32,
+    VkFlags,
+    u32,
+    *const VkMemoryBarrier,
+    u32,
+    *const c_void,
+    u32,
+    *const c_void,
+);
 type VkCreateFence = unsafe extern "system" fn(
     VkDevice,
     *const VkFenceCreateInfo,
@@ -453,6 +471,14 @@ struct VkMappedMemoryRange {
     memory: VkDeviceMemory,
     offset: u64,
     size: u64,
+}
+
+#[repr(C)]
+struct VkMemoryBarrier {
+    s_type: u32,
+    p_next: *const c_void,
+    src_access_mask: VkFlags,
+    dst_access_mask: VkFlags,
 }
 
 #[repr(C)]

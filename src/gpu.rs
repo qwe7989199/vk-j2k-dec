@@ -1,7 +1,196 @@
-use crate::codestream::{Codestream, QuantizationStep, WaveletTransform};
+use crate::codestream::{Codestream, QuantizationStep, SubbandKind, WaveletTransform};
+use crate::tier1::{Tier1BoundWorkPlan, Tier1CodingMode, Tier1DecodeError};
 
 const DWT_LOCAL_SIZE_X: u32 = 16;
 const DWT_LOCAL_SIZE_Y: u32 = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuTier1Plan {
+    pub codeblocks: Vec<GpuTier1Codeblock>,
+    pub compressed_bytes: Vec<u8>,
+    pub total_passes: u32,
+    pub arithmetic_passes: u32,
+    pub raw_bypass_passes: u32,
+    pub output_coefficients: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuTier1Codeblock {
+    pub component: u16,
+    pub resolution: u8,
+    pub subband: SubbandKind,
+    pub codeblock_x: u32,
+    pub codeblock_y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub magnitude_bitplanes: u32,
+    pub zero_bit_planes: u32,
+    pub byte_offset: u32,
+    pub byte_len: u32,
+    pub coefficient_offset: u32,
+    pub coefficient_count: u32,
+    pub pass_offset: u32,
+    pub pass_count: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GpuTier1CodeblockRecord {
+    pub component: u32,
+    pub resolution: u32,
+    pub subband: u32,
+    pub codeblock_x: u32,
+    pub codeblock_y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub magnitude_bitplanes: u32,
+    pub zero_bit_planes: u32,
+    pub byte_offset: u32,
+    pub byte_len: u32,
+    pub coefficient_offset: u32,
+    pub coefficient_count: u32,
+    pub pass_offset: u32,
+    pub pass_count: u32,
+    pub _padding: u32,
+}
+
+impl GpuTier1Plan {
+    pub fn from_bound_work_plan(
+        work_plan: &Tier1BoundWorkPlan<'_>,
+        codeblock_style: crate::codestream::CodeblockStyle,
+    ) -> Result<Self, Tier1DecodeError> {
+        let mut codeblocks = Vec::with_capacity(work_plan.codeblocks.len());
+        let mut compressed_bytes = Vec::with_capacity(work_plan.total_bytes());
+        let mut total_passes = 0u32;
+        let mut arithmetic_passes = 0u32;
+        let mut raw_bypass_passes = 0u32;
+        let mut output_coefficients = 0usize;
+
+        for codeblock in &work_plan.codeblocks {
+            let execution = codeblock.execution_plan(codeblock_style)?;
+            let byte_offset = checked_u32(compressed_bytes.len(), "Tier-1 byte offset")?;
+            for segment in &codeblock.segments {
+                compressed_bytes.extend_from_slice(segment.data);
+            }
+            let byte_len = checked_u32(execution.bytes, "Tier-1 byte length")?;
+            let coefficient_offset = checked_u32(output_coefficients, "Tier-1 coefficient offset")?;
+            let coefficient_count = codeblock
+                .width
+                .checked_mul(codeblock.height)
+                .ok_or_else(|| Tier1DecodeError::new("Tier-1 coefficient count overflow"))?;
+            let pass_offset = total_passes;
+            let pass_count = checked_u32(execution.passes.len(), "Tier-1 pass count")?;
+            total_passes = total_passes
+                .checked_add(pass_count)
+                .ok_or_else(|| Tier1DecodeError::new("Tier-1 pass count overflow"))?;
+            output_coefficients = output_coefficients
+                .checked_add(coefficient_count as usize)
+                .ok_or_else(|| Tier1DecodeError::new("Tier-1 coefficient count overflow"))?;
+
+            for pass in execution.passes {
+                match pass.coding_mode {
+                    Tier1CodingMode::Arithmetic => arithmetic_passes += 1,
+                    Tier1CodingMode::RawBypass => raw_bypass_passes += 1,
+                }
+            }
+
+            codeblocks.push(GpuTier1Codeblock {
+                component: codeblock.id.component,
+                resolution: codeblock.id.resolution,
+                subband: codeblock.id.subband,
+                codeblock_x: codeblock.id.codeblock_x,
+                codeblock_y: codeblock.id.codeblock_y,
+                width: codeblock.width,
+                height: codeblock.height,
+                magnitude_bitplanes: codeblock.magnitude_bitplanes,
+                zero_bit_planes: codeblock.zero_bit_planes,
+                byte_offset,
+                byte_len,
+                coefficient_offset,
+                coefficient_count,
+                pass_offset,
+                pass_count,
+            });
+        }
+
+        Ok(Self {
+            codeblocks,
+            compressed_bytes,
+            total_passes,
+            arithmetic_passes,
+            raw_bypass_passes,
+            output_coefficients,
+        })
+    }
+
+    pub fn codeblock_records(&self) -> Vec<GpuTier1CodeblockRecord> {
+        self.codeblocks
+            .iter()
+            .map(GpuTier1CodeblockRecord::from)
+            .collect()
+    }
+
+    pub fn compressed_u32_words(&self) -> Vec<u32> {
+        self.compressed_bytes
+            .chunks(4)
+            .map(|chunk| {
+                let mut word = 0u32;
+                for (shift, byte) in chunk.iter().enumerate() {
+                    word |= u32::from(*byte) << (shift * 8);
+                }
+                word
+            })
+            .collect()
+    }
+
+    pub fn codeblock_byte_checksum(&self, index: usize) -> Option<u32> {
+        let codeblock = self.codeblocks.get(index)?;
+        let start = codeblock.byte_offset as usize;
+        let end = start.checked_add(codeblock.byte_len as usize)?;
+        let bytes = self.compressed_bytes.get(start..end)?;
+        Some(
+            bytes
+                .iter()
+                .fold(0u32, |sum, byte| sum.wrapping_add(u32::from(*byte))),
+        )
+    }
+}
+
+impl From<&GpuTier1Codeblock> for GpuTier1CodeblockRecord {
+    fn from(codeblock: &GpuTier1Codeblock) -> Self {
+        Self {
+            component: u32::from(codeblock.component),
+            resolution: u32::from(codeblock.resolution),
+            subband: gpu_subband_id(codeblock.subband),
+            codeblock_x: codeblock.codeblock_x,
+            codeblock_y: codeblock.codeblock_y,
+            width: codeblock.width,
+            height: codeblock.height,
+            magnitude_bitplanes: codeblock.magnitude_bitplanes,
+            zero_bit_planes: codeblock.zero_bit_planes,
+            byte_offset: codeblock.byte_offset,
+            byte_len: codeblock.byte_len,
+            coefficient_offset: codeblock.coefficient_offset,
+            coefficient_count: codeblock.coefficient_count,
+            pass_offset: codeblock.pass_offset,
+            pass_count: codeblock.pass_count,
+            _padding: 0,
+        }
+    }
+}
+
+fn gpu_subband_id(subband: SubbandKind) -> u32 {
+    match subband {
+        SubbandKind::Ll => 0,
+        SubbandKind::Hl => 1,
+        SubbandKind::Lh => 2,
+        SubbandKind::Hh => 3,
+    }
+}
+
+fn checked_u32(value: usize, label: &str) -> Result<u32, Tier1DecodeError> {
+    u32::try_from(value).map_err(|_| Tier1DecodeError::new(format!("{label} exceeds u32")))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GpuPipelinePlan {

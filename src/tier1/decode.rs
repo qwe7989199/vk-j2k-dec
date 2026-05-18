@@ -7,6 +7,7 @@ pub struct DecodedCodeblock {
     pub state: CodeblockStatePlanes,
     pub reconstruction: CoefficientReconstruction,
     pub decoded_passes: u32,
+    pub nonzero_coefficients: usize,
     pub source_bytes: usize,
     pub decoder_bytes_consumed: usize,
 }
@@ -125,6 +126,7 @@ impl DecodedCodeblock {
             state: CodeblockStatePlanes::new(input.width, input.height)?,
             reconstruction,
             decoded_passes: 0,
+            nonzero_coefficients: 0,
             source_bytes: 0,
             decoder_bytes_consumed: 0,
         })
@@ -147,6 +149,7 @@ impl DecodedCodeblock {
             state: CodeblockStatePlanes::new(input.width, input.height)?,
             reconstruction,
             decoded_passes: 0,
+            nonzero_coefficients: 0,
             source_bytes: input.total_bytes(),
             decoder_bytes_consumed: 0,
         })
@@ -603,6 +606,11 @@ impl BoundCompressedCodeblock<'_> {
             decoded.decode_pass(pass, &mut mq)?;
         }
         decoded.decoder_bytes_consumed = mq.consumed_bytes();
+        decoded.nonzero_coefficients = decoded
+            .coefficients
+            .iter()
+            .filter(|coefficient| **coefficient != 0)
+            .count();
         Ok(decoded)
     }
 }
@@ -623,10 +631,7 @@ impl Tier1BoundWorkPlan<'_> {
         codeblock_style: CodeblockStyle,
         reconstruction: CoefficientReconstruction,
     ) -> Result<Tier1DecodeResult, Tier1DecodeError> {
-        let worker_count = std::thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(1)
-            .min(self.codeblocks.len());
+        let worker_count = tier1_worker_count(self.codeblocks.len());
         if worker_count > 1 && self.codeblocks.len() >= 64 {
             return self.decode_arithmetic_passes_parallel(
                 codeblock_style,
@@ -716,6 +721,18 @@ impl Tier1BoundWorkPlan<'_> {
             pending_passes: 0,
         })
     }
+}
+
+fn tier1_worker_count(codeblock_count: usize) -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    std::env::var("VK_J2K_TIER1_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(available)
+        .min(codeblock_count)
 }
 
 impl CodeblockStatePlanes {

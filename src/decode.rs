@@ -53,6 +53,9 @@ pub struct DecodeTimings {
     pub tier1_decode_ms: f64,
     pub gpu_setup_ms: f64,
     pub reconstruct_ms: f64,
+    pub reconstruct_upload_ms: f64,
+    pub reconstruct_alloc_ms: f64,
+    pub reconstruct_dispatch_ms: f64,
     pub pack_ms: f64,
     pub pack_shader_ms: f64,
     pub pack_copy_ms: f64,
@@ -507,6 +510,9 @@ fn decode_rgb48_with_backends_profiled(
                     .map_err(|err| DecodeError::new(format!("GPU RGB48 pipeline failed: {err}")))?;
                 profile.timings.gpu_setup_ms = result.setup_ms;
                 profile.timings.reconstruct_ms = result.reconstruct_ms;
+                profile.timings.reconstruct_upload_ms = result.reconstruct_upload_ms;
+                profile.timings.reconstruct_alloc_ms = result.reconstruct_alloc_ms;
+                profile.timings.reconstruct_dispatch_ms = result.reconstruct_dispatch_ms;
                 profile.timings.pack_ms = result.pack_ms;
                 profile.timings.pack_shader_ms = result.pack_shader_ms;
                 profile.timings.pack_copy_ms = result.pack_copy_ms;
@@ -544,6 +550,9 @@ fn decode_rgb48_with_backends_profiled(
                 .map_err(|err| DecodeError::new(format!("GPU RGB48 pipeline failed: {err}")))?;
                 profile.timings.gpu_setup_ms = result.setup_ms;
                 profile.timings.reconstruct_ms = result.reconstruct_ms;
+                profile.timings.reconstruct_upload_ms = result.reconstruct_upload_ms;
+                profile.timings.reconstruct_alloc_ms = result.reconstruct_alloc_ms;
+                profile.timings.reconstruct_dispatch_ms = result.reconstruct_dispatch_ms;
                 profile.timings.pack_ms = result.pack_ms;
                 profile.timings.pack_shader_ms = result.pack_shader_ms;
                 profile.timings.pack_copy_ms = result.pack_copy_ms;

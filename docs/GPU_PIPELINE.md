@@ -1,7 +1,9 @@
 # GPU pipeline notes
 
-The first Vulkan path keeps Tier-1 on CPU and sends decoded coefficient planes to
-compute shaders. The first useful GPU boundary is:
+The first production Vulkan path keeps Tier-1 on CPU and sends decoded
+coefficient planes to compute shaders. A separate Tier-1 GPU experiment now
+flattens packet/body work into GPU-readable jobs so that the next boundary can
+move earlier. The current production boundary is:
 
 1. CPU parses codestream, tile layout, packets, codeblock segments, and Tier-1.
 2. CPU writes coefficient planes plus per-sample subband step indices.
@@ -70,14 +72,31 @@ HOST_CACHED staging for CPU readback. On the local RTX 5060 sample this split is
 roughly 0.5 ms shader, 1.3 ms device-to-host copy, and 2.1 ms CPU map/read for
 the final 12.4 MB RGB48 buffer after DWT outputs are kept device-local through
 color conversion. With the high-level path using parallel Tier-1 codeblock
-decode, the same frame currently averages about 94 ms/frame through the
+decode, batched DWT subband uploads, and batched DWT dispatch command buffers,
+the same frame currently averages about 86 ms/frame through the
 persistent GPU RGB48 benchmark, compared with about 119 ms/frame for the local
-FFmpeg native JPEG2000 RGB48 loop. The implementation still submits one shader
-dispatch at a time, so the next GPU milestones are:
+FFmpeg native JPEG2000 RGB48 loop. The next GPU milestones are:
 
-- reuse descriptor layouts, pipelines, command pools, and command buffers;
 - add persistent buffer pools for repeated full-frame decode;
+- overlap CPU Tier-1, coefficient uploads, and GPU reconstruction;
+- replace CPU Tier-1 with a real GPU Tier-1 decoder;
 - wire irreversible 9/7 DWT into real-frame decode once a representative sample is available.
+
+## Tier-1 GPU handoff experiment
+
+`tier1-gpu-plan` builds a flat GPU-facing Tier-1 job list from the parsed packet
+summary. The CPU still parses Tier-2 and computes segment/pass boundaries, then
+emits:
+
+- one `GpuTier1CodeblockRecord` per included codeblock;
+- one packed u32 word stream containing all compressed packet-body bytes;
+- contiguous coefficient offsets for the eventual GPU output buffer.
+
+`tier1_plan_smoke.comp.glsl` currently validates that Vulkan can read both the
+records and the compressed byte stream by checking byte ranges and per-codeblock
+byte checksums on GPU. On the local RGB12 frame this covers 879 records, 97,023
+compressed bytes, and 25,206 MQ passes. This is not a Tier-1 decoder yet, but it
+locks down the SSBO shape needed for the real MQ/codeblock shader.
 
 ## Shader build
 

@@ -151,6 +151,12 @@ fn dispatch_storage_shader(
     )
 }
 
+struct StorageDispatchBatch<'a> {
+    descriptors: &'a [VkDescriptorBufferInfo],
+    push_constants: &'a [u8],
+    groups: [u32; 3],
+}
+
 struct StorageComputeProgram {
     descriptor_set_layout: DescriptorSetLayoutHandle,
     pipeline_layout: PipelineLayoutHandle,
@@ -191,37 +197,69 @@ impl StorageComputeProgram {
         groups_x: u32,
         groups_y: u32,
     ) -> Result<(), VulkanError> {
-        if descriptors.len() as u32 != self.binding_count {
-            return Err(VulkanError::new(format!(
-                "compute program expected {} descriptors, got {}",
-                self.binding_count,
-                descriptors.len()
-            )));
+        self.dispatch_many(
+            device,
+            queue_family_index,
+            &[StorageDispatchBatch {
+                descriptors,
+                push_constants,
+                groups: [groups_x, groups_y, 1],
+            }],
+        )
+    }
+
+    fn dispatch_many(
+        &self,
+        device: &VulkanDevice,
+        queue_family_index: u32,
+        dispatches: &[StorageDispatchBatch<'_>],
+    ) -> Result<(), VulkanError> {
+        if dispatches.is_empty() {
+            return Ok(());
         }
-        if push_constants.len() as u32 != self.push_constant_size {
-            return Err(VulkanError::new(format!(
-                "compute program expected {} push-constant bytes, got {}",
-                self.push_constant_size,
-                push_constants.len()
-            )));
+        for dispatch in dispatches {
+            if dispatch.descriptors.len() as u32 != self.binding_count {
+                return Err(VulkanError::new(format!(
+                    "compute program expected {} descriptors, got {}",
+                    self.binding_count,
+                    dispatch.descriptors.len()
+                )));
+            }
+            if dispatch.push_constants.len() as u32 != self.push_constant_size {
+                return Err(VulkanError::new(format!(
+                    "compute program expected {} push-constant bytes, got {}",
+                    self.push_constant_size,
+                    dispatch.push_constants.len()
+                )));
+            }
         }
-    let descriptor_pool = device.create_descriptor_pool(descriptors.len() as u32)?;
-    let descriptor_set =
-            device.allocate_descriptor_set(descriptor_pool.handle, self.descriptor_set_layout.handle)?;
-    device.update_storage_descriptor_set(descriptor_set, descriptors);
-    let command_pool = device.create_command_pool(queue_family_index)?;
-    let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
-    device.record_storage_dispatch(
-        command_buffer,
-        StorageDispatch {
+
+        let descriptor_pool = device.create_descriptor_pool(
+            self.binding_count * dispatches.len() as u32,
+            dispatches.len() as u32,
+        )?;
+        let mut descriptor_sets = Vec::with_capacity(dispatches.len());
+        for dispatch in dispatches {
+            let descriptor_set =
+                device.allocate_descriptor_set(descriptor_pool.handle, self.descriptor_set_layout.handle)?;
+            device.update_storage_descriptor_set(descriptor_set, dispatch.descriptors);
+            descriptor_sets.push(descriptor_set);
+        }
+        let command_pool = device.create_command_pool(queue_family_index)?;
+        let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
+        let storage_dispatches = dispatches
+            .iter()
+            .zip(&descriptor_sets)
+            .map(|(dispatch, descriptor_set)| StorageDispatch {
                 pipeline: self.pipeline.handle,
                 pipeline_layout: self.pipeline_layout.handle,
-            descriptor_set,
-            push_constants,
-            groups: [groups_x, groups_y, 1],
-        },
-    )?;
-    device.submit_and_wait(command_buffer)
+                descriptor_set: *descriptor_set,
+                push_constants: dispatch.push_constants,
+                groups: dispatch.groups,
+            })
+            .collect::<Vec<_>>();
+        device.record_storage_dispatches(command_buffer, &storage_dispatches)?;
+        device.submit_and_wait(command_buffer)
     }
 }
 
@@ -231,6 +269,79 @@ pub struct DequantSmokeResult {
     pub queue_family_index: u32,
     pub input: Vec<i32>,
     pub output: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tier1PlanSmokeResult {
+    pub device_name: String,
+    pub queue_family_index: u32,
+    pub output: Vec<u32>,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Tier1PlanSmokePushConstants {
+    codeblock_count: u32,
+}
+
+pub fn run_tier1_plan_smoke(
+    shader_path: &str,
+    records: &[crate::gpu::GpuTier1CodeblockRecord],
+    compressed_words: &[u32],
+) -> Result<Tier1PlanSmokeResult, VulkanError> {
+    if records.is_empty() {
+        return Err(VulkanError::new(
+            "Tier-1 plan smoke requires at least one record",
+        ));
+    }
+    if compressed_words.is_empty() {
+        return Err(VulkanError::new(
+            "Tier-1 plan smoke requires compressed byte words",
+        ));
+    }
+    let spirv = read_spirv(shader_path)?;
+    with_compute_device(|device, summary, queue_family_index| {
+        let program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            3,
+            std::mem::size_of::<Tier1PlanSmokePushConstants>() as u32,
+        )?;
+        let records_buffer =
+            device.create_host_buffer(bytes_len::<crate::gpu::GpuTier1CodeblockRecord>(
+                records.len(),
+            )?)?;
+        records_buffer.write_slice(records)?;
+        let compressed_buffer =
+            device.create_host_buffer(bytes_len::<u32>(compressed_words.len())?)?;
+        compressed_buffer.write_slice(compressed_words)?;
+        let output_len = records.len() * 4;
+        let output_seed = vec![0u32; output_len];
+        let output_buffer = device.create_host_buffer(bytes_len::<u32>(output_len)?)?;
+        output_buffer.write_slice(&output_seed)?;
+        let push = Tier1PlanSmokePushConstants {
+            codeblock_count: records.len() as u32,
+        };
+        program.dispatch(
+            device,
+            queue_family_index,
+            &[
+                records_buffer.descriptor_info(),
+                compressed_buffer.descriptor_info(),
+                output_buffer.descriptor_info(),
+            ],
+            bytes_of(&push),
+            (records.len() as u32).div_ceil(256),
+            1,
+        )?;
+        let output = output_buffer.read_vec::<u32>(output_len)?;
+        device.wait_idle()?;
+        Ok(Tier1PlanSmokeResult {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            output,
+        })
+    })
 }
 
 pub fn run_dequant_smoke(shader_path: &str) -> Result<DequantSmokeResult, VulkanError> {

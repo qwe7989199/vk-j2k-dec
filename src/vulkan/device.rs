@@ -11,6 +11,7 @@ struct VulkanDeviceFunctions {
     map_memory: VkMapMemory,
     unmap_memory: VkUnmapMemory,
     invalidate_mapped_memory_ranges: VkInvalidateMappedMemoryRanges,
+    flush_mapped_memory_ranges: VkFlushMappedMemoryRanges,
     create_shader_module: VkCreateShaderModule,
     destroy_shader_module: VkDestroyShaderModule,
     create_descriptor_set_layout: VkCreateDescriptorSetLayout,
@@ -33,6 +34,7 @@ struct VulkanDeviceFunctions {
     cmd_push_constants: VkCmdPushConstants,
     cmd_dispatch: VkCmdDispatch,
     cmd_copy_buffer: VkCmdCopyBuffer,
+    cmd_pipeline_barrier: VkCmdPipelineBarrier,
     create_fence: VkCreateFence,
     destroy_fence: VkDestroyFence,
     queue_submit: VkQueueSubmit,
@@ -53,6 +55,12 @@ struct StorageDispatch<'a> {
     descriptor_set: VkDescriptorSet,
     push_constants: &'a [u8],
     groups: [u32; 3],
+}
+
+struct BufferCopy<'a> {
+    source: &'a HostBuffer,
+    destination: &'a HostBuffer,
+    byte_len: u64,
 }
 
 impl VulkanDevice {
@@ -143,6 +151,7 @@ impl VulkanDevice {
             buffer,
             memory,
             size,
+            memory_properties,
         })
     }
 
@@ -298,6 +307,7 @@ impl VulkanDevice {
     fn create_descriptor_pool(
         &self,
         descriptor_count: u32,
+        max_sets: u32,
     ) -> Result<DescriptorPoolHandle, VulkanError> {
         let pool_size = VkDescriptorPoolSize {
             descriptor_type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -307,7 +317,7 @@ impl VulkanDevice {
             s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             p_next: ptr::null(),
             flags: 0,
-            max_sets: 1,
+            max_sets,
             pool_size_count: 1,
             p_pool_sizes: &pool_size,
         };
@@ -442,10 +452,10 @@ impl VulkanDevice {
         Ok(command_buffer)
     }
 
-    fn record_storage_dispatch(
+    fn record_storage_dispatches(
         &self,
         command_buffer: VkCommandBuffer,
-        dispatch: StorageDispatch<'_>,
+        dispatches: &[StorageDispatch<'_>],
     ) -> Result<(), VulkanError> {
         let begin_info = VkCommandBufferBeginInfo {
             s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -457,36 +467,68 @@ impl VulkanDevice {
             unsafe { (self.functions.begin_command_buffer)(command_buffer, &begin_info) },
             "vkBeginCommandBuffer",
         )?;
+        let Some(first) = dispatches.first() else {
+            return vk_check(
+                unsafe { (self.functions.end_command_buffer)(command_buffer) },
+                "vkEndCommandBuffer",
+            );
+        };
         unsafe {
             (self.functions.cmd_bind_pipeline)(
                 command_buffer,
                 VK_PIPELINE_BIND_POINT_COMPUTE,
-                dispatch.pipeline,
+                first.pipeline,
             );
-            (self.functions.cmd_bind_descriptor_sets)(
-                command_buffer,
-                VK_PIPELINE_BIND_POINT_COMPUTE,
-                dispatch.pipeline_layout,
-                0,
-                1,
-                &dispatch.descriptor_set,
-                0,
-                ptr::null(),
-            );
-            (self.functions.cmd_push_constants)(
-                command_buffer,
-                dispatch.pipeline_layout,
-                VK_SHADER_STAGE_COMPUTE_BIT,
-                0,
-                dispatch.push_constants.len() as u32,
-                dispatch.push_constants.as_ptr() as *const c_void,
-            );
-            (self.functions.cmd_dispatch)(
-                command_buffer,
-                dispatch.groups[0],
-                dispatch.groups[1],
-                dispatch.groups[2],
-            );
+        }
+        for (index, dispatch) in dispatches.iter().enumerate() {
+            unsafe {
+                (self.functions.cmd_bind_descriptor_sets)(
+                    command_buffer,
+                    VK_PIPELINE_BIND_POINT_COMPUTE,
+                    dispatch.pipeline_layout,
+                    0,
+                    1,
+                    &dispatch.descriptor_set,
+                    0,
+                    ptr::null(),
+                );
+                (self.functions.cmd_push_constants)(
+                    command_buffer,
+                    dispatch.pipeline_layout,
+                    VK_SHADER_STAGE_COMPUTE_BIT,
+                    0,
+                    dispatch.push_constants.len() as u32,
+                    dispatch.push_constants.as_ptr() as *const c_void,
+                );
+                (self.functions.cmd_dispatch)(
+                    command_buffer,
+                    dispatch.groups[0],
+                    dispatch.groups[1],
+                    dispatch.groups[2],
+                );
+            }
+            if index + 1 < dispatches.len() {
+                let barrier = VkMemoryBarrier {
+                    s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    p_next: ptr::null(),
+                    src_access_mask: VK_ACCESS_SHADER_WRITE_BIT,
+                    dst_access_mask: VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                };
+                unsafe {
+                    (self.functions.cmd_pipeline_barrier)(
+                        command_buffer,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0,
+                        1,
+                        &barrier,
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                    );
+                }
+            }
         }
         vk_check(
             unsafe { (self.functions.end_command_buffer)(command_buffer) },
@@ -501,6 +543,21 @@ impl VulkanDevice {
         destination: &HostBuffer,
         byte_len: u64,
     ) -> Result<(), VulkanError> {
+        self.record_copy_buffers(
+            command_buffer,
+            &[BufferCopy {
+                source,
+                destination,
+                byte_len,
+            }],
+        )
+    }
+
+    fn record_copy_buffers(
+        &self,
+        command_buffer: VkCommandBuffer,
+        copies: &[BufferCopy<'_>],
+    ) -> Result<(), VulkanError> {
         let begin_info = VkCommandBufferBeginInfo {
             s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
             p_next: ptr::null(),
@@ -511,19 +568,21 @@ impl VulkanDevice {
             unsafe { (self.functions.begin_command_buffer)(command_buffer, &begin_info) },
             "vkBeginCommandBuffer",
         )?;
-        let copy = VkBufferCopy {
-            src_offset: 0,
-            dst_offset: 0,
-            size: byte_len,
-        };
-        unsafe {
-            (self.functions.cmd_copy_buffer)(
-                command_buffer,
-                source.buffer,
-                destination.buffer,
-                1,
-                &copy,
-            );
+        for copy_request in copies {
+            let copy = VkBufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: copy_request.byte_len,
+            };
+            unsafe {
+                (self.functions.cmd_copy_buffer)(
+                    command_buffer,
+                    copy_request.source.buffer,
+                    copy_request.destination.buffer,
+                    1,
+                    &copy,
+                );
+            }
         }
         vk_check(
             unsafe { (self.functions.end_command_buffer)(command_buffer) },
@@ -541,6 +600,20 @@ impl VulkanDevice {
         let command_pool = self.create_command_pool(queue_family_index)?;
         let command_buffer = self.allocate_command_buffer(command_pool.handle)?;
         self.record_copy_buffer(command_buffer, source, destination, byte_len)?;
+        self.submit_and_wait(command_buffer)
+    }
+
+    fn copy_buffers(
+        &self,
+        queue_family_index: u32,
+        copies: &[BufferCopy<'_>],
+    ) -> Result<(), VulkanError> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let command_pool = self.create_command_pool(queue_family_index)?;
+        let command_buffer = self.allocate_command_buffer(command_pool.handle)?;
+        self.record_copy_buffers(command_buffer, copies)?;
         self.submit_and_wait(command_buffer)
     }
 
@@ -619,6 +692,7 @@ struct HostBuffer {
     buffer: VkBuffer,
     memory: VkDeviceMemory,
     size: u64,
+    memory_properties: VkFlags,
 }
 
 impl HostBuffer {
@@ -643,6 +717,11 @@ impl HostBuffer {
                 mapped as *mut u8,
                 byte_len as usize,
             );
+        }
+        if self.memory_properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT == 0 {
+            self.flush_range(byte_len)?;
+        }
+        unsafe {
             (self.functions.unmap_memory)(self.device, self.memory);
         }
         Ok(())
@@ -674,6 +753,20 @@ impl HostBuffer {
             (self.functions.unmap_memory)(self.device, self.memory);
         }
         Ok(values)
+    }
+
+    fn flush_range(&self, _byte_len: u64) -> Result<(), VulkanError> {
+        let range = VkMappedMemoryRange {
+            s_type: VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+            p_next: ptr::null(),
+            memory: self.memory,
+            offset: 0,
+            size: VK_WHOLE_SIZE,
+        };
+        vk_check(
+            unsafe { (self.functions.flush_mapped_memory_ranges)(self.device, 1, &range) },
+            "vkFlushMappedMemoryRanges",
+        )
     }
 
     fn invalidate_range(&self, _byte_len: u64) -> Result<(), VulkanError> {

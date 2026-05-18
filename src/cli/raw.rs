@@ -266,12 +266,15 @@ pub fn profile_rgb48_bench_file(
             }
         };
         println!(
-            "  iter {:>2}: decode_total_ms {:.3} tier1_ms {:.3} gpu_setup_ms {:.3} reconstruct_ms {:.3} pack_ms {:.3} pack_shader_ms {:.3} pack_copy_ms {:.3} pack_readback_ms {:.3}",
+            "  iter {:>2}: decode_total_ms {:.3} tier1_ms {:.3} gpu_setup_ms {:.3} reconstruct_ms {:.3} reconstruct_upload_ms {:.3} reconstruct_alloc_ms {:.3} reconstruct_dispatch_ms {:.3} pack_ms {:.3} pack_shader_ms {:.3} pack_copy_ms {:.3} pack_readback_ms {:.3}",
             iteration + 1,
             decoded.profile.timings.total_ms,
             decoded.profile.timings.tier1_decode_ms,
             decoded.profile.timings.gpu_setup_ms,
             decoded.profile.timings.reconstruct_ms,
+            decoded.profile.timings.reconstruct_upload_ms,
+            decoded.profile.timings.reconstruct_alloc_ms,
+            decoded.profile.timings.reconstruct_dispatch_ms,
             decoded.profile.timings.pack_ms,
             decoded.profile.timings.pack_shader_ms,
             decoded.profile.timings.pack_copy_ms,
@@ -914,6 +917,18 @@ fn print_decode_profile(profile: &DecodeProfile) {
     println!("    tier1_decode_ms {:.3}", profile.timings.tier1_decode_ms);
     println!("    gpu_setup_ms {:.3}", profile.timings.gpu_setup_ms);
     println!("    reconstruct_ms {:.3}", profile.timings.reconstruct_ms);
+    println!(
+        "    reconstruct_upload_ms {:.3}",
+        profile.timings.reconstruct_upload_ms
+    );
+    println!(
+        "    reconstruct_alloc_ms {:.3}",
+        profile.timings.reconstruct_alloc_ms
+    );
+    println!(
+        "    reconstruct_dispatch_ms {:.3}",
+        profile.timings.reconstruct_dispatch_ms
+    );
     println!("    pack_ms {:.3}", profile.timings.pack_ms);
     println!("    pack_shader_ms {:.3}", profile.timings.pack_shader_ms);
     println!("    pack_copy_ms {:.3}", profile.timings.pack_copy_ms);
@@ -937,6 +952,9 @@ fn print_profile_average(label: &str, profiles: &[DecodeProfile]) {
             acc.timings.tier1_decode_ms += profile.timings.tier1_decode_ms;
             acc.timings.gpu_setup_ms += profile.timings.gpu_setup_ms;
             acc.timings.reconstruct_ms += profile.timings.reconstruct_ms;
+            acc.timings.reconstruct_upload_ms += profile.timings.reconstruct_upload_ms;
+            acc.timings.reconstruct_alloc_ms += profile.timings.reconstruct_alloc_ms;
+            acc.timings.reconstruct_dispatch_ms += profile.timings.reconstruct_dispatch_ms;
             acc.timings.pack_ms += profile.timings.pack_ms;
             acc.timings.pack_shader_ms += profile.timings.pack_shader_ms;
             acc.timings.pack_copy_ms += profile.timings.pack_copy_ms;
@@ -944,7 +962,7 @@ fn print_profile_average(label: &str, profiles: &[DecodeProfile]) {
             acc
         });
     println!(
-        "  {label}_ms decode_total {:.3} parse {:.3} layout {:.3} packet {:.3} work_plan {:.3} bind {:.3} tier1 {:.3} gpu_setup {:.3} reconstruct {:.3} pack {:.3} pack_shader {:.3} pack_copy {:.3} pack_readback {:.3}",
+        "  {label}_ms decode_total {:.3} parse {:.3} layout {:.3} packet {:.3} work_plan {:.3} bind {:.3} tier1 {:.3} gpu_setup {:.3} reconstruct {:.3} reconstruct_upload {:.3} reconstruct_alloc {:.3} reconstruct_dispatch {:.3} pack {:.3} pack_shader {:.3} pack_copy {:.3} pack_readback {:.3}",
         sum.timings.total_ms / count,
         sum.timings.parse_ms / count,
         sum.timings.layout_ms / count,
@@ -954,6 +972,9 @@ fn print_profile_average(label: &str, profiles: &[DecodeProfile]) {
         sum.timings.tier1_decode_ms / count,
         sum.timings.gpu_setup_ms / count,
         sum.timings.reconstruct_ms / count,
+        sum.timings.reconstruct_upload_ms / count,
+        sum.timings.reconstruct_alloc_ms / count,
+        sum.timings.reconstruct_dispatch_ms / count,
         sum.timings.pack_ms / count,
         sum.timings.pack_shader_ms / count,
         sum.timings.pack_copy_ms / count,

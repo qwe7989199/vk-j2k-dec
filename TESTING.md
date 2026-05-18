@@ -356,6 +356,25 @@ diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0 (x 0, y 0, chann
   channel_mean R=0.000000000000 G=0.000000000000 B=0.000000000000
 ```
 
+The Tier-1 GPU handoff experiment is exposed through:
+
+```text
+cargo run --release -- tier1-gpu-plan target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
+```
+
+Current local result:
+
+```text
+tier1 gpu plan: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
+  tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
+    first: C0 R0 LL cblk 0,0 60x34, bytes 0..2386, coeff 0..2040, passes 0..34
+    vulkan smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 records, 24256 byte words
+```
+
+The smoke shader reads the flattened codeblock records and the packed compressed
+byte stream on GPU, then validates per-codeblock byte ranges and checksums
+against the CPU plan.
+
 - This sample is inside the first target profile.
 
 ## Local profiling
@@ -409,10 +428,19 @@ HOST_CACHED staging:
 
 ```text
 profile-rgb48-bench: mode gpu, 1920x1080 12-bit, discard 0, iterations 10, 6220800 samples
-  pipeline_setup_ms 236.069
-  avg_all_ms decode_total 93.881 tier1 39.846 gpu_setup 0.000 reconstruct 48.004 pack 4.862 pack_shader 0.509 pack_copy 1.362 pack_readback 2.053
-  avg_warm_skip1_ms decode_total 94.102 tier1 39.980 gpu_setup 0.000 reconstruct 48.162 pack 4.781 pack_shader 0.507 pack_copy 1.263 pack_readback 2.054
+  pipeline_setup_ms 237.064
+  avg_all_ms decode_total 86.288 tier1 39.776 gpu_setup 0.000 reconstruct 40.365 reconstruct_upload 15.573 reconstruct_alloc 4.696 reconstruct_dispatch 3.479 pack 4.992 pack_shader 0.521 pack_copy 1.313 pack_readback 2.148
+  avg_warm_skip1_ms decode_total 86.130 tier1 39.664 gpu_setup 0.000 reconstruct 40.311 reconstruct_upload 15.465 reconstruct_alloc 4.722 reconstruct_dispatch 3.437 pack 5.001 pack_shader 0.527 pack_copy 1.286 pack_readback 2.158
 ```
+
+The GPU bench also reports the reversible 5/3 reconstruct split as
+`reconstruct_upload`, `reconstruct_alloc`, and `reconstruct_dispatch`. The shader
+dispatch work is only several milliseconds on the local frame after batching the
+three DWT passes per resolution into one command buffer with compute barriers;
+the larger cost is currently CPU coefficient-plane staging/upload plus per-frame
+buffer allocation.
+`VK_J2K_TIER1_THREADS=<n>` can override the default Tier-1 worker count when
+scanning CPU scheduling behavior.
 
 The matching CPU 10-iteration bench reports:
 
@@ -423,11 +451,17 @@ profile-rgb48-bench: mode cpu, 1920x1080 12-bit, discard 0, iterations 10, 62208
 ```
 
 The comparable FFmpeg native JPEG2000 10-frame loop against the same in-memory
-frame source, writing RGB48 output to `NUL`, reports about 119 ms/frame:
+frame source, writing RGB48 output to `NUL`, reports about 119-126 ms/frame on
+the local machine. Explicit `-threads 1` and default `-threads 0` are similar for
+this single-frame codestream:
 
 ```text
 ffmpeg -hide_banner -v info -benchmark -stream_loop 9 -i target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k -frames:v 10 -pix_fmt rgb48le -f rawvideo NUL
 bench: utime=1.141s stime=0.078s rtime=1.192s
+ffmpeg -hide_banner -v info -benchmark -threads 1 -stream_loop 9 -i target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k -frames:v 10 -pix_fmt rgb48le -f rawvideo NUL
+bench: utime=1.219s stime=0.031s rtime=1.254s
+ffmpeg -hide_banner -v info -benchmark -threads 0 -stream_loop 9 -i target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k -frames:v 10 -pix_fmt rgb48le -f rawvideo NUL
+bench: utime=1.281s stime=0.078s rtime=1.264s
 ```
 
 The low-resolution path now prunes unused high-resolution codeblocks before
@@ -480,6 +514,7 @@ compiled shaders\idwt53_1d.comp.glsl -> target\shaders\idwt53_1d.comp.spv
 compiled shaders\idwt97_1d.comp.glsl -> target\shaders\idwt97_1d.comp.spv
 compiled shaders\color_convert.comp.glsl -> target\shaders\color_convert.comp.spv
 compiled shaders\color_convert_i32.comp.glsl -> target\shaders\color_convert_i32.comp.spv
+compiled shaders\tier1_plan_smoke.comp.glsl -> target\shaders\tier1_plan_smoke.comp.spv
 ```
 
 Device enumeration:

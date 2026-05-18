@@ -45,7 +45,11 @@ impl TileCoefficientPlanes {
             .decode_arithmetic_passes_with_reconstruction(codeblock_style, reconstruction)?;
         let decoded_codeblocks = decoded.codeblocks.len();
         let decoded_passes = decoded.decoded_passes;
-        let mut nonzero_coefficients = 0usize;
+        let nonzero_coefficients = decoded
+            .codeblocks
+            .iter()
+            .map(|codeblock| codeblock.nonzero_coefficients)
+            .sum();
 
         for decoded in &decoded.codeblocks {
             let component = components
@@ -56,11 +60,6 @@ impl TileCoefficientPlanes {
                         decoded.id.component
                     ))
                 })?;
-            nonzero_coefficients += decoded
-                .coefficients
-                .iter()
-                .filter(|coefficient| **coefficient != 0)
-                .count();
             component.place_codeblock(&decoded)?;
         }
 

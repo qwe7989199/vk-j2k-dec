@@ -3,7 +3,7 @@ use std::fs;
 use std::process::ExitCode;
 
 use vk_j2k_dec::codestream::{Codestream, WaveletTransform, scan_codestreams};
-use vk_j2k_dec::gpu::{GpuDwtDispatchPlan, GpuPipelinePlan};
+use vk_j2k_dec::gpu::{GpuDwtDispatchPlan, GpuPipelinePlan, GpuTier1Plan};
 use vk_j2k_dec::packet::{TilePacketHeaderState, parse_lrcp_tile_packets};
 use vk_j2k_dec::reconstruct::TileCoefficientPlanes;
 use vk_j2k_dec::tier1::{CoefficientReconstruction, Tier1WorkPlan};
@@ -49,6 +49,7 @@ pub fn run() -> ExitCode {
             tier1_smoke(&path, max_codeblocks)
         }
         (Some("tier1-subband-stats"), Some(path)) => tier1_subband_stats(&path),
+        (Some("tier1-gpu-plan"), Some(path)) => tier1_gpu_plan(&path),
         (Some("tier1-codeblock-trace"), Some(path)) => {
             let Some(component) = args.next().and_then(|value| value.parse::<u16>().ok()) else {
                 eprintln!(
@@ -397,6 +398,7 @@ pub fn run() -> ExitCode {
             eprintln!("  {program} extract <container-or-bytestream> <index> <output.j2k>");
             eprintln!("  {program} tier1-smoke <input.j2k> [max_codeblocks]");
             eprintln!("  {program} tier1-subband-stats <input.j2k>");
+            eprintln!("  {program} tier1-gpu-plan <input.j2k>");
             eprintln!(
                 "  {program} tier1-codeblock-trace <input.j2k> <component> <resolution> <LL|HL|LH|HH> <codeblock-x> <codeblock-y>"
             );
@@ -582,6 +584,169 @@ fn tier1_subband_stats(path: &str) -> ExitCode {
         }
     }
 
+    ExitCode::SUCCESS
+}
+
+fn tier1_gpu_plan(path: &str) -> ExitCode {
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("tier1 gpu plan: failed to read {path}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let codestream = match Codestream::parse(&data) {
+        Ok(codestream) => codestream,
+        Err(err) => {
+            eprintln!("tier1 gpu plan: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(cod) = &codestream.cod else {
+        eprintln!("tier1 gpu plan: missing COD marker");
+        return ExitCode::FAILURE;
+    };
+    let layouts = match codestream.tile_layouts() {
+        Ok(layouts) => layouts,
+        Err(err) => {
+            eprintln!("tier1 gpu plan: tile layout unavailable ({err})");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("tier1 gpu plan: {path}");
+    for tile_part in &codestream.tile_parts {
+        let Some(layout) = layouts
+            .iter()
+            .find(|layout| layout.tile_index == tile_part.tile_index)
+        else {
+            eprintln!(
+                "tier1 gpu plan: missing layout for tile {}",
+                tile_part.tile_index
+            );
+            return ExitCode::FAILURE;
+        };
+        let Some(tile_data) = data.get(tile_part.data_start..tile_part.data_end) else {
+            eprintln!(
+                "tier1 gpu plan: tile {} payload outside input",
+                tile_part.tile_index
+            );
+            return ExitCode::FAILURE;
+        };
+        let packet_summary = match parse_lrcp_tile_packets(tile_data, layout, cod.layers) {
+            Ok(summary) => summary,
+            Err(err) => {
+                eprintln!(
+                    "tier1 gpu plan: packet parse failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let work_plan = match Tier1WorkPlan::from_packet_summary_with_quantization(
+            &packet_summary,
+            codestream.qcd.as_ref(),
+            &codestream.qccs,
+        ) {
+            Ok(plan) => plan,
+            Err(err) => {
+                eprintln!(
+                    "tier1 gpu plan: work plan failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let bound = match work_plan.bind_segment_data(tile_data) {
+            Ok(bound) => bound,
+            Err(err) => {
+                eprintln!(
+                    "tier1 gpu plan: segment bind failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let plan = match GpuTier1Plan::from_bound_work_plan(&bound, cod.codeblock_style_flags()) {
+            Ok(plan) => plan,
+            Err(err) => {
+                eprintln!(
+                    "tier1 gpu plan: flatten failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "  tile {}: {} cblk, {} compressed bytes, {} coeff, {} passes ({} mq, {} raw)",
+            tile_part.tile_index,
+            plan.codeblocks.len(),
+            plan.compressed_bytes.len(),
+            plan.output_coefficients,
+            plan.total_passes,
+            plan.arithmetic_passes,
+            plan.raw_bypass_passes
+        );
+        if let Some(first) = plan.codeblocks.first() {
+            println!(
+                "    first: C{} R{} {} cblk {},{} {}x{}, bytes {}..{}, coeff {}..{}, passes {}..{}",
+                first.component,
+                first.resolution,
+                first.subband,
+                first.codeblock_x,
+                first.codeblock_y,
+                first.width,
+                first.height,
+                first.byte_offset,
+                first.byte_offset + first.byte_len,
+                first.coefficient_offset,
+                first.coefficient_offset + first.coefficient_count,
+                first.pass_offset,
+                first.pass_offset + first.pass_count
+            );
+        }
+        let shader_path = "target\\shaders\\tier1_plan_smoke.comp.spv";
+        if std::path::Path::new(shader_path).exists() {
+            let records = plan.codeblock_records();
+            let compressed_words = plan.compressed_u32_words();
+            let smoke = match vk_j2k_dec::vulkan::run_tier1_plan_smoke(
+                shader_path,
+                &records,
+                &compressed_words,
+            ) {
+                Ok(smoke) => smoke,
+                Err(err) => {
+                    eprintln!("tier1 gpu plan: Vulkan smoke failed: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Some(first) = plan.codeblocks.first() {
+                let expected = [
+                    first.byte_offset + first.byte_len,
+                    first.coefficient_offset + first.coefficient_count,
+                    first.pass_offset + first.pass_count,
+                    plan.codeblock_byte_checksum(0).unwrap_or(0),
+                ];
+                if smoke.output.get(0..4) != Some(expected.as_slice()) {
+                    eprintln!(
+                        "tier1 gpu plan: smoke mismatch: got {:?}, expected {:?}",
+                        smoke.output.get(0..4).unwrap_or(&[]),
+                        expected
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+            println!(
+                "    vulkan smoke: device {}, queue {}, {} records, {} byte words",
+                smoke.device_name,
+                smoke.queue_family_index,
+                records.len(),
+                compressed_words.len()
+            );
+        } else {
+            println!("    vulkan smoke: skipped, missing {shader_path}");
+        }
+    }
     ExitCode::SUCCESS
 }
 

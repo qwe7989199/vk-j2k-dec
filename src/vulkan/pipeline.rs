@@ -28,6 +28,9 @@ pub struct GpuRgb48ComponentsResult {
     pub samples: Vec<u16>,
     pub setup_ms: f64,
     pub reconstruct_ms: f64,
+    pub reconstruct_upload_ms: f64,
+    pub reconstruct_alloc_ms: f64,
+    pub reconstruct_dispatch_ms: f64,
     pub pack_ms: f64,
     pub pack_shader_ms: f64,
     pub pack_copy_ms: f64,
@@ -38,6 +41,13 @@ struct GpuPlaneI32Buffer {
     width: u32,
     height: u32,
     buffer: HostBuffer,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct GpuDwtProfile {
+    upload_ms: f64,
+    alloc_ms: f64,
+    dispatch_ms: f64,
 }
 
 struct GpuPackedRgb48Result {
@@ -123,14 +133,16 @@ impl VulkanRgb48Pipeline {
 
         let stage_start = std::time::Instant::now();
         let mut planes = Vec::with_capacity(components.len());
+        let dwt_profile = GpuDwtProfile::default();
         for component in components {
-            planes.push(run_idwt53_component_on_device(
+            let plane = run_idwt53_component_on_device(
                 &self.context.device,
                 self.queue_family_index,
                 &self.idwt53_program,
                 component,
                 target_resolution,
-            )?);
+            )?;
+            planes.push(plane);
         }
         let reconstruct_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -158,6 +170,9 @@ impl VulkanRgb48Pipeline {
             samples,
             setup_ms: 0.0,
             reconstruct_ms,
+            reconstruct_upload_ms: dwt_profile.upload_ms,
+            reconstruct_alloc_ms: dwt_profile.alloc_ms,
+            reconstruct_dispatch_ms: dwt_profile.dispatch_ms,
             pack_ms,
             pack_shader_ms: 0.0,
             pack_copy_ms: 0.0,
@@ -175,6 +190,7 @@ impl VulkanRgb48Pipeline {
     ) -> Result<GpuRgb48ComponentsResult, VulkanError> {
         let stage_start = std::time::Instant::now();
         let mut planes = Vec::with_capacity(components.len());
+        let mut dwt_profile = GpuDwtProfile::default();
         for component in components {
             planes.push(run_idwt53_component_buffer_on_device(
                 &self.context.device,
@@ -182,6 +198,7 @@ impl VulkanRgb48Pipeline {
                 &self.idwt53_program,
                 component,
                 target_resolution,
+                &mut dwt_profile,
             )?);
         }
         let reconstruct_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
@@ -210,6 +227,9 @@ impl VulkanRgb48Pipeline {
             samples: packed.samples,
             setup_ms: 0.0,
             reconstruct_ms,
+            reconstruct_upload_ms: dwt_profile.upload_ms,
+            reconstruct_alloc_ms: dwt_profile.alloc_ms,
+            reconstruct_dispatch_ms: dwt_profile.dispatch_ms,
             pack_ms,
             pack_shader_ms: packed.shader_ms,
             pack_copy_ms: packed.copy_ms,
@@ -346,6 +366,7 @@ fn run_idwt53_component_on_device(
         program,
         component,
         target_resolution,
+        &mut GpuDwtProfile::default(),
     )?;
     Ok(crate::dwt::PlaneI32 {
         width: plane.width,
@@ -365,13 +386,15 @@ fn run_idwt53_component_buffer_on_device(
     program: &StorageComputeProgram,
     component: &ComponentSubbandPlanes,
     target_resolution: u8,
+    profile: &mut GpuDwtProfile,
 ) -> Result<GpuPlaneI32Buffer, VulkanError> {
     let ll = component
         .plane(0, SubbandKind::Ll)
         .ok_or_else(|| VulkanError::new("GPU IDWT missing resolution 0 LL plane"))?;
     let mut current_width = ll.width;
     let mut current_height = ll.height;
-    let mut current_buffer = create_i32_device_buffer(device, queue_family_index, &ll.coefficients)?;
+    let mut current_buffer =
+        create_i32_device_buffer(device, queue_family_index, &ll.coefficients, profile)?;
 
     if target_resolution == 0 {
         return Ok(GpuPlaneI32Buffer {
@@ -406,9 +429,20 @@ fn run_idwt53_component_buffer_on_device(
 
         let output_width = current_width + hl.width;
         let output_height = current_height + lh.height;
-        let hl_buffer = create_i32_device_buffer(device, queue_family_index, &hl.coefficients)?;
-        let lh_buffer = create_i32_device_buffer(device, queue_family_index, &lh.coefficients)?;
-        let hh_buffer = create_i32_device_buffer(device, queue_family_index, &hh.coefficients)?;
+        let upload_start = std::time::Instant::now();
+        let hl_upload = create_i32_device_upload(device, &hl.coefficients)?;
+        let lh_upload = create_i32_device_upload(device, &lh.coefficients)?;
+        let hh_upload = create_i32_device_upload(device, &hh.coefficients)?;
+        copy_i32_device_uploads(
+            device,
+            queue_family_index,
+            &[&hl_upload, &lh_upload, &hh_upload],
+        )?;
+        profile.upload_ms += upload_start.elapsed().as_secs_f64() * 1000.0;
+        let hl_buffer = hl_upload.buffer;
+        let lh_buffer = lh_upload.buffer;
+        let hh_buffer = hh_upload.buffer;
+        let alloc_start = std::time::Instant::now();
         let low_columns_buffer = create_empty_device_buffer::<i32>(
             device,
             checked_plane_len(output_width, current_height)?,
@@ -419,64 +453,65 @@ fn run_idwt53_component_buffer_on_device(
             device,
             checked_plane_len(output_width, output_height)?,
         )?;
+        profile.alloc_ms += alloc_start.elapsed().as_secs_f64() * 1000.0;
 
-        dispatch_idwt_lines(
+        let dispatch_start = std::time::Instant::now();
+        dispatch_idwt_line_batch(
             device,
             queue_family_index,
             program,
-            &current_buffer,
-            &hl_buffer,
-            &low_columns_buffer,
-            Idwt53PushConstants {
-                low_count: current_width,
-                high_count: hl.width,
-                line_count: current_height,
-                low_line_stride: current_width,
-                low_sample_stride: 1,
-                high_line_stride: hl.width,
-                high_sample_stride: 1,
-                output_line_stride: output_width,
-                output_sample_stride: 1,
-            },
+            &[
+                IdwtLineDispatch {
+                    low_buffer: &current_buffer,
+                    high_buffer: &hl_buffer,
+                    output_buffer: &low_columns_buffer,
+                    push: Idwt53PushConstants {
+                        low_count: current_width,
+                        high_count: hl.width,
+                        line_count: current_height,
+                        low_line_stride: current_width,
+                        low_sample_stride: 1,
+                        high_line_stride: hl.width,
+                        high_sample_stride: 1,
+                        output_line_stride: output_width,
+                        output_sample_stride: 1,
+                    },
+                },
+                IdwtLineDispatch {
+                    low_buffer: &lh_buffer,
+                    high_buffer: &hh_buffer,
+                    output_buffer: &high_columns_buffer,
+                    push: Idwt53PushConstants {
+                        low_count: current_width,
+                        high_count: hh.width,
+                        line_count: lh.height,
+                        low_line_stride: lh.width,
+                        low_sample_stride: 1,
+                        high_line_stride: hh.width,
+                        high_sample_stride: 1,
+                        output_line_stride: output_width,
+                        output_sample_stride: 1,
+                    },
+                },
+                IdwtLineDispatch {
+                    low_buffer: &low_columns_buffer,
+                    high_buffer: &high_columns_buffer,
+                    output_buffer: &output_buffer,
+                    push: Idwt53PushConstants {
+                        low_count: current_height,
+                        high_count: lh.height,
+                        line_count: output_width,
+                        low_line_stride: 1,
+                        low_sample_stride: output_width,
+                        high_line_stride: 1,
+                        high_sample_stride: output_width,
+                        output_line_stride: 1,
+                        output_sample_stride: output_width,
+                    },
+                },
+            ],
         )?;
-        dispatch_idwt_lines(
-            device,
-            queue_family_index,
-            program,
-            &lh_buffer,
-            &hh_buffer,
-            &high_columns_buffer,
-            Idwt53PushConstants {
-                low_count: current_width,
-                high_count: hh.width,
-                line_count: lh.height,
-                low_line_stride: lh.width,
-                low_sample_stride: 1,
-                high_line_stride: hh.width,
-                high_sample_stride: 1,
-                output_line_stride: output_width,
-                output_sample_stride: 1,
-            },
-        )?;
-        dispatch_idwt_lines(
-            device,
-            queue_family_index,
-            program,
-            &low_columns_buffer,
-            &high_columns_buffer,
-            &output_buffer,
-            Idwt53PushConstants {
-                low_count: current_height,
-                high_count: lh.height,
-                line_count: output_width,
-                low_line_stride: 1,
-                low_sample_stride: output_width,
-                high_line_stride: 1,
-                high_sample_stride: output_width,
-                output_line_stride: 1,
-                output_sample_stride: output_width,
-            },
-        )?;
+        profile.dispatch_ms += dispatch_start.elapsed().as_secs_f64() * 1000.0;
 
         current_width = output_width;
         current_height = output_height;
@@ -778,25 +813,111 @@ fn dispatch_idwt_lines(
     )
 }
 
-fn create_i32_buffer(device: &VulkanDevice, values: &[i32]) -> Result<HostBuffer, VulkanError> {
-    let buffer = device.create_host_buffer(bytes_len::<i32>(values.len())?)?;
+struct IdwtLineDispatch<'a> {
+    low_buffer: &'a HostBuffer,
+    high_buffer: &'a HostBuffer,
+    output_buffer: &'a HostBuffer,
+    push: Idwt53PushConstants,
+}
+
+fn dispatch_idwt_line_batch(
+    device: &VulkanDevice,
+    queue_family_index: u32,
+    program: &StorageComputeProgram,
+    dispatches: &[IdwtLineDispatch<'_>],
+) -> Result<(), VulkanError> {
+    let descriptors = dispatches
+        .iter()
+        .map(|dispatch| {
+            [
+                dispatch.low_buffer.descriptor_info(),
+                dispatch.high_buffer.descriptor_info(),
+                dispatch.output_buffer.descriptor_info(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let pushes = dispatches
+        .iter()
+        .map(|dispatch| dispatch.push)
+        .collect::<Vec<_>>();
+    let batches = dispatches
+        .iter()
+        .enumerate()
+        .map(|(index, dispatch)| StorageDispatchBatch {
+            descriptors: &descriptors[index],
+            push_constants: bytes_of(&pushes[index]),
+            groups: [
+                (dispatch.push.low_count + dispatch.push.high_count).div_ceil(16),
+                dispatch.push.line_count.div_ceil(16),
+                1,
+            ],
+        })
+        .collect::<Vec<_>>();
+    program.dispatch_many(device, queue_family_index, &batches)
+}
+
+fn create_i32_upload_buffer(
+    device: &VulkanDevice,
+    values: &[i32],
+) -> Result<HostBuffer, VulkanError> {
+    let buffer = device.create_host_cached_buffer(
+        bytes_len::<i32>(values.len())?,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+    )?;
     buffer.write_slice(values)?;
     Ok(buffer)
+}
+
+struct I32DeviceUpload {
+    staging: HostBuffer,
+    buffer: HostBuffer,
+    byte_len: u64,
+}
+
+fn create_i32_device_upload(
+    device: &VulkanDevice,
+    values: &[i32],
+) -> Result<I32DeviceUpload, VulkanError> {
+    let byte_len = bytes_len::<i32>(values.len())?;
+    let staging = create_i32_upload_buffer(device, values)?;
+    let buffer = device.create_device_local_buffer(
+        byte_len,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    )?;
+    Ok(I32DeviceUpload {
+        staging,
+        buffer,
+        byte_len,
+    })
+}
+
+fn copy_i32_device_uploads(
+    device: &VulkanDevice,
+    queue_family_index: u32,
+    uploads: &[&I32DeviceUpload],
+) -> Result<(), VulkanError> {
+    let copies = uploads
+        .iter()
+        .map(|upload| BufferCopy {
+            source: &upload.staging,
+            destination: &upload.buffer,
+            byte_len: upload.byte_len,
+        })
+        .collect::<Vec<_>>();
+    device.copy_buffers(queue_family_index, &copies)
 }
 
 fn create_i32_device_buffer(
     device: &VulkanDevice,
     queue_family_index: u32,
     values: &[i32],
+    profile: &mut GpuDwtProfile,
 ) -> Result<HostBuffer, VulkanError> {
-    let byte_len = bytes_len::<i32>(values.len())?;
-    let staging = create_i32_buffer(device, values)?;
-    let buffer = device.create_device_local_buffer(
-        byte_len,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-    )?;
-    device.copy_buffer(queue_family_index, &staging, &buffer, byte_len)?;
-    Ok(buffer)
+    let upload_start = std::time::Instant::now();
+    let upload = create_i32_device_upload(device, values)?;
+    copy_i32_device_uploads(device, queue_family_index, &[&upload])?;
+    profile.upload_ms += upload_start.elapsed().as_secs_f64() * 1000.0;
+    Ok(upload.buffer)
 }
 
 pub fn run_color_components(
