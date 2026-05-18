@@ -893,6 +893,53 @@ fn tier1_gpu_plan(path: &str) -> ExitCode {
                             scatter_smoke.dispatch_ms,
                             scatter_smoke.readback_ms
                         );
+                        let cleanup_scatter_smoke =
+                            match vk_j2k_dec::vulkan::run_tier1_cleanup_scatter_smoke(
+                                cleanup_shader_path,
+                                scatter_shader_path,
+                                &records,
+                                &compressed_words,
+                                &scatter_plan.records,
+                                scatter_plan.output_coefficients,
+                            ) {
+                                Ok(smoke) => smoke,
+                                Err(err) => {
+                                    eprintln!(
+                                        "tier1 gpu plan: Vulkan cleanup+scatter smoke failed: {err}"
+                                    );
+                                    return ExitCode::FAILURE;
+                                }
+                            };
+                        if cleanup_scatter_smoke.output != expected {
+                            eprintln!(
+                                "tier1 gpu plan: cleanup+scatter summary mismatch: got {:?}, expected {:?}",
+                                cleanup_scatter_smoke.output, expected
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                        if cleanup_scatter_smoke.plane_coefficients != expected_scatter {
+                            let mismatch = cleanup_scatter_smoke
+                                .plane_coefficients
+                                .iter()
+                                .zip(&expected_scatter)
+                                .position(|(actual, expected)| actual != expected)
+                                .unwrap_or(cleanup_scatter_smoke.plane_coefficients.len());
+                            eprintln!(
+                                "tier1 gpu plan: cleanup+scatter plane mismatch at {mismatch}: got {:?}, expected {:?}",
+                                cleanup_scatter_smoke.plane_coefficients.get(mismatch),
+                                expected_scatter.get(mismatch)
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                        println!(
+                            "    vulkan tier1 cleanup+scatter: device {}, queue {}, upload {:.3} ms, cleanup {:.3} ms, scatter {:.3} ms, readback {:.3} ms",
+                            cleanup_scatter_smoke.device_name,
+                            cleanup_scatter_smoke.queue_family_index,
+                            cleanup_scatter_smoke.upload_ms,
+                            cleanup_scatter_smoke.cleanup_dispatch_ms,
+                            cleanup_scatter_smoke.scatter_dispatch_ms,
+                            cleanup_scatter_smoke.readback_ms
+                        );
                     } else {
                         println!(
                             "    vulkan tier1 scatter smoke: skipped, missing {scatter_shader_path}"
@@ -1093,6 +1140,74 @@ fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
             );
             return ExitCode::FAILURE;
         }
+        let scatter_shader_path = "target\\shaders\\tier1_scatter_smoke.comp.spv";
+        let mut cleanup_scatter_average_ms = None;
+        if std::path::Path::new(scatter_shader_path).exists() {
+            let scatter_plan = match plan.scatter_plan(&layout.components) {
+                Ok(scatter_plan) => scatter_plan,
+                Err(err) => {
+                    eprintln!("tier1 gpu bench: scatter plan failed: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let expected_scatter = match tier1_scatter_expected(
+                &scatter_plan.records,
+                &expected_coefficients,
+                scatter_plan.output_coefficients,
+            ) {
+                Ok(expected) => expected,
+                Err(err) => {
+                    eprintln!("tier1 gpu bench: CPU scatter failed: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let cleanup_scatter_bench = match vk_j2k_dec::vulkan::run_tier1_cleanup_scatter_bench(
+                cleanup_shader_path,
+                scatter_shader_path,
+                &records,
+                &compressed_words,
+                &scatter_plan.records,
+                scatter_plan.output_coefficients,
+                iterations,
+            ) {
+                Ok(bench) => bench,
+                Err(err) => {
+                    eprintln!("tier1 gpu bench: Vulkan cleanup+scatter bench failed: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if cleanup_scatter_bench.output != expected_output {
+                eprintln!(
+                    "tier1 gpu bench: cleanup+scatter summary mismatch: got {:?}, expected {:?}",
+                    cleanup_scatter_bench.output, expected_output
+                );
+                return ExitCode::FAILURE;
+            }
+            if cleanup_scatter_bench.plane_coefficients != expected_scatter {
+                let mismatch = cleanup_scatter_bench
+                    .plane_coefficients
+                    .iter()
+                    .zip(&expected_scatter)
+                    .position(|(actual, expected)| actual != expected)
+                    .unwrap_or(cleanup_scatter_bench.plane_coefficients.len());
+                eprintln!(
+                    "tier1 gpu bench: cleanup+scatter plane mismatch at {mismatch}: got {:?}, expected {:?}",
+                    cleanup_scatter_bench.plane_coefficients.get(mismatch),
+                    expected_scatter.get(mismatch)
+                );
+                return ExitCode::FAILURE;
+            }
+            cleanup_scatter_average_ms = Some(cleanup_scatter_bench.dispatch_average_ms);
+            println!(
+                "    vulkan tier1 cleanup+scatter bench: device {}, queue {}, setup {:.3} ms, hot_dispatch {:.3} ms total / {:.3} ms avg, readback {:.3} ms",
+                cleanup_scatter_bench.device_name,
+                cleanup_scatter_bench.queue_family_index,
+                cleanup_scatter_bench.setup_ms,
+                cleanup_scatter_bench.dispatch_total_ms,
+                cleanup_scatter_bench.dispatch_average_ms,
+                cleanup_scatter_bench.readback_ms
+            );
+        }
         let cpu_average_ms = cpu_total_ms / iterations as f64;
         let hot_speedup = cpu_average_ms / bench.dispatch_average_ms;
         println!(
@@ -1104,6 +1219,12 @@ fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
             bench.dispatch_average_ms,
             bench.readback_ms
         );
+        if let Some(cleanup_scatter_average_ms) = cleanup_scatter_average_ms {
+            println!(
+                "    gpu cleanup+scatter vs cpu reference: {:.2}x hot speedup",
+                cpu_average_ms / cleanup_scatter_average_ms
+            );
+        }
         println!(
             "    cpu tier1 reference: {:.3} ms total / {:.3} ms avg, hot GPU speedup {:.2}x, first nonzero {}, checksum 0x{:08x}",
             cpu_total_ms, cpu_average_ms, hot_speedup, bench.output[0], bench.output[1]

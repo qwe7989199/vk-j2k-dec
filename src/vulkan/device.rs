@@ -467,21 +467,23 @@ impl VulkanDevice {
             unsafe { (self.functions.begin_command_buffer)(command_buffer, &begin_info) },
             "vkBeginCommandBuffer",
         )?;
-        let Some(first) = dispatches.first() else {
+        if dispatches.is_empty() {
             return vk_check(
                 unsafe { (self.functions.end_command_buffer)(command_buffer) },
                 "vkEndCommandBuffer",
             );
         };
-        unsafe {
-            (self.functions.cmd_bind_pipeline)(
-                command_buffer,
-                VK_PIPELINE_BIND_POINT_COMPUTE,
-                first.pipeline,
-            );
-        }
+        let mut bound_pipeline = 0usize;
         for (index, dispatch) in dispatches.iter().enumerate() {
             unsafe {
+                if dispatch.pipeline != bound_pipeline {
+                    (self.functions.cmd_bind_pipeline)(
+                        command_buffer,
+                        VK_PIPELINE_BIND_POINT_COMPUTE,
+                        dispatch.pipeline,
+                    );
+                    bound_pipeline = dispatch.pipeline;
+                }
                 (self.functions.cmd_bind_descriptor_sets)(
                     command_buffer,
                     VK_PIPELINE_BIND_POINT_COMPUTE,

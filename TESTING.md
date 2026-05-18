@@ -371,13 +371,16 @@ tier1 gpu plan: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
     first: C0 R0 LL cblk 0,0 60x34, bytes 0..2386, coeff 0..2040, passes 0..34
     vulkan smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 records, 24256 byte words
     vulkan mq smoke: device NVIDIA GeForce RTX 5060, queue 2, cblk 0, context 0, 32 bits 0x08000200
-    vulkan tier1 scatter smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 records, 6220800 plane coeff, upload 11.994 ms, dispatch 0.241 ms, readback 7.332 ms
+    vulkan tier1 scatter smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 records, 6220800 plane coeff, upload 11.859 ms, dispatch 0.151 ms, readback 6.702 ms
+    vulkan tier1 cleanup+scatter: device NVIDIA GeForce RTX 5060, queue 2, upload 2.242 ms, cleanup 60.267 ms, scatter 0.198 ms, readback 7.036 ms
     vulkan tier1 full smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 cblk summaries, 3177152 coeff, first nonzero 2040, checksum 0xfffe2412
-      tier1 full smoke timings: gpu_roundtrip 827.450 ms (upload 1.437, dispatch 73.809, readback 4.525), cpu_reference 278.210 ms
+      tier1 full smoke timings: gpu_roundtrip 738.962 ms (upload 1.597, dispatch 59.746, readback 4.117), cpu_reference 262.726 ms
 tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 iteration(s)
   tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
-    vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 1.692 ms, hot_dispatch 644.523 ms total / 64.452 ms avg, readback 4.361 ms
-    cpu tier1 reference: 3009.618 ms total / 300.962 ms avg, hot GPU speedup 4.67x, first nonzero 2040, checksum 0xfffe2412
+    vulkan tier1 cleanup+scatter bench: device NVIDIA GeForce RTX 5060, queue 2, setup 2.766 ms, hot_dispatch 611.329 ms total / 61.133 ms avg, readback 7.229 ms
+    vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 1.969 ms, hot_dispatch 615.803 ms total / 61.580 ms avg, readback 4.198 ms
+    gpu cleanup+scatter vs cpu reference: 4.33x hot speedup
+    cpu tier1 reference: 2645.729 ms total / 264.573 ms avg, hot GPU speedup 4.30x, first nonzero 2040, checksum 0xfffe2412
 ```
 
 The smoke shader reads the flattened codeblock records and the packed compressed
@@ -399,6 +402,9 @@ The scatter smoke is the next GPU handoff step: it uses precomputed codeblock
 rectangles to scatter the flat Tier-1 coefficient buffer into concatenated
 component/subband plane storage. That validates the layout needed to feed GPU
 Tier-1 output directly into GPU DWT without a CPU coefficient placement pass.
+The cleanup+scatter bench keeps that flat buffer device-local and records the
+cleanup and scatter shaders into the same command buffer loop; scatter adds
+effectively no hot-path cost beside MQ decode on the local frame.
 
 - This sample is inside the first target profile.
 
