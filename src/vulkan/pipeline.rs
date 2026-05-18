@@ -6,6 +6,16 @@ pub struct Idwt53ComponentsResult {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Idwt53ScatteredComponentsResult {
+    pub device_name: String,
+    pub queue_family_index: u32,
+    pub planes: Vec<crate::dwt::PlaneI32>,
+    pub upload_ms: f64,
+    pub dispatch_ms: f64,
+    pub readback_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Idwt97ComponentsResult {
     pub device_name: String,
     pub queue_family_index: u32,
@@ -270,6 +280,70 @@ pub fn run_idwt53_components(
     })
 }
 
+pub fn run_idwt53_scattered_components(
+    shader_path: &str,
+    planes: &[crate::gpu::GpuTier1ScatterPlane],
+    plane_coefficients: &[i32],
+    target_resolution: u8,
+) -> Result<Idwt53ScatteredComponentsResult, VulkanError> {
+    if plane_coefficients.is_empty() {
+        return Err(VulkanError::new(
+            "GPU scattered IDWT requires plane coefficients",
+        ));
+    }
+    let spirv = read_spirv(shader_path)?;
+    with_compute_device(|device, summary, queue_family_index| {
+        let program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            3,
+            std::mem::size_of::<Idwt53OffsetPushConstants>() as u32,
+        )?;
+        let mut profile = GpuDwtProfile::default();
+        let plane_buffer =
+            create_i32_device_buffer(device, queue_family_index, plane_coefficients, &mut profile)?;
+        let mut component_ids = planes
+            .iter()
+            .map(|plane| plane.component)
+            .collect::<Vec<_>>();
+        component_ids.sort_unstable();
+        component_ids.dedup();
+        let mut output_planes = Vec::with_capacity(component_ids.len());
+        let readback_start = std::time::Instant::now();
+        let mut readback_ms = 0.0;
+        for component in component_ids {
+            let output = run_idwt53_scattered_component_on_device(
+                device,
+                queue_family_index,
+                &program,
+                &plane_buffer,
+                planes,
+                component,
+                target_resolution,
+                &mut profile,
+            )?;
+            let output_len = checked_plane_len(output.width, output.height)?;
+            let samples =
+                read_device_i32_buffer(device, queue_family_index, &output.buffer, output_len)?;
+            readback_ms += readback_start.elapsed().as_secs_f64() * 1000.0 - readback_ms;
+            output_planes.push(crate::dwt::PlaneI32 {
+                width: output.width,
+                height: output.height,
+                samples,
+            });
+        }
+        device.wait_idle()?;
+        Ok(Idwt53ScatteredComponentsResult {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            planes: output_planes,
+            upload_ms: profile.upload_ms,
+            dispatch_ms: profile.dispatch_ms,
+            readback_ms,
+        })
+    })
+}
+
 pub fn run_idwt53_rgb48_components(
     idwt53_shader_path: &str,
     color_shader_path: &str,
@@ -523,6 +597,165 @@ fn run_idwt53_component_buffer_on_device(
         height: current_height,
         buffer: current_buffer,
     })
+}
+
+fn run_idwt53_scattered_component_on_device(
+    device: &VulkanDevice,
+    queue_family_index: u32,
+    program: &StorageComputeProgram,
+    plane_buffer: &HostBuffer,
+    planes: &[crate::gpu::GpuTier1ScatterPlane],
+    component: u16,
+    target_resolution: u8,
+    profile: &mut GpuDwtProfile,
+) -> Result<GpuPlaneI32Buffer, VulkanError> {
+    let ll = require_scattered_plane(planes, component, 0, SubbandKind::Ll)?;
+    let mut current_width = ll.width;
+    let mut current_height = ll.height;
+    let mut current_buffer: Option<HostBuffer> = None;
+
+    if target_resolution == 0 {
+        return Err(VulkanError::new(
+            "GPU scattered IDWT currently requires target resolution above 0",
+        ));
+    }
+
+    for resolution in 1..=target_resolution {
+        let hl = require_scattered_plane(planes, component, resolution, SubbandKind::Hl)?;
+        let lh = require_scattered_plane(planes, component, resolution, SubbandKind::Lh)?;
+        let hh = require_scattered_plane(planes, component, resolution, SubbandKind::Hh)?;
+        if lh.width != current_width || hl.height != current_height {
+            return Err(VulkanError::new(format!(
+                "GPU scattered IDWT r{resolution} low/high dimensions do not match current {}x{}: HL {}x{}, LH {}x{}",
+                current_width, current_height, hl.width, hl.height, lh.width, lh.height
+            )));
+        }
+        if hh.width != hl.width || hh.height != lh.height {
+            return Err(VulkanError::new(format!(
+                "GPU scattered IDWT r{resolution} HH dimensions {}x{} do not match HL/LH high extents {}x{}",
+                hh.width, hh.height, hl.width, lh.height
+            )));
+        }
+
+        let output_width = current_width + hl.width;
+        let output_height = current_height + lh.height;
+        let alloc_start = std::time::Instant::now();
+        let low_columns_buffer = create_empty_device_buffer::<i32>(
+            device,
+            checked_plane_len(output_width, current_height)?,
+        )?;
+        let high_columns_buffer =
+            create_empty_device_buffer::<i32>(device, checked_plane_len(output_width, lh.height)?)?;
+        let output_buffer = create_empty_device_buffer::<i32>(
+            device,
+            checked_plane_len(output_width, output_height)?,
+        )?;
+        profile.alloc_ms += alloc_start.elapsed().as_secs_f64() * 1000.0;
+
+        let current_source = current_buffer.as_ref().unwrap_or(plane_buffer);
+        let current_offset = current_buffer
+            .as_ref()
+            .map(|_| 0)
+            .unwrap_or(ll.plane_offset);
+        let dispatch_start = std::time::Instant::now();
+        dispatch_idwt_offset_line_batch(
+            device,
+            queue_family_index,
+            program,
+            &[
+                IdwtOffsetLineDispatch {
+                    low_buffer: current_source,
+                    high_buffer: plane_buffer,
+                    output_buffer: &low_columns_buffer,
+                    push: Idwt53OffsetPushConstants {
+                        low_count: current_width,
+                        high_count: hl.width,
+                        line_count: current_height,
+                        low_line_stride: current_width,
+                        low_sample_stride: 1,
+                        high_line_stride: hl.width,
+                        high_sample_stride: 1,
+                        output_line_stride: output_width,
+                        output_sample_stride: 1,
+                        low_offset: current_offset,
+                        high_offset: hl.plane_offset,
+                        output_offset: 0,
+                    },
+                },
+                IdwtOffsetLineDispatch {
+                    low_buffer: plane_buffer,
+                    high_buffer: plane_buffer,
+                    output_buffer: &high_columns_buffer,
+                    push: Idwt53OffsetPushConstants {
+                        low_count: current_width,
+                        high_count: hh.width,
+                        line_count: lh.height,
+                        low_line_stride: lh.width,
+                        low_sample_stride: 1,
+                        high_line_stride: hh.width,
+                        high_sample_stride: 1,
+                        output_line_stride: output_width,
+                        output_sample_stride: 1,
+                        low_offset: lh.plane_offset,
+                        high_offset: hh.plane_offset,
+                        output_offset: 0,
+                    },
+                },
+                IdwtOffsetLineDispatch {
+                    low_buffer: &low_columns_buffer,
+                    high_buffer: &high_columns_buffer,
+                    output_buffer: &output_buffer,
+                    push: Idwt53OffsetPushConstants {
+                        low_count: current_height,
+                        high_count: lh.height,
+                        line_count: output_width,
+                        low_line_stride: 1,
+                        low_sample_stride: output_width,
+                        high_line_stride: 1,
+                        high_sample_stride: output_width,
+                        output_line_stride: 1,
+                        output_sample_stride: output_width,
+                        low_offset: 0,
+                        high_offset: 0,
+                        output_offset: 0,
+                    },
+                },
+            ],
+        )?;
+        profile.dispatch_ms += dispatch_start.elapsed().as_secs_f64() * 1000.0;
+
+        current_width = output_width;
+        current_height = output_height;
+        current_buffer = Some(output_buffer);
+    }
+
+    let buffer = current_buffer.ok_or_else(|| VulkanError::new("GPU scattered IDWT produced no output"))?;
+    Ok(GpuPlaneI32Buffer {
+        width: current_width,
+        height: current_height,
+        buffer,
+    })
+}
+
+fn require_scattered_plane(
+    planes: &[crate::gpu::GpuTier1ScatterPlane],
+    component: u16,
+    resolution: u8,
+    subband: SubbandKind,
+) -> Result<crate::gpu::GpuTier1ScatterPlane, VulkanError> {
+    planes
+        .iter()
+        .copied()
+        .find(|plane| {
+            plane.component == component
+                && plane.resolution == resolution
+                && plane.subband == subband
+        })
+        .ok_or_else(|| {
+            VulkanError::new(format!(
+                "GPU scattered IDWT missing C{component} R{resolution} {subband} plane"
+            ))
+        })
 }
 
 fn run_idwt97_component_on_device(
@@ -820,11 +1053,71 @@ struct IdwtLineDispatch<'a> {
     push: Idwt53PushConstants,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Idwt53OffsetPushConstants {
+    low_count: u32,
+    high_count: u32,
+    line_count: u32,
+    low_line_stride: u32,
+    low_sample_stride: u32,
+    high_line_stride: u32,
+    high_sample_stride: u32,
+    output_line_stride: u32,
+    output_sample_stride: u32,
+    low_offset: u32,
+    high_offset: u32,
+    output_offset: u32,
+}
+
+struct IdwtOffsetLineDispatch<'a> {
+    low_buffer: &'a HostBuffer,
+    high_buffer: &'a HostBuffer,
+    output_buffer: &'a HostBuffer,
+    push: Idwt53OffsetPushConstants,
+}
+
 fn dispatch_idwt_line_batch(
     device: &VulkanDevice,
     queue_family_index: u32,
     program: &StorageComputeProgram,
     dispatches: &[IdwtLineDispatch<'_>],
+) -> Result<(), VulkanError> {
+    let descriptors = dispatches
+        .iter()
+        .map(|dispatch| {
+            [
+                dispatch.low_buffer.descriptor_info(),
+                dispatch.high_buffer.descriptor_info(),
+                dispatch.output_buffer.descriptor_info(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let pushes = dispatches
+        .iter()
+        .map(|dispatch| dispatch.push)
+        .collect::<Vec<_>>();
+    let batches = dispatches
+        .iter()
+        .enumerate()
+        .map(|(index, dispatch)| StorageDispatchBatch {
+            descriptors: &descriptors[index],
+            push_constants: bytes_of(&pushes[index]),
+            groups: [
+                (dispatch.push.low_count + dispatch.push.high_count).div_ceil(16),
+                dispatch.push.line_count.div_ceil(16),
+                1,
+            ],
+        })
+        .collect::<Vec<_>>();
+    program.dispatch_many(device, queue_family_index, &batches)
+}
+
+fn dispatch_idwt_offset_line_batch(
+    device: &VulkanDevice,
+    queue_family_index: u32,
+    program: &StorageComputeProgram,
+    dispatches: &[IdwtOffsetLineDispatch<'_>],
 ) -> Result<(), VulkanError> {
     let descriptors = dispatches
         .iter()

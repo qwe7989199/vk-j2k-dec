@@ -57,7 +57,18 @@ pub struct GpuTier1CodeblockRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuTier1ScatterPlan {
     pub records: Vec<GpuTier1ScatterRecord>,
+    pub planes: Vec<GpuTier1ScatterPlane>,
     pub output_coefficients: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuTier1ScatterPlane {
+    pub component: u16,
+    pub resolution: u8,
+    pub subband: SubbandKind,
+    pub plane_offset: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[repr(C)]
@@ -282,6 +293,17 @@ impl GpuTier1Plan {
 
         Ok(GpuTier1ScatterPlan {
             records,
+            planes: plane_offsets
+                .iter()
+                .map(|plane| GpuTier1ScatterPlane {
+                    component: plane.component,
+                    resolution: plane.resolution,
+                    subband: plane.subband,
+                    plane_offset: plane.plane_offset,
+                    width: plane.layout.width,
+                    height: plane.layout.height,
+                })
+                .collect(),
             output_coefficients,
         })
     }
@@ -819,6 +841,17 @@ mod tests {
             .expect("scatter plan");
 
         assert_eq!(scatter.output_coefficients, 32);
+        assert_eq!(
+            scatter.planes,
+            vec![GpuTier1ScatterPlane {
+                component: 0,
+                resolution: 0,
+                subband: SubbandKind::Ll,
+                plane_offset: 0,
+                width: 8,
+                height: 4,
+            }]
+        );
         assert_eq!(
             scatter.records,
             vec![GpuTier1ScatterRecord {

@@ -373,6 +373,8 @@ tier1 gpu plan: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
     vulkan mq smoke: device NVIDIA GeForce RTX 5060, queue 2, cblk 0, context 0, 32 bits 0x08000200
     vulkan tier1 scatter smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 records, 6220800 plane coeff, upload 11.859 ms, dispatch 0.151 ms, readback 6.702 ms
     vulkan tier1 cleanup+scatter: device NVIDIA GeForce RTX 5060, queue 2, upload 2.242 ms, cleanup 60.267 ms, scatter 0.198 ms, readback 7.036 ms
+    vulkan scattered idwt53: device NVIDIA GeForce RTX 5060, queue 2, 3 components, upload 5.690 ms, dispatch 3.851 ms, readback 24.510 ms
+    vulkan cleanup+scatter+idwt53: device NVIDIA GeForce RTX 5060, queue 2, upload 2.195 ms, cleanup 60.337 ms, scatter 0.286 ms, idwt_dispatch 3.580 ms, idwt_alloc 3.854 ms, readback 7.339 ms
     vulkan tier1 full smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 cblk summaries, 3177152 coeff, first nonzero 2040, checksum 0xfffe2412
       tier1 full smoke timings: gpu_roundtrip 738.962 ms (upload 1.597, dispatch 59.746, readback 4.117), cpu_reference 262.726 ms
 tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 iteration(s)
@@ -405,6 +407,10 @@ Tier-1 output directly into GPU DWT without a CPU coefficient placement pass.
 The cleanup+scatter bench keeps that flat buffer device-local and records the
 cleanup and scatter shaders into the same command buffer loop; scatter adds
 effectively no hot-path cost beside MQ decode on the local frame.
+The cleanup+scatter+IDWT smoke then feeds the concatenated subband-plane buffer
+directly into an offset-aware 5/3 DWT shader. It avoids the standalone
+scatter-validation path's flat coefficient readback and re-upload, then compares
+all reconstructed component planes against the CPU 5/3 reference.
 
 - This sample is inside the first target profile.
 
@@ -543,6 +549,7 @@ Expected output:
 ```text
 compiled shaders\dequant.comp.glsl -> target\shaders\dequant.comp.spv
 compiled shaders\idwt53_1d.comp.glsl -> target\shaders\idwt53_1d.comp.spv
+compiled shaders\idwt53_offset_1d.comp.glsl -> target\shaders\idwt53_offset_1d.comp.spv
 compiled shaders\idwt97_1d.comp.glsl -> target\shaders\idwt97_1d.comp.spv
 compiled shaders\color_convert.comp.glsl -> target\shaders\color_convert.comp.spv
 compiled shaders\color_convert_i32.comp.glsl -> target\shaders\color_convert_i32.comp.spv

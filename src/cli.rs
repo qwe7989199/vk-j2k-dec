@@ -805,16 +805,15 @@ fn tier1_gpu_plan(path: &str) -> ExitCode {
                     };
                     let gpu_tier1_ms = elapsed_ms(gpu_tier1_start);
                     let cpu_tier1_start = Instant::now();
-                    let (expected, expected_coefficients) = match tier1_cleanup_smoke_expected_all(
-                        &bound.codeblocks,
-                        coefficient_reconstruction_for_transform(cod.transform),
-                    ) {
-                        Ok(expected) => expected,
-                        Err(err) => {
-                            eprintln!("tier1 gpu plan: CPU cleanup smoke failed: {err}");
-                            return ExitCode::FAILURE;
-                        }
-                    };
+                    let reconstruction = coefficient_reconstruction_for_transform(cod.transform);
+                    let (expected, expected_coefficients) =
+                        match tier1_cleanup_smoke_expected_all(&bound.codeblocks, reconstruction) {
+                            Ok(expected) => expected,
+                            Err(err) => {
+                                eprintln!("tier1 gpu plan: CPU cleanup smoke failed: {err}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
                     let cpu_tier1_ms = elapsed_ms(cpu_tier1_start);
                     if cleanup_smoke.output != expected {
                         eprintln!(
@@ -940,6 +939,141 @@ fn tier1_gpu_plan(path: &str) -> ExitCode {
                             cleanup_scatter_smoke.scatter_dispatch_ms,
                             cleanup_scatter_smoke.readback_ms
                         );
+                        let idwt53_offset_shader_path =
+                            "target\\shaders\\idwt53_offset_1d.comp.spv";
+                        if cod.transform == WaveletTransform::Reversible53
+                            && std::path::Path::new(idwt53_offset_shader_path).exists()
+                        {
+                            let scattered_idwt =
+                                match vk_j2k_dec::vulkan::run_idwt53_scattered_components(
+                                    idwt53_offset_shader_path,
+                                    &scatter_plan.planes,
+                                    &cleanup_scatter_smoke.plane_coefficients,
+                                    cod.decomposition_levels,
+                                ) {
+                                    Ok(result) => result,
+                                    Err(err) => {
+                                        eprintln!(
+                                            "tier1 gpu plan: Vulkan scattered IDWT failed: {err}"
+                                        );
+                                        return ExitCode::FAILURE;
+                                    }
+                                };
+                            let cpu_tile_planes =
+                                match TileCoefficientPlanes::decode_arithmetic_with_reconstruction(
+                                    &layout.components,
+                                    &bound,
+                                    cod.codeblock_style_flags(),
+                                    reconstruction,
+                                ) {
+                                    Ok(planes) => planes,
+                                    Err(err) => {
+                                        eprintln!(
+                                            "tier1 gpu plan: CPU scattered IDWT reference failed: {err}"
+                                        );
+                                        return ExitCode::FAILURE;
+                                    }
+                                };
+                            if scattered_idwt.planes.len() != cpu_tile_planes.components.len() {
+                                eprintln!(
+                                    "tier1 gpu plan: scattered IDWT component count mismatch: got {}, expected {}",
+                                    scattered_idwt.planes.len(),
+                                    cpu_tile_planes.components.len()
+                                );
+                                return ExitCode::FAILURE;
+                            }
+                            for (component_index, (gpu_plane, cpu_component)) in scattered_idwt
+                                .planes
+                                .iter()
+                                .zip(&cpu_tile_planes.components)
+                                .enumerate()
+                            {
+                                let cpu_plane = match cpu_component
+                                    .inverse_5_3_until(cod.decomposition_levels)
+                                {
+                                    Ok(plane) => plane,
+                                    Err(err) => {
+                                        eprintln!(
+                                            "tier1 gpu plan: CPU IDWT component {component_index} failed: {err}"
+                                        );
+                                        return ExitCode::FAILURE;
+                                    }
+                                };
+                                if gpu_plane != &cpu_plane {
+                                    let mismatch = gpu_plane
+                                        .samples
+                                        .iter()
+                                        .zip(&cpu_plane.samples)
+                                        .position(|(actual, expected)| actual != expected)
+                                        .unwrap_or(gpu_plane.samples.len());
+                                    eprintln!(
+                                        "tier1 gpu plan: scattered IDWT component {component_index} mismatch at {mismatch}: got {:?}, expected {:?}",
+                                        gpu_plane.samples.get(mismatch),
+                                        cpu_plane.samples.get(mismatch)
+                                    );
+                                    return ExitCode::FAILURE;
+                                }
+                            }
+                            println!(
+                                "    vulkan scattered idwt53: device {}, queue {}, {} components, upload {:.3} ms, dispatch {:.3} ms, readback {:.3} ms",
+                                scattered_idwt.device_name,
+                                scattered_idwt.queue_family_index,
+                                scattered_idwt.planes.len(),
+                                scattered_idwt.upload_ms,
+                                scattered_idwt.dispatch_ms,
+                                scattered_idwt.readback_ms
+                            );
+                            let combined_idwt =
+                                match vk_j2k_dec::vulkan::run_tier1_cleanup_scatter_idwt53_smoke(
+                                    cleanup_shader_path,
+                                    scatter_shader_path,
+                                    idwt53_offset_shader_path,
+                                    &records,
+                                    &compressed_words,
+                                    &scatter_plan.records,
+                                    &scatter_plan.planes,
+                                    scatter_plan.output_coefficients,
+                                    cod.decomposition_levels,
+                                ) {
+                                    Ok(result) => result,
+                                    Err(err) => {
+                                        eprintln!(
+                                            "tier1 gpu plan: Vulkan cleanup+scatter+IDWT failed: {err}"
+                                        );
+                                        return ExitCode::FAILURE;
+                                    }
+                                };
+                            if combined_idwt.output != expected {
+                                eprintln!(
+                                    "tier1 gpu plan: cleanup+scatter+IDWT summary mismatch: got {:?}, expected {:?}",
+                                    combined_idwt.output, expected
+                                );
+                                return ExitCode::FAILURE;
+                            }
+                            if combined_idwt.planes != scattered_idwt.planes {
+                                let mismatch_component = combined_idwt
+                                    .planes
+                                    .iter()
+                                    .zip(&scattered_idwt.planes)
+                                    .position(|(actual, expected)| actual != expected)
+                                    .unwrap_or(combined_idwt.planes.len());
+                                eprintln!(
+                                    "tier1 gpu plan: cleanup+scatter+IDWT component mismatch at {mismatch_component}"
+                                );
+                                return ExitCode::FAILURE;
+                            }
+                            println!(
+                                "    vulkan cleanup+scatter+idwt53: device {}, queue {}, upload {:.3} ms, cleanup {:.3} ms, scatter {:.3} ms, idwt_dispatch {:.3} ms, idwt_alloc {:.3} ms, readback {:.3} ms",
+                                combined_idwt.device_name,
+                                combined_idwt.queue_family_index,
+                                combined_idwt.upload_ms,
+                                combined_idwt.cleanup_dispatch_ms,
+                                combined_idwt.scatter_dispatch_ms,
+                                combined_idwt.idwt_dispatch_ms,
+                                combined_idwt.idwt_alloc_ms,
+                                combined_idwt.readback_ms
+                            );
+                        }
                     } else {
                         println!(
                             "    vulkan tier1 scatter smoke: skipped, missing {scatter_shader_path}"

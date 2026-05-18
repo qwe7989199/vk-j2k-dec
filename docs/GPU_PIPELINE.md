@@ -141,11 +141,18 @@ iteration. The scatter step is effectively hidden beside MQ decode time on the
 local frame, while avoiding the separate flat-coefficient upload that the
 standalone scatter smoke uses for validation.
 
-The Tier-1 decoder is still a correctness-first kernel and reads coefficients
-back for verification in the smoke path. The next implementation step is
-connecting the scatter output to downstream GPU DWT without readback and then
-replacing the one-invocation-per-codeblock Tier-1 shape with a more cooperative
-workgroup layout.
+`idwt53_offset_1d.comp.glsl` lets the DWT read LL/HL/LH/HH bands from a
+concatenated subband-plane buffer via element offsets. The
+cleanup+scatter+IDWT smoke now keeps Tier-1 output and scattered subband planes
+device-local through inverse 5/3, then reads back only the reconstructed
+component planes for validation. The local smoke reports about 60.3 ms cleanup,
+0.3 ms scatter, 3.6 ms IDWT dispatch, 3.9 ms IDWT allocation, and 7.3 ms final
+component-plane readback.
+
+The next implementation step is moving this combined GPU chain into the
+high-level `profile-rgb48-bench` path and connecting it to GPU color packing, so
+the fast path no longer does CPU coefficient placement or intermediate
+coefficient-plane transfers.
 
 ## Shader build
 
