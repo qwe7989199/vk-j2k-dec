@@ -33,7 +33,7 @@ layout(std430, set = 0, binding = 2) writeonly buffer Output {
     uint output_words[];
 };
 
-layout(std430, set = 0, binding = 3) writeonly buffer CoefficientsOut {
+layout(std430, set = 0, binding = 3) buffer CoefficientsOut {
     int output_coefficients[];
 };
 
@@ -43,6 +43,11 @@ layout(push_constant) uniform PushConstants {
 
 const uint MAX_COEFFS = 4096u;
 const uint MQ_CONTEXT_COUNT = 19u;
+const uint STATE_SIGNIFICANT = 1u;
+const uint STATE_NEGATIVE = 2u;
+const uint STATE_REFINED = 4u;
+const uint STATE_VISIT_SHIFT = 8u;
+const uint STATE_VISIT_MASK = 0xff00u;
 const uint MQ_QE[47] = uint[](
     0x5601u, 0x3401u, 0x1801u, 0x0ac1u, 0x0521u, 0x0221u,
     0x5601u, 0x5401u, 0x4801u, 0x3801u, 0x3001u, 0x2401u,
@@ -76,11 +81,8 @@ const uint MQ_SWITCH_MPS[47] = uint[](
 
 uint context_state[19];
 uint context_mps[19];
-uint significant[4096];
-uint negative_sign[4096];
-uint magnitude_refined[4096];
-uint visited_in_bitplane[4096];
-int coefficients[4096];
+shared uint coefficient_state[4096];
+shared uint neighbor_state[4096];
 Tier1Codeblock codeblock;
 uint byte_pos;
 uint c_reg;
@@ -94,9 +96,47 @@ uint uniform_bits;
 uint became_significant;
 uint visited;
 uint decoded_passes;
+uint visit_generation;
 
 uint index_at(uint x, uint y) {
     return y * codeblock.width + x;
+}
+
+uint coeff_offset(uint index) {
+    return codeblock.coefficient_offset + index;
+}
+
+uint state_at_index(uint index) {
+    return coefficient_state[index];
+}
+
+bool is_significant_index(uint index) {
+    return (state_at_index(index) & STATE_SIGNIFICANT) != 0u;
+}
+
+bool is_negative_index(uint index) {
+    return (state_at_index(index) & STATE_NEGATIVE) != 0u;
+}
+
+bool is_refined_index(uint index) {
+    return (state_at_index(index) & STATE_REFINED) != 0u;
+}
+
+bool is_visited_index(uint index) {
+    return ((state_at_index(index) & STATE_VISIT_MASK) >> STATE_VISIT_SHIFT) == visit_generation;
+}
+
+void mark_visited_index(uint index) {
+    coefficient_state[index] = (coefficient_state[index] & ~STATE_VISIT_MASK)
+        | (visit_generation << STATE_VISIT_SHIFT);
+}
+
+uint pack_neighbors(uint horizontal, uint vertical, uint diagonal) {
+    return horizontal | (vertical << 4u) | (diagonal << 8u);
+}
+
+uvec3 unpack_neighbors(uint packed) {
+    return uvec3(packed & 0xfu, (packed >> 4u) & 0xfu, (packed >> 8u) & 0xfu);
 }
 
 uint byte_at(uint index) {
@@ -187,25 +227,38 @@ uint sig_at(int x, int y) {
     if (x < 0 || y < 0 || x >= int(codeblock.width) || y >= int(codeblock.height)) {
         return 0u;
     }
-    return significant[index_at(uint(x), uint(y))];
+    return is_significant_index(index_at(uint(x), uint(y))) ? 1u : 0u;
 }
 
 uint sign_at(int x, int y) {
     if (x < 0 || y < 0 || x >= int(codeblock.width) || y >= int(codeblock.height)) {
         return 0u;
     }
-    return negative_sign[index_at(uint(x), uint(y))];
+    return is_negative_index(index_at(uint(x), uint(y))) ? 1u : 0u;
 }
 
 uvec3 neighbor_counts(uint x, uint y) {
+    return unpack_neighbors(neighbor_state[index_at(x, y)]);
+}
+
+void increment_neighbor(int x, int y, uint bit_shift) {
+    if (x < 0 || y < 0 || x >= int(codeblock.width) || y >= int(codeblock.height)) {
+        return;
+    }
+    neighbor_state[index_at(uint(x), uint(y))] += 1u << bit_shift;
+}
+
+void update_neighbors_for_significant(uint x, uint y) {
     int ix = int(x);
     int iy = int(y);
-    uint horizontal = sig_at(ix - 1, iy) + sig_at(ix + 1, iy);
-    uint vertical = sig_at(ix, iy - 1) + sig_at(ix, iy + 1);
-    uint diagonal =
-        sig_at(ix - 1, iy - 1) + sig_at(ix + 1, iy - 1) +
-        sig_at(ix - 1, iy + 1) + sig_at(ix + 1, iy + 1);
-    return uvec3(horizontal, vertical, diagonal);
+    increment_neighbor(ix - 1, iy, 0u);
+    increment_neighbor(ix + 1, iy, 0u);
+    increment_neighbor(ix, iy - 1, 4u);
+    increment_neighbor(ix, iy + 1, 4u);
+    increment_neighbor(ix - 1, iy - 1, 8u);
+    increment_neighbor(ix + 1, iy - 1, 8u);
+    increment_neighbor(ix - 1, iy + 1, 8u);
+    increment_neighbor(ix + 1, iy + 1, 8u);
 }
 
 uint lh_or_ll_context(uint primary, uint secondary, uint diagonal) {
@@ -285,22 +338,24 @@ bool cleanup_run_length_candidate(uint x, uint stripe_y) {
         uint y = stripe_y + y_offset;
         uint index = index_at(x, y);
         uvec3 n = neighbor_counts(x, y);
-        if (visited_in_bitplane[index] != 0u || significant[index] != 0u || (n.x + n.y + n.z) != 0u) {
+        if (is_visited_index(index) || is_significant_index(index) || (n.x + n.y + n.z) != 0u) {
             return false;
         }
     }
     return true;
 }
 
-void decode_significant_sample(uint x, uint y, uint bitplane) {
+void decode_significant_sample(uint x, uint y, uint bitplane, bool mark_visit) {
     uint index = index_at(x, y);
     uvec2 sc = sign_context(x, y);
     uint sign_bit = decode_bit(sc.x) ^ sc.y;
     int magnitude = int(1u << bitplane);
-    coefficients[index] = sign_bit != 0u ? -magnitude : magnitude;
-    significant[index] = 1u;
-    negative_sign[index] = sign_bit;
-    visited_in_bitplane[index] = 1u;
+    output_coefficients[coeff_offset(index)] = sign_bit != 0u ? -magnitude : magnitude;
+    update_neighbors_for_significant(x, y);
+    coefficient_state[index] = STATE_SIGNIFICANT | (sign_bit != 0u ? STATE_NEGATIVE : 0u);
+    if (mark_visit) {
+        mark_visited_index(index);
+    }
     sign_bits += 1u;
     significance_bits += 1u;
     became_significant += 1u;
@@ -309,26 +364,24 @@ void decode_significant_sample(uint x, uint y, uint bitplane) {
 
 void decode_cleanup_sample(uint x, uint y, uint bitplane) {
     uint index = index_at(x, y);
-    if (visited_in_bitplane[index] != 0u || significant[index] != 0u) {
+    if (is_visited_index(index) || is_significant_index(index)) {
         return;
     }
     uint is_significant = decode_bit(significance_context(x, y));
     if (is_significant != 0u) {
-        decode_significant_sample(x, y, bitplane);
+        decode_significant_sample(x, y, bitplane, false);
     } else {
-        visited_in_bitplane[index] = 1u;
         significance_bits += 1u;
         visited += 1u;
     }
 }
 
 void clear_bitplane_visits() {
-    for (uint i = 0u; i < codeblock.coefficient_count; i++) {
-        visited_in_bitplane[i] = 0u;
-    }
+    visit_generation += 1u;
 }
 
 void decode_cleanup_pass(uint bitplane) {
+    // Cleanup is the final pass for a bitplane; cleanup-only visits are counted but not reread.
     uint stripe_y = 0u;
     while (stripe_y < codeblock.height) {
         uint stripe_height = min(4u, codeblock.height - stripe_y);
@@ -337,21 +390,15 @@ void decode_cleanup_pass(uint bitplane) {
                 uint any_significant = decode_bit(17u);
                 run_length_bits += 1u;
                 if (any_significant == 0u) {
-                    for (uint y_offset = 0u; y_offset < 4u; y_offset++) {
-                        visited_in_bitplane[index_at(x, stripe_y + y_offset)] = 1u;
-                    }
                     significance_bits += 4u;
                     visited += 4u;
                     continue;
                 }
                 uint run = (decode_bit(18u) << 1u) | decode_bit(18u);
                 uniform_bits += 2u;
-                for (uint y_offset = 0u; y_offset < run; y_offset++) {
-                    visited_in_bitplane[index_at(x, stripe_y + y_offset)] = 1u;
-                }
                 significance_bits += run;
                 visited += run;
-                decode_significant_sample(x, stripe_y + run, bitplane);
+                decode_significant_sample(x, stripe_y + run, bitplane, false);
                 for (uint y_offset = run + 1u; y_offset < stripe_height; y_offset++) {
                     decode_cleanup_sample(x, stripe_y + y_offset, bitplane);
                 }
@@ -375,14 +422,14 @@ void decode_significance_pass(uint bitplane) {
                 uint y = stripe_y + y_offset;
                 uint index = index_at(x, y);
                 uvec3 n = neighbor_counts(x, y);
-                if (visited_in_bitplane[index] != 0u || significant[index] != 0u || (n.x + n.y + n.z) == 0u) {
+                if (is_visited_index(index) || is_significant_index(index) || (n.x + n.y + n.z) == 0u) {
                     continue;
                 }
                 uint is_significant = decode_bit(significance_context(x, y));
                 if (is_significant != 0u) {
-                    decode_significant_sample(x, y, bitplane);
+                    decode_significant_sample(x, y, bitplane, true);
                 } else {
-                    visited_in_bitplane[index] = 1u;
+                    mark_visited_index(index);
                     significance_bits += 1u;
                     visited += 1u;
                 }
@@ -401,16 +448,18 @@ void decode_refinement_pass(uint bitplane) {
             for (uint y_offset = 0u; y_offset < stripe_height; y_offset++) {
                 uint y = stripe_y + y_offset;
                 uint index = index_at(x, y);
-                if (visited_in_bitplane[index] != 0u || significant[index] == 0u) {
+                if (is_visited_index(index) || !is_significant_index(index)) {
                     continue;
                 }
                 uvec3 n = neighbor_counts(x, y);
-                uint context = magnitude_refined[index] != 0u ? 16u : ((n.x + n.y + n.z) != 0u ? 15u : 14u);
+                uint context = is_refined_index(index) ? 16u : ((n.x + n.y + n.z) != 0u ? 15u : 14u);
                 uint bit = decode_bit(context);
                 int delta = bit != 0u ? int(1u << bitplane) : 0;
-                coefficients[index] += negative_sign[index] != 0u ? -delta : delta;
-                magnitude_refined[index] = 1u;
-                visited_in_bitplane[index] = 1u;
+                uint offset = coeff_offset(index);
+                output_coefficients[offset] += is_negative_index(index) ? -delta : delta;
+                coefficient_state[index] = (coefficient_state[index] | STATE_REFINED)
+                    & ~STATE_VISIT_MASK;
+                coefficient_state[index] |= visit_generation << STATE_VISIT_SHIFT;
                 refinement_bits += 1u;
                 visited += 1u;
             }
@@ -434,12 +483,9 @@ void main() {
     context_state[0] = 4u;
     context_state[17] = 3u;
     context_state[18] = 46u;
-    for (uint i = 0u; i < MAX_COEFFS; i++) {
-        significant[i] = 0u;
-        negative_sign[i] = 0u;
-        magnitude_refined[i] = 0u;
-        visited_in_bitplane[i] = 0u;
-        coefficients[i] = 0;
+    for (uint i = 0u; i < codeblock.coefficient_count; i++) {
+        coefficient_state[i] = 0u;
+        neighbor_state[i] = 0u;
     }
 
     byte_pos = 0u;
@@ -457,6 +503,7 @@ void main() {
     became_significant = 0u;
     visited = 0u;
     decoded_passes = 0u;
+    visit_generation = 1u;
 
     uint first_bitplane = codeblock.magnitude_bitplanes - codeblock.zero_bit_planes - 1u;
     for (uint pass_index = 0u; pass_index < codeblock.pass_count; pass_index++) {
@@ -481,10 +528,13 @@ void main() {
     uint nonzero = 0u;
     uint checksum = 0u;
     for (uint i = 0u; i < codeblock.coefficient_count; i++) {
-        output_coefficients[codeblock.coefficient_offset + i] = coefficients[i];
-        if (coefficients[i] != 0) {
+        uint offset = codeblock.coefficient_offset + i;
+        if (is_significant_index(i)) {
+            int coefficient = output_coefficients[offset];
             nonzero += 1u;
-            checksum += uint(coefficients[i]);
+            checksum += uint(coefficient);
+        } else {
+            output_coefficients[offset] = 0;
         }
     }
     uint output_offset = codeblock_index * 9u;

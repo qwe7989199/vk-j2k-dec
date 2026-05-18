@@ -360,6 +360,7 @@ The Tier-1 GPU handoff experiment is exposed through:
 
 ```text
 cargo run --release -- tier1-gpu-plan target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
+cargo run --release -- tier1-gpu-bench target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 10
 ```
 
 Current local result:
@@ -371,7 +372,11 @@ tier1 gpu plan: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
     vulkan smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 records, 24256 byte words
     vulkan mq smoke: device NVIDIA GeForce RTX 5060, queue 2, cblk 0, context 0, 32 bits 0x08000200
     vulkan tier1 full smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 cblk summaries, 3177152 coeff, first nonzero 2040, checksum 0xfffe2412
-      tier1 full smoke timings: gpu_roundtrip 1112.020 ms, cpu_reference 262.901 ms
+      tier1 full smoke timings: gpu_roundtrip 752.463 ms (upload 1.356, dispatch 59.778, readback 4.207), cpu_reference 265.199 ms
+tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 iteration(s)
+  tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
+    vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 2.083 ms, hot_dispatch 593.012 ms total / 59.301 ms avg, readback 4.179 ms
+    cpu tier1 reference: 2652.393 ms total / 265.239 ms avg, hot GPU speedup 4.47x, first nonzero 2040, checksum 0xfffe2412
 ```
 
 The smoke shader reads the flattened codeblock records and the packed compressed
@@ -382,9 +387,12 @@ against the CPU `MqDecoder`. The full Tier-1 smoke runs every MQ-coded pass for
 every codeblock on GPU, including cleanup, significance propagation, magnitude
 refinement, run-length mode, significance contexts, sign contexts, and
 coefficient/significance state updates. It writes a flat GPU coefficient buffer
-and compares all 3,177,152 coefficients against CPU Tier-1. This is a
-correctness-oriented shader with per-invocation private state and full readback;
-it is intentionally not the optimized performance kernel yet.
+and compares all 3,177,152 coefficients against CPU Tier-1. The shader now keeps
+state in workgroup memory, caches neighbor counts, uses visit-generation bits
+instead of clearing visit flags every significance pass, and avoids cleanup-only
+visit writes that cannot be read again in the same bitplane. The benchmark mode
+creates the decode flow once, dispatches the same frame repeatedly, and reads
+back once for correctness.
 
 - This sample is inside the first target profile.
 
@@ -398,6 +406,7 @@ cargo run --release -- profile-rgb48 target\samples\test_j2k_rgb12_1080p24_3min_
 cargo run --release -- profile-rgb48 target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 4 cpu target\samples\profile_cpu_lowres4.rgb48le
 cargo run --release -- profile-rgb48 target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 0 gpu target\samples\profile_gpu_full.rgb48le
 cargo run --release -- profile-rgb48-bench target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 0 gpu 10 target\samples\bench_gpu_10.rgb48le
+cargo run --release -- tier1-gpu-bench target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 10
 ```
 
 Current local CPU full-resolution profile:

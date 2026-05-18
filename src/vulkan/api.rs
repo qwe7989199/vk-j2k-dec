@@ -208,6 +208,53 @@ impl StorageComputeProgram {
         )
     }
 
+    fn dispatch_repeated(
+        &self,
+        device: &VulkanDevice,
+        queue_family_index: u32,
+        descriptors: &[VkDescriptorBufferInfo],
+        push_constants: &[u8],
+        groups_x: u32,
+        groups_y: u32,
+        iterations: usize,
+    ) -> Result<(), VulkanError> {
+        if iterations == 0 {
+            return Ok(());
+        }
+        if descriptors.len() as u32 != self.binding_count {
+            return Err(VulkanError::new(format!(
+                "compute program expected {} descriptors, got {}",
+                self.binding_count,
+                descriptors.len()
+            )));
+        }
+        if push_constants.len() as u32 != self.push_constant_size {
+            return Err(VulkanError::new(format!(
+                "compute program expected {} push-constant bytes, got {}",
+                self.push_constant_size,
+                push_constants.len()
+            )));
+        }
+
+        let descriptor_pool = device.create_descriptor_pool(self.binding_count, 1)?;
+        let descriptor_set =
+            device.allocate_descriptor_set(descriptor_pool.handle, self.descriptor_set_layout.handle)?;
+        device.update_storage_descriptor_set(descriptor_set, descriptors);
+        let command_pool = device.create_command_pool(queue_family_index)?;
+        let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
+        let storage_dispatches = (0..iterations)
+            .map(|_| StorageDispatch {
+                pipeline: self.pipeline.handle,
+                pipeline_layout: self.pipeline_layout.handle,
+                descriptor_set,
+                push_constants,
+                groups: [groups_x, groups_y, 1],
+            })
+            .collect::<Vec<_>>();
+        device.record_storage_dispatches(command_buffer, &storage_dispatches)?;
+        device.submit_and_wait(command_buffer)
+    }
+
     fn dispatch_many(
         &self,
         device: &VulkanDevice,
@@ -285,12 +332,28 @@ pub struct Tier1MqSmokeResult {
     pub output: Vec<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Tier1CleanupSmokeResult {
     pub device_name: String,
     pub queue_family_index: u32,
     pub output: Vec<u32>,
     pub coefficients: Vec<i32>,
+    pub upload_ms: f64,
+    pub dispatch_ms: f64,
+    pub readback_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tier1CleanupBenchResult {
+    pub device_name: String,
+    pub queue_family_index: u32,
+    pub iterations: usize,
+    pub output: Vec<u32>,
+    pub coefficients: Vec<i32>,
+    pub setup_ms: f64,
+    pub dispatch_total_ms: f64,
+    pub dispatch_average_ms: f64,
+    pub readback_ms: f64,
 }
 
 #[repr(C)]
@@ -454,24 +517,7 @@ pub fn run_tier1_cleanup_smoke(
     records: &[crate::gpu::GpuTier1CodeblockRecord],
     compressed_words: &[u32],
 ) -> Result<Tier1CleanupSmokeResult, VulkanError> {
-    if records.is_empty() {
-        return Err(VulkanError::new(
-            "Tier-1 cleanup smoke requires at least one record",
-        ));
-    }
-    if compressed_words.is_empty() {
-        return Err(VulkanError::new(
-            "Tier-1 cleanup smoke requires compressed byte words",
-        ));
-    }
-    for (index, record) in records.iter().enumerate() {
-        if record.coefficient_count > 4096 {
-            return Err(VulkanError::new(format!(
-                "Tier-1 cleanup smoke supports up to 4096 coefficients, got {} for record {index}",
-                record.coefficient_count
-            )));
-        }
-    }
+    validate_tier1_cleanup_inputs(records, compressed_words)?;
     let spirv = read_spirv(shader_path)?;
     with_compute_device(|device, summary, queue_family_index| {
         let program = StorageComputeProgram::new(
@@ -480,30 +526,41 @@ pub fn run_tier1_cleanup_smoke(
             4,
             std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
         )?;
-        let records_buffer =
-            device.create_host_buffer(bytes_len::<crate::gpu::GpuTier1CodeblockRecord>(
-                records.len(),
-            )?)?;
-        records_buffer.write_slice(records)?;
-        let compressed_buffer =
-            device.create_host_buffer(bytes_len::<u32>(compressed_words.len())?)?;
-        compressed_buffer.write_slice(compressed_words)?;
+        let upload_start = std::time::Instant::now();
+        let records_buffer = create_device_buffer_from_slice(
+            device,
+            queue_family_index,
+            records,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let compressed_buffer = create_device_buffer_from_slice(
+            device,
+            queue_family_index,
+            compressed_words,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let upload_ms = upload_start.elapsed().as_secs_f64() * 1000.0;
+
         let output_len = records.len() * 9;
-        let output_seed = vec![0u32; output_len];
-        let output_buffer = device.create_host_buffer(bytes_len::<u32>(output_len)?)?;
-        output_buffer.write_slice(&output_seed)?;
+        let output_byte_len = bytes_len::<u32>(output_len)?;
+        let output_buffer = device.create_device_local_buffer(
+            output_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        )?;
         let coefficient_count = records
             .iter()
             .map(|record| record.coefficient_offset + record.coefficient_count)
             .max()
             .unwrap_or(0) as usize;
-        let coefficient_seed = vec![0i32; coefficient_count];
-        let coefficient_buffer =
-            device.create_host_buffer(bytes_len::<i32>(coefficient_count)?)?;
-        coefficient_buffer.write_slice(&coefficient_seed)?;
+        let coefficient_byte_len = bytes_len::<i32>(coefficient_count)?;
+        let coefficient_buffer = device.create_device_local_buffer(
+            coefficient_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        )?;
         let push = Tier1CleanupSmokePushConstants {
             codeblock_count: records.len() as u32,
         };
+        let dispatch_start = std::time::Instant::now();
         program.dispatch(
             device,
             queue_family_index,
@@ -517,16 +574,192 @@ pub fn run_tier1_cleanup_smoke(
             records.len() as u32,
             1,
         )?;
-        let output = output_buffer.read_vec::<u32>(output_len)?;
-        let coefficients = coefficient_buffer.read_vec::<i32>(coefficient_count)?;
+        let dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
+
+        let readback_start = std::time::Instant::now();
+        let output_staging =
+            device.create_host_cached_buffer(output_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+        let coefficient_staging = device
+            .create_host_cached_buffer(coefficient_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+        device.copy_buffers(
+            queue_family_index,
+            &[
+                BufferCopy {
+                    source: &output_buffer,
+                    destination: &output_staging,
+                    byte_len: output_byte_len,
+                },
+                BufferCopy {
+                    source: &coefficient_buffer,
+                    destination: &coefficient_staging,
+                    byte_len: coefficient_byte_len,
+                },
+            ],
+        )?;
+        let output = output_staging.read_vec::<u32>(output_len)?;
+        let coefficients = coefficient_staging.read_vec::<i32>(coefficient_count)?;
+        let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
         device.wait_idle()?;
         Ok(Tier1CleanupSmokeResult {
             device_name: summary.name.clone(),
             queue_family_index,
             output,
             coefficients,
+            upload_ms,
+            dispatch_ms,
+            readback_ms,
         })
     })
+}
+
+pub fn run_tier1_cleanup_bench(
+    shader_path: &str,
+    records: &[crate::gpu::GpuTier1CodeblockRecord],
+    compressed_words: &[u32],
+    iterations: usize,
+) -> Result<Tier1CleanupBenchResult, VulkanError> {
+    validate_tier1_cleanup_inputs(records, compressed_words)?;
+    if iterations == 0 {
+        return Err(VulkanError::new(
+            "Tier-1 cleanup bench requires at least one iteration",
+        ));
+    }
+    let spirv = read_spirv(shader_path)?;
+    with_compute_device(|device, summary, queue_family_index| {
+        let program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            4,
+            std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
+        )?;
+        let setup_start = std::time::Instant::now();
+        let records_buffer = create_device_buffer_from_slice(
+            device,
+            queue_family_index,
+            records,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let compressed_buffer = create_device_buffer_from_slice(
+            device,
+            queue_family_index,
+            compressed_words,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let output_len = records.len() * 9;
+        let output_byte_len = bytes_len::<u32>(output_len)?;
+        let output_buffer = device.create_device_local_buffer(
+            output_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        )?;
+        let coefficient_count = records
+            .iter()
+            .map(|record| record.coefficient_offset + record.coefficient_count)
+            .max()
+            .unwrap_or(0) as usize;
+        let coefficient_byte_len = bytes_len::<i32>(coefficient_count)?;
+        let coefficient_buffer = device.create_device_local_buffer(
+            coefficient_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        )?;
+        let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
+
+        let push = Tier1CleanupSmokePushConstants {
+            codeblock_count: records.len() as u32,
+        };
+        let descriptors = [
+            records_buffer.descriptor_info(),
+            compressed_buffer.descriptor_info(),
+            output_buffer.descriptor_info(),
+            coefficient_buffer.descriptor_info(),
+        ];
+        let dispatch_start = std::time::Instant::now();
+        program.dispatch_repeated(
+            device,
+            queue_family_index,
+            &descriptors,
+            bytes_of(&push),
+            records.len() as u32,
+            1,
+            iterations,
+        )?;
+        let dispatch_total_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
+
+        let readback_start = std::time::Instant::now();
+        let output_staging =
+            device.create_host_cached_buffer(output_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+        let coefficient_staging = device
+            .create_host_cached_buffer(coefficient_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+        device.copy_buffers(
+            queue_family_index,
+            &[
+                BufferCopy {
+                    source: &output_buffer,
+                    destination: &output_staging,
+                    byte_len: output_byte_len,
+                },
+                BufferCopy {
+                    source: &coefficient_buffer,
+                    destination: &coefficient_staging,
+                    byte_len: coefficient_byte_len,
+                },
+            ],
+        )?;
+        let output = output_staging.read_vec::<u32>(output_len)?;
+        let coefficients = coefficient_staging.read_vec::<i32>(coefficient_count)?;
+        let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
+        device.wait_idle()?;
+        Ok(Tier1CleanupBenchResult {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            iterations,
+            output,
+            coefficients,
+            setup_ms,
+            dispatch_total_ms,
+            dispatch_average_ms: dispatch_total_ms / iterations as f64,
+            readback_ms,
+        })
+    })
+}
+
+fn validate_tier1_cleanup_inputs(
+    records: &[crate::gpu::GpuTier1CodeblockRecord],
+    compressed_words: &[u32],
+) -> Result<(), VulkanError> {
+    if records.is_empty() {
+        return Err(VulkanError::new(
+            "Tier-1 cleanup requires at least one record",
+        ));
+    }
+    if compressed_words.is_empty() {
+        return Err(VulkanError::new(
+            "Tier-1 cleanup requires compressed byte words",
+        ));
+    }
+    for (index, record) in records.iter().enumerate() {
+        if record.coefficient_count > 4096 {
+            return Err(VulkanError::new(format!(
+                "Tier-1 cleanup supports up to 4096 coefficients, got {} for record {index}",
+                record.coefficient_count
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn create_device_buffer_from_slice<T: Copy>(
+    device: &VulkanDevice,
+    queue_family_index: u32,
+    values: &[T],
+    usage: VkFlags,
+) -> Result<HostBuffer, VulkanError> {
+    let byte_len = bytes_len::<T>(values.len())?;
+    let staging = device.create_host_cached_buffer(byte_len, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)?;
+    staging.write_slice(values)?;
+    let buffer =
+        device.create_device_local_buffer(byte_len, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+    device.copy_buffer(queue_family_index, &staging, &buffer, byte_len)?;
+    Ok(buffer)
 }
 
 pub fn run_dequant_smoke(shader_path: &str) -> Result<DequantSmokeResult, VulkanError> {

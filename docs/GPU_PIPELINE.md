@@ -104,14 +104,32 @@ it against real codeblock bytes. The CLI compares decoded bits, byte position,
 
 `tier1_cleanup_smoke.comp.glsl` now runs every MQ-coded pass for every real
 codeblock on GPU. It maintains per-coefficient significance/sign/refinement
-state, handles cleanup run-length coding, significance propagation, magnitude
-refinement, context selection, and exact reversible coefficient reconstruction.
-The current smoke writes a flat GPU coefficient buffer and compares all
-3,177,152 coefficients, MQ byte positions, and pass summary counters against CPU
-Tier-1. This is still a correctness kernel: it uses large private per-invocation
-state and reads coefficients back for verification. The next implementation step
-is replacing that private state shape with an efficient one-workgroup-per-codeblock
-layout and feeding the coefficient buffer directly into downstream GPU DWT.
+state plus cached neighbor counts in workgroup memory, handles cleanup
+run-length coding, significance propagation, magnitude refinement, context
+selection, and exact reversible coefficient reconstruction. The current smoke
+writes a flat GPU coefficient buffer and compares all 3,177,152 coefficients,
+MQ byte positions, and pass summary counters against CPU Tier-1.
+
+The hot Tier-1 bench command builds the Vulkan pipeline and buffers once, repeats
+the same frame in one command buffer, and reads back once for bit-exact
+validation:
+
+```powershell
+cargo run --release -- tier1-gpu-bench target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 10
+```
+
+Current local RTX 5060 result after device-local buffers, cached neighbor state,
+visit-generation tracking, and skipping cleanup-only visit writes:
+
+```text
+vulkan tier1 bench: setup 2.083 ms, hot_dispatch 593.012 ms total / 59.301 ms avg, readback 4.179 ms
+cpu tier1 reference: 2652.393 ms total / 265.239 ms avg, hot GPU speedup 4.47x
+```
+
+This is still a correctness-first kernel and reads coefficients back for
+verification. The next implementation step is feeding the flat coefficient
+buffer directly into downstream GPU DWT and then replacing the
+one-invocation-per-codeblock shape with a more cooperative workgroup layout.
 
 ## Shader build
 
