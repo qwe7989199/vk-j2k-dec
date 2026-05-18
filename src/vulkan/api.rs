@@ -356,6 +356,16 @@ pub struct Tier1CleanupBenchResult {
     pub readback_ms: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tier1ScatterSmokeResult {
+    pub device_name: String,
+    pub queue_family_index: u32,
+    pub output: Vec<i32>,
+    pub upload_ms: f64,
+    pub dispatch_ms: f64,
+    pub readback_ms: f64,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct Tier1PlanSmokePushConstants {
@@ -373,6 +383,12 @@ struct Tier1MqSmokePushConstants {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct Tier1CleanupSmokePushConstants {
+    codeblock_count: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Tier1ScatterSmokePushConstants {
     codeblock_count: u32,
 }
 
@@ -745,6 +761,145 @@ fn validate_tier1_cleanup_inputs(
         }
     }
     Ok(())
+}
+
+pub fn run_tier1_scatter_smoke(
+    shader_path: &str,
+    records: &[crate::gpu::GpuTier1ScatterRecord],
+    flat_coefficients: &[i32],
+    output_coefficients: usize,
+) -> Result<Tier1ScatterSmokeResult, VulkanError> {
+    if records.is_empty() {
+        return Err(VulkanError::new(
+            "Tier-1 scatter smoke requires at least one record",
+        ));
+    }
+    if flat_coefficients.is_empty() {
+        return Err(VulkanError::new(
+            "Tier-1 scatter smoke requires flat coefficients",
+        ));
+    }
+    if output_coefficients == 0 {
+        return Err(VulkanError::new(
+            "Tier-1 scatter smoke requires at least one output coefficient",
+        ));
+    }
+    let max_codeblock_coefficients = records
+        .iter()
+        .map(|record| record.coefficient_count)
+        .max()
+        .unwrap_or(0);
+    if max_codeblock_coefficients == 0 {
+        return Err(VulkanError::new(
+            "Tier-1 scatter smoke records must contain coefficients",
+        ));
+    }
+    for (index, record) in records.iter().enumerate() {
+        let source_end = record
+            .coefficient_offset
+            .checked_add(record.coefficient_count)
+            .ok_or_else(|| VulkanError::new(format!("scatter record {index} source overflows")))?;
+        if source_end as usize > flat_coefficients.len() {
+            return Err(VulkanError::new(format!(
+                "scatter record {index} source {}..{} outside {} coefficients",
+                record.coefficient_offset,
+                source_end,
+                flat_coefficients.len()
+            )));
+        }
+        let destination_end = record
+            .plane_offset
+            .checked_add(
+                record
+                    .plane_y0
+                    .checked_add(record.height.saturating_sub(1))
+                    .and_then(|y| y.checked_mul(record.plane_width))
+                    .and_then(|row| row.checked_add(record.plane_x0))
+                    .and_then(|offset| offset.checked_add(record.width))
+                    .ok_or_else(|| {
+                        VulkanError::new(format!("scatter record {index} destination overflows"))
+                    })?,
+            )
+            .ok_or_else(|| {
+                VulkanError::new(format!("scatter record {index} destination overflows"))
+            })?;
+        if destination_end as usize > output_coefficients {
+            return Err(VulkanError::new(format!(
+                "scatter record {index} destination exceeds {output_coefficients} coefficients"
+            )));
+        }
+    }
+
+    let spirv = read_spirv(shader_path)?;
+    with_compute_device(|device, summary, queue_family_index| {
+        let program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            3,
+            std::mem::size_of::<Tier1ScatterSmokePushConstants>() as u32,
+        )?;
+        let upload_start = std::time::Instant::now();
+        let records_buffer = create_device_buffer_from_slice(
+            device,
+            queue_family_index,
+            records,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let flat_buffer = create_device_buffer_from_slice(
+            device,
+            queue_family_index,
+            flat_coefficients,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let output_seed = vec![0i32; output_coefficients];
+        let output_buffer = create_device_buffer_from_slice(
+            device,
+            queue_family_index,
+            &output_seed,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        )?;
+        let upload_ms = upload_start.elapsed().as_secs_f64() * 1000.0;
+
+        let push = Tier1ScatterSmokePushConstants {
+            codeblock_count: records.len() as u32,
+        };
+        let dispatch_start = std::time::Instant::now();
+        program.dispatch(
+            device,
+            queue_family_index,
+            &[
+                records_buffer.descriptor_info(),
+                flat_buffer.descriptor_info(),
+                output_buffer.descriptor_info(),
+            ],
+            bytes_of(&push),
+            max_codeblock_coefficients.div_ceil(256),
+            records.len() as u32,
+        )?;
+        let dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
+
+        let readback_start = std::time::Instant::now();
+        let output_byte_len = bytes_len::<i32>(output_coefficients)?;
+        let output_staging =
+            device.create_host_cached_buffer(output_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+        device.copy_buffer(
+            queue_family_index,
+            &output_buffer,
+            &output_staging,
+            output_byte_len,
+        )?;
+        let output = output_staging.read_vec::<i32>(output_coefficients)?;
+        let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
+        device.wait_idle()?;
+        Ok(Tier1ScatterSmokeResult {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            output,
+            upload_ms,
+            dispatch_ms,
+            readback_ms,
+        })
+    })
 }
 
 fn create_device_buffer_from_slice<T: Copy>(

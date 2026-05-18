@@ -837,6 +837,67 @@ fn tier1_gpu_plan(path: &str) -> ExitCode {
                         );
                         return ExitCode::FAILURE;
                     }
+                    let scatter_shader_path = "target\\shaders\\tier1_scatter_smoke.comp.spv";
+                    if std::path::Path::new(scatter_shader_path).exists() {
+                        let scatter_plan = match plan.scatter_plan(&layout.components) {
+                            Ok(scatter_plan) => scatter_plan,
+                            Err(err) => {
+                                eprintln!("tier1 gpu plan: scatter plan failed: {err}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        let scatter_smoke = match vk_j2k_dec::vulkan::run_tier1_scatter_smoke(
+                            scatter_shader_path,
+                            &scatter_plan.records,
+                            &cleanup_smoke.coefficients,
+                            scatter_plan.output_coefficients,
+                        ) {
+                            Ok(smoke) => smoke,
+                            Err(err) => {
+                                eprintln!("tier1 gpu plan: Vulkan scatter smoke failed: {err}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        let expected_scatter = match tier1_scatter_expected(
+                            &scatter_plan.records,
+                            &expected_coefficients,
+                            scatter_plan.output_coefficients,
+                        ) {
+                            Ok(expected) => expected,
+                            Err(err) => {
+                                eprintln!("tier1 gpu plan: CPU scatter failed: {err}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        if scatter_smoke.output != expected_scatter {
+                            let mismatch = scatter_smoke
+                                .output
+                                .iter()
+                                .zip(&expected_scatter)
+                                .position(|(actual, expected)| actual != expected)
+                                .unwrap_or(scatter_smoke.output.len());
+                            eprintln!(
+                                "tier1 gpu plan: scatter mismatch at {mismatch}: got {:?}, expected {:?}",
+                                scatter_smoke.output.get(mismatch),
+                                expected_scatter.get(mismatch)
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                        println!(
+                            "    vulkan tier1 scatter smoke: device {}, queue {}, {} records, {} plane coeff, upload {:.3} ms, dispatch {:.3} ms, readback {:.3} ms",
+                            scatter_smoke.device_name,
+                            scatter_smoke.queue_family_index,
+                            scatter_plan.records.len(),
+                            scatter_smoke.output.len(),
+                            scatter_smoke.upload_ms,
+                            scatter_smoke.dispatch_ms,
+                            scatter_smoke.readback_ms
+                        );
+                    } else {
+                        println!(
+                            "    vulkan tier1 scatter smoke: skipped, missing {scatter_shader_path}"
+                        );
+                    }
                     println!(
                         "    vulkan tier1 full smoke: device {}, queue {}, {} cblk summaries, {} coeff, first nonzero {}, checksum 0x{:08x}",
                         cleanup_smoke.device_name,
@@ -1164,6 +1225,51 @@ fn tier1_cleanup_smoke_expected_all(
         coefficients.append(&mut codeblock_coefficients);
     }
     Ok((expected, coefficients))
+}
+
+fn tier1_scatter_expected(
+    records: &[vk_j2k_dec::gpu::GpuTier1ScatterRecord],
+    flat_coefficients: &[i32],
+    output_coefficients: usize,
+) -> Result<Vec<i32>, String> {
+    let mut output = vec![0i32; output_coefficients];
+    for (record_index, record) in records.iter().enumerate() {
+        if record.width == 0 || record.height == 0 {
+            return Err(format!(
+                "scatter record {record_index} has empty dimensions"
+            ));
+        }
+        if record.width.checked_mul(record.height) != Some(record.coefficient_count) {
+            return Err(format!(
+                "scatter record {record_index} dimensions {}x{} do not match {} coefficients",
+                record.width, record.height, record.coefficient_count
+            ));
+        }
+        let source_start = record.coefficient_offset as usize;
+        let source_end = source_start
+            .checked_add(record.coefficient_count as usize)
+            .ok_or_else(|| format!("scatter record {record_index} source overflows"))?;
+        if source_end > flat_coefficients.len() {
+            return Err(format!(
+                "scatter record {record_index} source {source_start}..{source_end} outside {} coefficients",
+                flat_coefficients.len()
+            ));
+        }
+        for y in 0..record.height {
+            for x in 0..record.width {
+                let source = source_start + (y * record.width + x) as usize;
+                let destination = record.plane_offset as usize
+                    + ((record.plane_y0 + y) * record.plane_width + record.plane_x0 + x) as usize;
+                let Some(slot) = output.get_mut(destination) else {
+                    return Err(format!(
+                        "scatter record {record_index} destination {destination} outside {output_coefficients} coefficients"
+                    ));
+                };
+                *slot = flat_coefficients[source];
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn elapsed_ms(start: Instant) -> f64 {

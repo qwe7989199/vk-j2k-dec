@@ -371,12 +371,13 @@ tier1 gpu plan: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
     first: C0 R0 LL cblk 0,0 60x34, bytes 0..2386, coeff 0..2040, passes 0..34
     vulkan smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 records, 24256 byte words
     vulkan mq smoke: device NVIDIA GeForce RTX 5060, queue 2, cblk 0, context 0, 32 bits 0x08000200
+    vulkan tier1 scatter smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 records, 6220800 plane coeff, upload 11.994 ms, dispatch 0.241 ms, readback 7.332 ms
     vulkan tier1 full smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 cblk summaries, 3177152 coeff, first nonzero 2040, checksum 0xfffe2412
-      tier1 full smoke timings: gpu_roundtrip 752.463 ms (upload 1.356, dispatch 59.778, readback 4.207), cpu_reference 265.199 ms
+      tier1 full smoke timings: gpu_roundtrip 827.450 ms (upload 1.437, dispatch 73.809, readback 4.525), cpu_reference 278.210 ms
 tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 iteration(s)
   tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
-    vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 2.083 ms, hot_dispatch 593.012 ms total / 59.301 ms avg, readback 4.179 ms
-    cpu tier1 reference: 2652.393 ms total / 265.239 ms avg, hot GPU speedup 4.47x, first nonzero 2040, checksum 0xfffe2412
+    vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 1.692 ms, hot_dispatch 644.523 ms total / 64.452 ms avg, readback 4.361 ms
+    cpu tier1 reference: 3009.618 ms total / 300.962 ms avg, hot GPU speedup 4.67x, first nonzero 2040, checksum 0xfffe2412
 ```
 
 The smoke shader reads the flattened codeblock records and the packed compressed
@@ -393,6 +394,11 @@ instead of clearing visit flags every significance pass, and avoids cleanup-only
 visit writes that cannot be read again in the same bitplane. The benchmark mode
 creates the decode flow once, dispatches the same frame repeatedly, and reads
 back once for correctness.
+
+The scatter smoke is the next GPU handoff step: it uses precomputed codeblock
+rectangles to scatter the flat Tier-1 coefficient buffer into concatenated
+component/subband plane storage. That validates the layout needed to feed GPU
+Tier-1 output directly into GPU DWT without a CPU coefficient placement pass.
 
 - This sample is inside the first target profile.
 
@@ -537,6 +543,7 @@ compiled shaders\color_convert_i32.comp.glsl -> target\shaders\color_convert_i32
 compiled shaders\tier1_plan_smoke.comp.glsl -> target\shaders\tier1_plan_smoke.comp.spv
 compiled shaders\tier1_mq_smoke.comp.glsl -> target\shaders\tier1_mq_smoke.comp.spv
 compiled shaders\tier1_cleanup_smoke.comp.glsl -> target\shaders\tier1_cleanup_smoke.comp.spv
+compiled shaders\tier1_scatter_smoke.comp.glsl -> target\shaders\tier1_scatter_smoke.comp.spv
 ```
 
 Device enumeration:

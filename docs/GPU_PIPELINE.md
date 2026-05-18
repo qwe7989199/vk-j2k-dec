@@ -122,14 +122,23 @@ Current local RTX 5060 result after device-local buffers, cached neighbor state,
 visit-generation tracking, and skipping cleanup-only visit writes:
 
 ```text
-vulkan tier1 bench: setup 2.083 ms, hot_dispatch 593.012 ms total / 59.301 ms avg, readback 4.179 ms
-cpu tier1 reference: 2652.393 ms total / 265.239 ms avg, hot GPU speedup 4.47x
+vulkan tier1 bench: setup 1.692 ms, hot_dispatch 644.523 ms total / 64.452 ms avg, readback 4.361 ms
+cpu tier1 reference: 3009.618 ms total / 300.962 ms avg, hot GPU speedup 4.67x
 ```
 
-This is still a correctness-first kernel and reads coefficients back for
-verification. The next implementation step is feeding the flat coefficient
-buffer directly into downstream GPU DWT and then replacing the
-one-invocation-per-codeblock shape with a more cooperative workgroup layout.
+`tier1_scatter_smoke.comp.glsl` is the first handoff shader after GPU Tier-1. It
+maps the flat per-codeblock coefficient buffer into concatenated component
+subband planes using precomputed codeblock rectangles. On the local frame it
+scatters 879 codeblocks into 6,220,800 plane coefficients with sub-millisecond
+shader dispatch; the current smoke still uploads/zeros/readbacks for validation, but
+the dispatch itself is small enough that the next useful step is keeping those
+plane buffers device-local and feeding them directly into DWT.
+
+The Tier-1 decoder is still a correctness-first kernel and reads coefficients
+back for verification in the smoke path. The next implementation step is
+connecting the scatter output to downstream GPU DWT without readback and then
+replacing the one-invocation-per-codeblock Tier-1 shape with a more cooperative
+workgroup layout.
 
 ## Shader build
 

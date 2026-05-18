@@ -54,6 +54,25 @@ pub struct GpuTier1CodeblockRecord {
     pub _padding: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuTier1ScatterPlan {
+    pub records: Vec<GpuTier1ScatterRecord>,
+    pub output_coefficients: usize,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GpuTier1ScatterRecord {
+    pub coefficient_offset: u32,
+    pub coefficient_count: u32,
+    pub width: u32,
+    pub height: u32,
+    pub plane_offset: u32,
+    pub plane_width: u32,
+    pub plane_x0: u32,
+    pub plane_y0: u32,
+}
+
 impl GpuTier1Plan {
     pub fn from_bound_work_plan(
         work_plan: &Tier1BoundWorkPlan<'_>,
@@ -154,6 +173,126 @@ impl GpuTier1Plan {
                 .fold(0u32, |sum, byte| sum.wrapping_add(u32::from(*byte))),
         )
     }
+
+    pub fn scatter_plan(
+        &self,
+        component_layouts: &[crate::codestream::TileComponentLayout],
+    ) -> Result<GpuTier1ScatterPlan, Tier1DecodeError> {
+        let mut plane_offsets = Vec::new();
+        let mut output_coefficients = 0usize;
+        for (component, component_layout) in component_layouts.iter().enumerate() {
+            let component = u16::try_from(component)
+                .map_err(|_| Tier1DecodeError::new("Tier-1 scatter component index exceeds u16"))?;
+            for resolution in &component_layout.resolutions {
+                for subband in &resolution.subbands {
+                    let plane_offset =
+                        checked_u32(output_coefficients, "Tier-1 scatter plane offset")?;
+                    let plane_samples = usize::try_from(subband.width)
+                        .ok()
+                        .and_then(|width| {
+                            usize::try_from(subband.height)
+                                .ok()
+                                .and_then(|height| width.checked_mul(height))
+                        })
+                        .ok_or_else(|| {
+                            Tier1DecodeError::new("Tier-1 scatter plane size overflow")
+                        })?;
+                    output_coefficients = output_coefficients
+                        .checked_add(plane_samples)
+                        .ok_or_else(|| {
+                            Tier1DecodeError::new("Tier-1 scatter output size overflow")
+                        })?;
+                    plane_offsets.push(GpuTier1PlaneOffset {
+                        component,
+                        resolution: resolution.level,
+                        subband: subband.kind,
+                        plane_offset,
+                        layout: subband,
+                    });
+                }
+            }
+        }
+
+        let mut records = Vec::with_capacity(self.codeblocks.len());
+        for codeblock in &self.codeblocks {
+            let plane = plane_offsets
+                .iter()
+                .find(|plane| {
+                    plane.component == codeblock.component
+                        && plane.resolution == codeblock.resolution
+                        && plane.subband == codeblock.subband
+                })
+                .ok_or_else(|| {
+                    Tier1DecodeError::new(format!(
+                        "Tier-1 scatter missing plane C{} R{} {}",
+                        codeblock.component, codeblock.resolution, codeblock.subband
+                    ))
+                })?;
+            let rect = plane
+                .layout
+                .codeblock_rect(codeblock.codeblock_x, codeblock.codeblock_y)
+                .ok_or_else(|| {
+                    Tier1DecodeError::new(format!(
+                        "Tier-1 scatter codeblock {},{} outside C{} R{} {}",
+                        codeblock.codeblock_x,
+                        codeblock.codeblock_y,
+                        codeblock.component,
+                        codeblock.resolution,
+                        codeblock.subband
+                    ))
+                })?;
+            if rect.width() != codeblock.width || rect.height() != codeblock.height {
+                return Err(Tier1DecodeError::new(format!(
+                    "Tier-1 scatter codeblock C{} R{} {} {},{} has {}x{}, expected {}x{} from layout",
+                    codeblock.component,
+                    codeblock.resolution,
+                    codeblock.subband,
+                    codeblock.codeblock_x,
+                    codeblock.codeblock_y,
+                    codeblock.width,
+                    codeblock.height,
+                    rect.width(),
+                    rect.height()
+                )));
+            }
+            if codeblock.width.checked_mul(codeblock.height) != Some(codeblock.coefficient_count) {
+                return Err(Tier1DecodeError::new(format!(
+                    "Tier-1 scatter codeblock C{} R{} {} {},{} dimensions {}x{} do not match {} coefficients",
+                    codeblock.component,
+                    codeblock.resolution,
+                    codeblock.subband,
+                    codeblock.codeblock_x,
+                    codeblock.codeblock_y,
+                    codeblock.width,
+                    codeblock.height,
+                    codeblock.coefficient_count
+                )));
+            }
+            records.push(GpuTier1ScatterRecord {
+                coefficient_offset: codeblock.coefficient_offset,
+                coefficient_count: codeblock.coefficient_count,
+                width: codeblock.width,
+                height: codeblock.height,
+                plane_offset: plane.plane_offset,
+                plane_width: plane.layout.width,
+                plane_x0: rect.x0,
+                plane_y0: rect.y0,
+            });
+        }
+
+        Ok(GpuTier1ScatterPlan {
+            records,
+            output_coefficients,
+        })
+    }
+}
+
+struct GpuTier1PlaneOffset<'a> {
+    component: u16,
+    resolution: u8,
+    subband: SubbandKind,
+    plane_offset: u32,
+    layout: &'a crate::codestream::SubbandLayout,
 }
 
 impl From<&GpuTier1Codeblock> for GpuTier1CodeblockRecord {
@@ -625,8 +764,75 @@ mod tests {
     use super::*;
     use crate::codestream::{
         CodSegment, ComponentSpec, ProgressionOrder, QccSegment, QcdSegment, QuantizationStyle,
-        SizSegment, SubbandKind,
+        ResolutionLayout, SizSegment, SubbandKind, SubbandLayout, TileComponentLayout,
     };
+
+    #[test]
+    fn tier1_scatter_plan_maps_codeblocks_into_planes() {
+        let component_layout = TileComponentLayout {
+            width: 8,
+            height: 4,
+            resolutions: vec![ResolutionLayout {
+                level: 0,
+                width: 8,
+                height: 4,
+                precincts_x: 1,
+                precincts_y: 1,
+                subbands: vec![SubbandLayout {
+                    kind: SubbandKind::Ll,
+                    width: 8,
+                    height: 4,
+                    codeblock_width: 4,
+                    codeblock_height: 4,
+                    codeblocks_x: 2,
+                    codeblocks_y: 1,
+                }],
+            }],
+        };
+        let plan = GpuTier1Plan {
+            codeblocks: vec![GpuTier1Codeblock {
+                component: 0,
+                resolution: 0,
+                subband: SubbandKind::Ll,
+                codeblock_x: 1,
+                codeblock_y: 0,
+                width: 4,
+                height: 4,
+                magnitude_bitplanes: 8,
+                zero_bit_planes: 0,
+                byte_offset: 0,
+                byte_len: 3,
+                coefficient_offset: 16,
+                coefficient_count: 16,
+                pass_offset: 0,
+                pass_count: 1,
+            }],
+            compressed_bytes: vec![0, 0, 0],
+            total_passes: 1,
+            arithmetic_passes: 1,
+            raw_bypass_passes: 0,
+            output_coefficients: 32,
+        };
+
+        let scatter = plan
+            .scatter_plan(&[component_layout])
+            .expect("scatter plan");
+
+        assert_eq!(scatter.output_coefficients, 32);
+        assert_eq!(
+            scatter.records,
+            vec![GpuTier1ScatterRecord {
+                coefficient_offset: 16,
+                coefficient_count: 16,
+                width: 4,
+                height: 4,
+                plane_offset: 0,
+                plane_width: 8,
+                plane_x0: 4,
+                plane_y0: 0,
+            }]
+        );
+    }
 
     #[test]
     fn builds_gpu_plan_for_reversible_rgb12_codestream() {
