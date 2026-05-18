@@ -98,6 +98,20 @@ byte checksums on GPU. On the local RGB12 frame this covers 879 records, 97,023
 compressed bytes, and 25,206 MQ passes. This is not a Tier-1 decoder yet, but it
 locks down the SSBO shape needed for the real MQ/codeblock shader.
 
+`tier1_mq_smoke.comp.glsl` ports the MQ arithmetic decoder core to GLSL and runs
+it against real codeblock bytes. The CLI compares decoded bits, byte position,
+`A/C/CT` registers, and context state against the CPU `MqDecoder`.
+
+`tier1_cleanup_smoke.comp.glsl` takes the next step and decodes the first
+cleanup pass for one real codeblock on GPU. It maintains per-coefficient
+significance/sign/coefficient state, handles cleanup run-length coding,
+significance context selection, sign context selection, and exact reversible
+coefficient reconstruction. The current smoke compares GPU nonzero count,
+coefficient checksum, MQ byte position, and pass summary counters against the
+CPU Tier-1 pass. The next implementation step is changing this from a one-block
+smoke into a one-workgroup-per-codeblock kernel that writes coefficient planes or
+a compact coefficient buffer for the downstream GPU DWT path.
+
 ## Shader build
 
 Compile and validate the current compute shaders with:

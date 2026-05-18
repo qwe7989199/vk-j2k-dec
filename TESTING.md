@@ -369,11 +369,18 @@ tier1 gpu plan: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
   tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
     first: C0 R0 LL cblk 0,0 60x34, bytes 0..2386, coeff 0..2040, passes 0..34
     vulkan smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 records, 24256 byte words
+    vulkan mq smoke: device NVIDIA GeForce RTX 5060, queue 2, cblk 0, context 0, 32 bits 0x08000200
+    vulkan cleanup smoke: device NVIDIA GeForce RTX 5060, queue 2, cblk 0, nonzero 897, checksum 0xfff58800
 ```
 
 The smoke shader reads the flattened codeblock records and the packed compressed
 byte stream on GPU, then validates per-codeblock byte ranges and checksums
-against the CPU plan.
+against the CPU plan. The MQ smoke runs the JPEG 2000 MQ state machine on the
+GPU against real codeblock bytes and compares the decoded bits plus registers
+against the CPU `MqDecoder`. The cleanup smoke runs the first cleanup pass for
+the first codeblock on GPU, including run-length mode, significance contexts,
+sign contexts, and coefficient/significance state updates, then compares the
+summary and coefficient checksum against the CPU Tier-1 pass.
 
 - This sample is inside the first target profile.
 
@@ -515,6 +522,8 @@ compiled shaders\idwt97_1d.comp.glsl -> target\shaders\idwt97_1d.comp.spv
 compiled shaders\color_convert.comp.glsl -> target\shaders\color_convert.comp.spv
 compiled shaders\color_convert_i32.comp.glsl -> target\shaders\color_convert_i32.comp.spv
 compiled shaders\tier1_plan_smoke.comp.glsl -> target\shaders\tier1_plan_smoke.comp.spv
+compiled shaders\tier1_mq_smoke.comp.glsl -> target\shaders\tier1_mq_smoke.comp.spv
+compiled shaders\tier1_cleanup_smoke.comp.glsl -> target\shaders\tier1_cleanup_smoke.comp.spv
 ```
 
 Device enumeration:

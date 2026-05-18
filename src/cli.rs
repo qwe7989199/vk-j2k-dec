@@ -6,7 +6,10 @@ use vk_j2k_dec::codestream::{Codestream, WaveletTransform, scan_codestreams};
 use vk_j2k_dec::gpu::{GpuDwtDispatchPlan, GpuPipelinePlan, GpuTier1Plan};
 use vk_j2k_dec::packet::{TilePacketHeaderState, parse_lrcp_tile_packets};
 use vk_j2k_dec::reconstruct::TileCoefficientPlanes;
-use vk_j2k_dec::tier1::{CoefficientReconstruction, Tier1WorkPlan};
+use vk_j2k_dec::tier1::{
+    BoundCompressedCodeblock, CoefficientReconstruction, DecodedCodeblock, MqDecoder,
+    Tier1WorkPlan, tier1_pass_for_index,
+};
 
 mod raw;
 mod scan;
@@ -743,11 +746,173 @@ fn tier1_gpu_plan(path: &str) -> ExitCode {
                 records.len(),
                 compressed_words.len()
             );
+            let mq_shader_path = "target\\shaders\\tier1_mq_smoke.comp.spv";
+            if std::path::Path::new(mq_shader_path).exists() {
+                let mq_smoke = match vk_j2k_dec::vulkan::run_tier1_mq_smoke(
+                    mq_shader_path,
+                    &records,
+                    &compressed_words,
+                    0,
+                    32,
+                    0,
+                ) {
+                    Ok(smoke) => smoke,
+                    Err(err) => {
+                        eprintln!("tier1 gpu plan: Vulkan MQ smoke failed: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let expected = match tier1_mq_smoke_expected(&plan, 0, 32, 0) {
+                    Ok(expected) => expected,
+                    Err(err) => {
+                        eprintln!("tier1 gpu plan: CPU MQ smoke failed: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if mq_smoke.output != expected {
+                    eprintln!(
+                        "tier1 gpu plan: MQ smoke mismatch: got {:?}, expected {:?}",
+                        mq_smoke.output, expected
+                    );
+                    return ExitCode::FAILURE;
+                }
+                println!(
+                    "    vulkan mq smoke: device {}, queue {}, cblk 0, context 0, 32 bits 0x{:08x}",
+                    mq_smoke.device_name, mq_smoke.queue_family_index, mq_smoke.output[0]
+                );
+                let cleanup_shader_path = "target\\shaders\\tier1_cleanup_smoke.comp.spv";
+                if std::path::Path::new(cleanup_shader_path).exists() {
+                    let cleanup_smoke = match vk_j2k_dec::vulkan::run_tier1_cleanup_smoke(
+                        cleanup_shader_path,
+                        &records,
+                        &compressed_words,
+                        0,
+                    ) {
+                        Ok(smoke) => smoke,
+                        Err(err) => {
+                            eprintln!("tier1 gpu plan: Vulkan cleanup smoke failed: {err}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    let Some(first_bound) = bound.codeblocks.first() else {
+                        eprintln!("tier1 gpu plan: CPU cleanup smoke missing first codeblock");
+                        return ExitCode::FAILURE;
+                    };
+                    let expected = match tier1_cleanup_smoke_expected(
+                        first_bound,
+                        coefficient_reconstruction_for_transform(cod.transform),
+                    ) {
+                        Ok(expected) => expected,
+                        Err(err) => {
+                            eprintln!("tier1 gpu plan: CPU cleanup smoke failed: {err}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    if cleanup_smoke.output != expected {
+                        eprintln!(
+                            "tier1 gpu plan: cleanup smoke mismatch: got {:?}, expected {:?}",
+                            cleanup_smoke.output, expected
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    println!(
+                        "    vulkan cleanup smoke: device {}, queue {}, cblk 0, nonzero {}, checksum 0x{:08x}",
+                        cleanup_smoke.device_name,
+                        cleanup_smoke.queue_family_index,
+                        cleanup_smoke.output[0],
+                        cleanup_smoke.output[1]
+                    );
+                } else {
+                    println!("    vulkan cleanup smoke: skipped, missing {cleanup_shader_path}");
+                }
+            } else {
+                println!("    vulkan mq smoke: skipped, missing {mq_shader_path}");
+            }
         } else {
             println!("    vulkan smoke: skipped, missing {shader_path}");
         }
     }
     ExitCode::SUCCESS
+}
+
+fn tier1_mq_smoke_expected(
+    plan: &GpuTier1Plan,
+    codeblock_index: usize,
+    bit_count: u32,
+    context_index: usize,
+) -> Result<Vec<u32>, String> {
+    let codeblock = plan
+        .codeblocks
+        .get(codeblock_index)
+        .ok_or_else(|| format!("missing codeblock {codeblock_index}"))?;
+    let start = codeblock.byte_offset as usize;
+    let end = start
+        .checked_add(codeblock.byte_len as usize)
+        .ok_or_else(|| "codeblock byte range overflow".to_string())?;
+    let bytes = plan
+        .compressed_bytes
+        .get(start..end)
+        .ok_or_else(|| format!("codeblock {codeblock_index} byte range outside stream"))?;
+    let mut mq = MqDecoder::with_data(bytes);
+    let mut bits = 0u32;
+    for _ in 0..bit_count.min(32) {
+        let bit = mq
+            .decode_bit(context_index)
+            .map_err(|err| err.to_string())?;
+        bits = (bits << 1) | if bit { 1 } else { 0 };
+    }
+    let registers = mq.input_registers();
+    let context = mq
+        .context(context_index)
+        .ok_or_else(|| format!("missing MQ context {context_index}"))?;
+    Ok(vec![
+        bits,
+        u32::try_from(registers.byte_pos).map_err(|_| "MQ byte_pos exceeds u32".to_string())?,
+        registers.a,
+        registers.c,
+        registers.ct,
+        u32::from(context.state) | ((if context.mps { 1 } else { 0 }) << 8),
+    ])
+}
+
+fn tier1_cleanup_smoke_expected(
+    codeblock: &BoundCompressedCodeblock<'_>,
+    reconstruction: CoefficientReconstruction,
+) -> Result<Vec<u32>, String> {
+    let pass = tier1_pass_for_index(codeblock.magnitude_bitplanes, codeblock.zero_bit_planes, 0);
+    let mut decoded = DecodedCodeblock::new_bound_with_reconstruction(codeblock, reconstruction)
+        .map_err(|err| err.to_string())?;
+    let mut mq = if codeblock.segments.len() == 1 {
+        MqDecoder::with_data(codeblock.segments[0].data)
+    } else {
+        let mut data = Vec::with_capacity(codeblock.total_bytes());
+        for segment in &codeblock.segments {
+            data.extend_from_slice(segment.data);
+        }
+        MqDecoder::with_owned_data(data)
+    };
+    let summary = decoded
+        .decode_pass(pass, &mut mq)
+        .map_err(|err| err.to_string())?;
+    let mut nonzero = 0u32;
+    let mut checksum = 0u32;
+    for coefficient in &decoded.coefficients {
+        if *coefficient != 0 {
+            nonzero += 1;
+            checksum = checksum.wrapping_add(*coefficient as u32);
+        }
+    }
+    Ok(vec![
+        nonzero,
+        checksum,
+        u32::try_from(mq.consumed_bytes()).map_err(|_| "MQ byte_pos exceeds u32".to_string())?,
+        summary.significance_bits,
+        summary.sign_bits,
+        summary.run_length_bits,
+        summary.uniform_bits,
+        summary.became_significant,
+        summary.visited,
+    ])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

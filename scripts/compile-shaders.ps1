@@ -23,7 +23,9 @@ $shaders = @(
     @{ Source = "shaders\idwt97_1d.comp.glsl"; Output = "idwt97_1d.comp.spv" },
     @{ Source = "shaders\color_convert.comp.glsl"; Output = "color_convert.comp.spv" },
     @{ Source = "shaders\color_convert_i32.comp.glsl"; Output = "color_convert_i32.comp.spv" },
-    @{ Source = "shaders\tier1_plan_smoke.comp.glsl"; Output = "tier1_plan_smoke.comp.spv" }
+    @{ Source = "shaders\tier1_plan_smoke.comp.glsl"; Output = "tier1_plan_smoke.comp.spv" },
+    @{ Source = "shaders\tier1_mq_smoke.comp.glsl"; Output = "tier1_mq_smoke.comp.spv" },
+    @{ Source = "shaders\tier1_cleanup_smoke.comp.glsl"; Output = "tier1_cleanup_smoke.comp.spv" }
 )
 
 foreach ($shader in $shaders) {

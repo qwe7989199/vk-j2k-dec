@@ -278,10 +278,38 @@ pub struct Tier1PlanSmokeResult {
     pub output: Vec<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tier1MqSmokeResult {
+    pub device_name: String,
+    pub queue_family_index: u32,
+    pub output: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tier1CleanupSmokeResult {
+    pub device_name: String,
+    pub queue_family_index: u32,
+    pub output: Vec<u32>,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct Tier1PlanSmokePushConstants {
     codeblock_count: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Tier1MqSmokePushConstants {
+    codeblock_index: u32,
+    bit_count: u32,
+    context_index: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Tier1CleanupSmokePushConstants {
+    codeblock_index: u32,
 }
 
 pub fn run_tier1_plan_smoke(
@@ -337,6 +365,154 @@ pub fn run_tier1_plan_smoke(
         let output = output_buffer.read_vec::<u32>(output_len)?;
         device.wait_idle()?;
         Ok(Tier1PlanSmokeResult {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            output,
+        })
+    })
+}
+
+pub fn run_tier1_mq_smoke(
+    shader_path: &str,
+    records: &[crate::gpu::GpuTier1CodeblockRecord],
+    compressed_words: &[u32],
+    codeblock_index: u32,
+    bit_count: u32,
+    context_index: u32,
+) -> Result<Tier1MqSmokeResult, VulkanError> {
+    if records.is_empty() {
+        return Err(VulkanError::new(
+            "Tier-1 MQ smoke requires at least one record",
+        ));
+    }
+    if codeblock_index as usize >= records.len() {
+        return Err(VulkanError::new(format!(
+            "Tier-1 MQ smoke codeblock index {codeblock_index} outside {} records",
+            records.len()
+        )));
+    }
+    if compressed_words.is_empty() {
+        return Err(VulkanError::new(
+            "Tier-1 MQ smoke requires compressed byte words",
+        ));
+    }
+    if bit_count == 0 || bit_count > 32 {
+        return Err(VulkanError::new(format!(
+            "Tier-1 MQ smoke bit count must be 1..32, got {bit_count}"
+        )));
+    }
+    let spirv = read_spirv(shader_path)?;
+    with_compute_device(|device, summary, queue_family_index| {
+        let program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            3,
+            std::mem::size_of::<Tier1MqSmokePushConstants>() as u32,
+        )?;
+        let records_buffer =
+            device.create_host_buffer(bytes_len::<crate::gpu::GpuTier1CodeblockRecord>(
+                records.len(),
+            )?)?;
+        records_buffer.write_slice(records)?;
+        let compressed_buffer =
+            device.create_host_buffer(bytes_len::<u32>(compressed_words.len())?)?;
+        compressed_buffer.write_slice(compressed_words)?;
+        let output_len = 6usize;
+        let output_seed = vec![0u32; output_len];
+        let output_buffer = device.create_host_buffer(bytes_len::<u32>(output_len)?)?;
+        output_buffer.write_slice(&output_seed)?;
+        let push = Tier1MqSmokePushConstants {
+            codeblock_index,
+            bit_count,
+            context_index,
+        };
+        program.dispatch(
+            device,
+            queue_family_index,
+            &[
+                records_buffer.descriptor_info(),
+                compressed_buffer.descriptor_info(),
+                output_buffer.descriptor_info(),
+            ],
+            bytes_of(&push),
+            1,
+            1,
+        )?;
+        let output = output_buffer.read_vec::<u32>(output_len)?;
+        device.wait_idle()?;
+        Ok(Tier1MqSmokeResult {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            output,
+        })
+    })
+}
+
+pub fn run_tier1_cleanup_smoke(
+    shader_path: &str,
+    records: &[crate::gpu::GpuTier1CodeblockRecord],
+    compressed_words: &[u32],
+    codeblock_index: u32,
+) -> Result<Tier1CleanupSmokeResult, VulkanError> {
+    if records.is_empty() {
+        return Err(VulkanError::new(
+            "Tier-1 cleanup smoke requires at least one record",
+        ));
+    }
+    if codeblock_index as usize >= records.len() {
+        return Err(VulkanError::new(format!(
+            "Tier-1 cleanup smoke codeblock index {codeblock_index} outside {} records",
+            records.len()
+        )));
+    }
+    if compressed_words.is_empty() {
+        return Err(VulkanError::new(
+            "Tier-1 cleanup smoke requires compressed byte words",
+        ));
+    }
+    let record = records[codeblock_index as usize];
+    if record.coefficient_count > 4096 {
+        return Err(VulkanError::new(format!(
+            "Tier-1 cleanup smoke supports up to 4096 coefficients, got {}",
+            record.coefficient_count
+        )));
+    }
+    let spirv = read_spirv(shader_path)?;
+    with_compute_device(|device, summary, queue_family_index| {
+        let program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            3,
+            std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
+        )?;
+        let records_buffer =
+            device.create_host_buffer(bytes_len::<crate::gpu::GpuTier1CodeblockRecord>(
+                records.len(),
+            )?)?;
+        records_buffer.write_slice(records)?;
+        let compressed_buffer =
+            device.create_host_buffer(bytes_len::<u32>(compressed_words.len())?)?;
+        compressed_buffer.write_slice(compressed_words)?;
+        let output_len = 9usize;
+        let output_seed = vec![0u32; output_len];
+        let output_buffer = device.create_host_buffer(bytes_len::<u32>(output_len)?)?;
+        output_buffer.write_slice(&output_seed)?;
+        let push = Tier1CleanupSmokePushConstants { codeblock_index };
+        program.dispatch(
+            device,
+            queue_family_index,
+            &[
+                records_buffer.descriptor_info(),
+                compressed_buffer.descriptor_info(),
+                output_buffer.descriptor_info(),
+            ],
+            bytes_of(&push),
+            1,
+            1,
+        )?;
+        let output = output_buffer.read_vec::<u32>(output_len)?;
+        device.wait_idle()?;
+        Ok(Tier1CleanupSmokeResult {
             device_name: summary.name.clone(),
             queue_family_index,
             output,
