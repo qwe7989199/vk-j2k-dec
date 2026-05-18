@@ -961,9 +961,16 @@ fn print_profile_average(label: &str, profiles: &[DecodeProfile]) {
             acc.timings.pack_readback_ms += profile.timings.pack_readback_ms;
             acc
         });
+    let decode_total_ms = sum.timings.total_ms / count;
+    let fps = if decode_total_ms > 0.0 {
+        1000.0 / decode_total_ms
+    } else {
+        0.0
+    };
     println!(
-        "  {label}_ms decode_total {:.3} parse {:.3} layout {:.3} packet {:.3} work_plan {:.3} bind {:.3} tier1 {:.3} gpu_setup {:.3} reconstruct {:.3} reconstruct_upload {:.3} reconstruct_alloc {:.3} reconstruct_dispatch {:.3} pack {:.3} pack_shader {:.3} pack_copy {:.3} pack_readback {:.3}",
-        sum.timings.total_ms / count,
+        "  {label}_ms decode_total {:.3} fps {:.2} parse {:.3} layout {:.3} packet {:.3} work_plan {:.3} bind {:.3} tier1 {:.3} gpu_setup {:.3} reconstruct {:.3} reconstruct_upload {:.3} reconstruct_alloc {:.3} reconstruct_dispatch {:.3} pack {:.3} pack_shader {:.3} pack_copy {:.3} pack_readback {:.3}",
+        decode_total_ms,
+        fps,
         sum.timings.parse_ms / count,
         sum.timings.layout_ms / count,
         sum.timings.packet_ms / count,

@@ -371,18 +371,22 @@ tier1 gpu plan: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
     first: C0 R0 LL cblk 0,0 60x34, bytes 0..2386, coeff 0..2040, passes 0..34
     vulkan smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 records, 24256 byte words
     vulkan mq smoke: device NVIDIA GeForce RTX 5060, queue 2, cblk 0, context 0, 32 bits 0x08000200
-    vulkan tier1 scatter smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 records, 6220800 plane coeff, upload 11.859 ms, dispatch 0.151 ms, readback 6.702 ms
-    vulkan tier1 cleanup+scatter: device NVIDIA GeForce RTX 5060, queue 2, upload 2.242 ms, cleanup 60.267 ms, scatter 0.198 ms, readback 7.036 ms
-    vulkan scattered idwt53: device NVIDIA GeForce RTX 5060, queue 2, 3 components, upload 5.690 ms, dispatch 3.851 ms, readback 24.510 ms
-    vulkan cleanup+scatter+idwt53: device NVIDIA GeForce RTX 5060, queue 2, upload 2.195 ms, cleanup 60.337 ms, scatter 0.286 ms, idwt_dispatch 3.580 ms, idwt_alloc 3.854 ms, readback 7.339 ms
+    vulkan tier1 scatter smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 records, 6220800 plane coeff, upload 13.014 ms, dispatch 0.284 ms, readback 7.550 ms
+    vulkan tier1_cleanup_pass+scatter: device NVIDIA GeForce RTX 5060, queue 2, upload 1.982 ms, tier1_cleanup_pass 67.544 ms, scatter 0.230 ms, readback 7.504 ms
+    vulkan scattered idwt53: device NVIDIA GeForce RTX 5060, queue 2, 3 components, upload 5.846 ms, dispatch 4.015 ms, readback 24.028 ms
+    vulkan tier1_cleanup_pass+scatter+idwt53: device NVIDIA GeForce RTX 5060, queue 2, upload 1.655 ms, tier1_cleanup_pass 60.372 ms, scatter 0.233 ms, idwt_dispatch 4.374 ms, idwt_alloc 4.364 ms, readback 7.606 ms
+    vulkan tier1_cleanup_pass+scatter+rgb48: device NVIDIA GeForce RTX 5060, queue 2, 6220800 samples, upload 1.860 ms, tier1_cleanup_pass 66.311 ms, scatter 0.432 ms, idwt_dispatch 4.590 ms, idwt_alloc 5.516 ms, color_shader 0.447 ms, color_copy 1.252 ms, color_readback 2.093 ms, summary_readback 0.269 ms
     vulkan tier1 full smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 cblk summaries, 3177152 coeff, first nonzero 2040, checksum 0xfffe2412
-      tier1 full smoke timings: gpu_roundtrip 738.962 ms (upload 1.597, dispatch 59.746, readback 4.117), cpu_reference 262.726 ms
+      tier1 full smoke timings: gpu_roundtrip 767.536 ms (upload 1.638, dispatch 59.667, readback 4.224), cpu_reference 272.495 ms
 tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 iteration(s)
   tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
-    vulkan tier1 cleanup+scatter bench: device NVIDIA GeForce RTX 5060, queue 2, setup 2.766 ms, hot_dispatch 611.329 ms total / 61.133 ms avg, readback 7.229 ms
-    vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 1.969 ms, hot_dispatch 615.803 ms total / 61.580 ms avg, readback 4.198 ms
-    gpu cleanup+scatter vs cpu reference: 4.33x hot speedup
-    cpu tier1 reference: 2645.729 ms total / 264.573 ms avg, hot GPU speedup 4.30x, first nonzero 2040, checksum 0xfffe2412
+    vulkan tier1_cleanup_pass+scatter bench: device NVIDIA GeForce RTX 5060, queue 2, setup 2.155 ms, hot_dispatch 599.086 ms total / 59.909 ms avg, readback 10.313 ms
+    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 674.278 ms, 814.522 ms total / 81.452 ms avg, 12.28 fps
+      avg breakdown: tier1_cleanup_pass 61.291 ms, scatter 0.218 ms, idwt_dispatch 3.878 ms, idwt_alloc 4.514 ms, color_shader 0.414 ms, color_copy 1.275 ms, color_readback 1.998 ms, summary_readback_once 0.274 ms
+      cpu full RGB48 reference: 1398.946 ms total / 139.895 ms avg, 7.15 fps; GPU speedup 1.72x
+    vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 1.782 ms, hot_dispatch 603.860 ms total / 60.386 ms avg, readback 4.231 ms
+    gpu cleanup+scatter vs cpu reference: 4.47x hot speedup
+    cpu tier1 reference: 2677.652 ms total / 267.765 ms avg, hot GPU speedup 4.43x, first nonzero 2040, checksum 0xfffe2412
 ```
 
 The smoke shader reads the flattened codeblock records and the packed compressed
@@ -407,10 +411,13 @@ Tier-1 output directly into GPU DWT without a CPU coefficient placement pass.
 The cleanup+scatter bench keeps that flat buffer device-local and records the
 cleanup and scatter shaders into the same command buffer loop; scatter adds
 effectively no hot-path cost beside MQ decode on the local frame.
-The cleanup+scatter+IDWT smoke then feeds the concatenated subband-plane buffer
-directly into an offset-aware 5/3 DWT shader. It avoids the standalone
-scatter-validation path's flat coefficient readback and re-upload, then compares
-all reconstructed component planes against the CPU 5/3 reference.
+The cleanup+scatter+IDWT/RGB48 smokes then feed the concatenated subband-plane
+buffer directly into an offset-aware 5/3 DWT shader and the integer RGB48 pack
+shader. They avoid the standalone scatter-validation path's flat coefficient
+readback and re-upload, compare all reconstructed component planes against the
+CPU 5/3 reference, and compare final packed RGB48 samples against the CPU
+decoder. In the logs, `tier1_cleanup_pass` means the JPEG 2000 Tier-1 cleanup
+coding pass, not resource destruction.
 
 - This sample is inside the first target profile.
 
@@ -460,15 +467,15 @@ profile-rgb48: mode gpu, 1920x1080 12-bit, discard 0, 6220800 samples
 For repeated-frame timing, `profile-rgb48-bench` reads the codestream once,
 builds the persistent GPU pipeline once, then decodes the same in-memory frame
 multiple times and reports both all-run and warm-skip-one averages. Current
-local 10-iteration GPU bench after cleanup-pass inlining, parallel Tier-1
+local 10-iteration GPU bench after cleanup-pass inlining, parallel CPU Tier-1
 codeblock decode, device-local DWT/color buffers, packed RGB48 readback, and
 HOST_CACHED staging:
 
 ```text
 profile-rgb48-bench: mode gpu, 1920x1080 12-bit, discard 0, iterations 10, 6220800 samples
-  pipeline_setup_ms 237.064
-  avg_all_ms decode_total 86.288 tier1 39.776 gpu_setup 0.000 reconstruct 40.365 reconstruct_upload 15.573 reconstruct_alloc 4.696 reconstruct_dispatch 3.479 pack 4.992 pack_shader 0.521 pack_copy 1.313 pack_readback 2.148
-  avg_warm_skip1_ms decode_total 86.130 tier1 39.664 gpu_setup 0.000 reconstruct 40.311 reconstruct_upload 15.465 reconstruct_alloc 4.722 reconstruct_dispatch 3.437 pack 5.001 pack_shader 0.527 pack_copy 1.286 pack_readback 2.158
+  pipeline_setup_ms 220.349
+  avg_all_ms decode_total 85.049 fps 11.76 parse 0.005 layout 0.002 packet 0.444 work_plan 0.179 bind 0.044 tier1 40.346 gpu_setup 0.000 reconstruct 38.792 reconstruct_upload 15.152 reconstruct_alloc 4.298 reconstruct_dispatch 3.494 pack 4.800 pack_shader 0.497 pack_copy 1.329 pack_readback 2.064
+  avg_warm_skip1_ms decode_total 84.833 fps 11.79 parse 0.004 layout 0.002 packet 0.448 work_plan 0.182 bind 0.044 tier1 40.328 gpu_setup 0.000 reconstruct 38.591 reconstruct_upload 15.064 reconstruct_alloc 4.250 reconstruct_dispatch 3.447 pack 4.797 pack_shader 0.496 pack_copy 1.305 pack_readback 2.065
 ```
 
 The GPU bench also reports the reversible 5/3 reconstruct split as
@@ -484,22 +491,30 @@ The matching CPU 10-iteration bench reports:
 
 ```text
 profile-rgb48-bench: mode cpu, 1920x1080 12-bit, discard 0, iterations 10, 6220800 samples
-  avg_all_ms decode_total 145.411 tier1 40.907 gpu_setup 0.000 reconstruct 95.049 pack 7.172 pack_shader 0.000 pack_copy 0.000 pack_readback 0.000
-  avg_warm_skip1_ms decode_total 145.507 tier1 41.047 gpu_setup 0.000 reconstruct 95.008 pack 7.181 pack_shader 0.000 pack_copy 0.000 pack_readback 0.000
+  avg_all_ms decode_total 137.468 fps 7.27 parse 0.007 layout 0.004 packet 0.465 work_plan 0.181 bind 0.052 tier1 39.540 gpu_setup 0.000 reconstruct 88.501 reconstruct_upload 0.000 reconstruct_alloc 0.000 reconstruct_dispatch 0.000 pack 6.967 pack_shader 0.000 pack_copy 0.000 pack_readback 0.000
+  avg_warm_skip1_ms decode_total 136.687 fps 7.32 parse 0.006 layout 0.003 packet 0.454 work_plan 0.178 bind 0.050 tier1 39.581 gpu_setup 0.000 reconstruct 87.694 reconstruct_upload 0.000 reconstruct_alloc 0.000 reconstruct_dispatch 0.000 pack 6.967 pack_shader 0.000 pack_copy 0.000 pack_readback 0.000
 ```
 
-The comparable FFmpeg native JPEG2000 10-frame loop against the same in-memory
-frame source, writing RGB48 output to `NUL`, reports about 119-126 ms/frame on
-the local machine. Explicit `-threads 1` and default `-threads 0` are similar for
-this single-frame codestream:
+The new full GPU Tier-1 fast-path bench keeps Tier-1 records, compressed words,
+scatter records, flat coefficient storage, and subband-plane storage device-local
+across the loop, then runs Tier-1 cleanup coding, scatter, offset IDWT, integer
+color packing, and RGB48 readback each iteration:
 
 ```text
-ffmpeg -hide_banner -v info -benchmark -stream_loop 9 -i target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k -frames:v 10 -pix_fmt rgb48le -f rawvideo NUL
-bench: utime=1.141s stime=0.078s rtime=1.192s
-ffmpeg -hide_banner -v info -benchmark -threads 1 -stream_loop 9 -i target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k -frames:v 10 -pix_fmt rgb48le -f rawvideo NUL
-bench: utime=1.219s stime=0.031s rtime=1.254s
-ffmpeg -hide_banner -v info -benchmark -threads 0 -stream_loop 9 -i target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k -frames:v 10 -pix_fmt rgb48le -f rawvideo NUL
-bench: utime=1.281s stime=0.078s rtime=1.264s
+tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 iteration(s)
+  tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
+    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 674.278 ms, 814.522 ms total / 81.452 ms avg, 12.28 fps
+      avg breakdown: tier1_cleanup_pass 61.291 ms, scatter 0.218 ms, idwt_dispatch 3.878 ms, idwt_alloc 4.514 ms, color_shader 0.414 ms, color_copy 1.275 ms, color_readback 1.998 ms, summary_readback_once 0.274 ms
+      cpu full RGB48 reference: 1398.946 ms total / 139.895 ms avg, 7.15 fps; GPU speedup 1.72x
+```
+
+The comparable FFmpeg native JPEG2000 10-frame loop against the same frame
+source, writing wrapped frames to `null`, reports about 124.5 ms/frame
+(~8.03 fps) on the local machine:
+
+```text
+ffmpeg -hide_banner -benchmark -v info -stream_loop 9 -i target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k -f null -
+bench: utime=1.156s stime=0.062s rtime=1.245s
 ```
 
 The low-resolution path now prunes unused high-resolution codeblocks before

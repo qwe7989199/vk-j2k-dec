@@ -119,13 +119,19 @@ cargo run --release -- tier1-gpu-bench target\samples\test_j2k_rgb12_1080p24_3mi
 ```
 
 Current local RTX 5060 result after device-local buffers, cached neighbor state,
-visit-generation tracking, and skipping cleanup-only visit writes:
+visit-generation tracking, skipping cleanup-only visit writes, and the
+device-local RGB48 fast-path bench:
 
 ```text
-vulkan tier1 cleanup+scatter bench: setup 2.766 ms, hot_dispatch 611.329 ms total / 61.133 ms avg, readback 7.229 ms
-vulkan tier1 bench: setup 1.969 ms, hot_dispatch 615.803 ms total / 61.580 ms avg, readback 4.198 ms
-cpu tier1 reference: 2645.729 ms total / 264.573 ms avg, hot GPU speedup 4.30x
+vulkan tier1_cleanup_pass+scatter bench: setup 2.155 ms, hot_dispatch 599.086 ms total / 59.909 ms avg, readback 10.313 ms
+vulkan full RGB48 hot bench: setup_once 674.278 ms, 814.522 ms total / 81.452 ms avg, 12.28 fps
+  avg breakdown: tier1_cleanup_pass 61.291 ms, scatter 0.218 ms, idwt_dispatch 3.878 ms, idwt_alloc 4.514 ms, color_shader 0.414 ms, color_copy 1.275 ms, color_readback 1.998 ms
+cpu full RGB48 reference: 1398.946 ms total / 139.895 ms avg, 7.15 fps; GPU speedup 1.72x
+cpu tier1 reference: 2677.652 ms total / 267.765 ms avg, hot GPU speedup 4.43x
 ```
+
+In these logs, `tier1_cleanup_pass` is the JPEG 2000 Tier-1 cleanup coding pass,
+not resource cleanup/destruction.
 
 `tier1_scatter_smoke.comp.glsl` is the first handoff shader after GPU Tier-1. It
 maps the flat per-codeblock coefficient buffer into concatenated component
@@ -143,16 +149,15 @@ standalone scatter smoke uses for validation.
 
 `idwt53_offset_1d.comp.glsl` lets the DWT read LL/HL/LH/HH bands from a
 concatenated subband-plane buffer via element offsets. The
-cleanup+scatter+IDWT smoke now keeps Tier-1 output and scattered subband planes
-device-local through inverse 5/3, then reads back only the reconstructed
-component planes for validation. The local smoke reports about 60.3 ms cleanup,
-0.3 ms scatter, 3.6 ms IDWT dispatch, 3.9 ms IDWT allocation, and 7.3 ms final
-component-plane readback.
+cleanup+scatter+IDWT/RGB48 smoke now keeps Tier-1 output and scattered subband
+planes device-local through inverse 5/3 and integer color packing, then reads
+back the packed RGB48 frame for validation. The hot full-chain bench avoids CPU
+coefficient placement and intermediate coefficient-plane transfers; the
+remaining dominant cost is the one-invocation-per-codeblock Tier-1 cleanup pass.
 
-The next implementation step is moving this combined GPU chain into the
-high-level `profile-rgb48-bench` path and connecting it to GPU color packing, so
-the fast path no longer does CPU coefficient placement or intermediate
-coefficient-plane transfers.
+The next implementation step is turning this smoke/bench path into a reusable
+high-level `profile-rgb48-bench` mode with persistent DWT scratch buffers and
+fewer per-stage descriptor/command allocations.
 
 ## Shader build
 
