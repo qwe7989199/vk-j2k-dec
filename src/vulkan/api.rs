@@ -290,6 +290,7 @@ pub struct Tier1CleanupSmokeResult {
     pub device_name: String,
     pub queue_family_index: u32,
     pub output: Vec<u32>,
+    pub coefficients: Vec<i32>,
 }
 
 #[repr(C)]
@@ -309,7 +310,7 @@ struct Tier1MqSmokePushConstants {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct Tier1CleanupSmokePushConstants {
-    codeblock_index: u32,
+    codeblock_count: u32,
 }
 
 pub fn run_tier1_plan_smoke(
@@ -452,37 +453,31 @@ pub fn run_tier1_cleanup_smoke(
     shader_path: &str,
     records: &[crate::gpu::GpuTier1CodeblockRecord],
     compressed_words: &[u32],
-    codeblock_index: u32,
 ) -> Result<Tier1CleanupSmokeResult, VulkanError> {
     if records.is_empty() {
         return Err(VulkanError::new(
             "Tier-1 cleanup smoke requires at least one record",
         ));
     }
-    if codeblock_index as usize >= records.len() {
-        return Err(VulkanError::new(format!(
-            "Tier-1 cleanup smoke codeblock index {codeblock_index} outside {} records",
-            records.len()
-        )));
-    }
     if compressed_words.is_empty() {
         return Err(VulkanError::new(
             "Tier-1 cleanup smoke requires compressed byte words",
         ));
     }
-    let record = records[codeblock_index as usize];
-    if record.coefficient_count > 4096 {
-        return Err(VulkanError::new(format!(
-            "Tier-1 cleanup smoke supports up to 4096 coefficients, got {}",
-            record.coefficient_count
-        )));
+    for (index, record) in records.iter().enumerate() {
+        if record.coefficient_count > 4096 {
+            return Err(VulkanError::new(format!(
+                "Tier-1 cleanup smoke supports up to 4096 coefficients, got {} for record {index}",
+                record.coefficient_count
+            )));
+        }
     }
     let spirv = read_spirv(shader_path)?;
     with_compute_device(|device, summary, queue_family_index| {
         let program = StorageComputeProgram::new(
             device,
             &spirv,
-            3,
+            4,
             std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
         )?;
         let records_buffer =
@@ -493,11 +488,22 @@ pub fn run_tier1_cleanup_smoke(
         let compressed_buffer =
             device.create_host_buffer(bytes_len::<u32>(compressed_words.len())?)?;
         compressed_buffer.write_slice(compressed_words)?;
-        let output_len = 9usize;
+        let output_len = records.len() * 9;
         let output_seed = vec![0u32; output_len];
         let output_buffer = device.create_host_buffer(bytes_len::<u32>(output_len)?)?;
         output_buffer.write_slice(&output_seed)?;
-        let push = Tier1CleanupSmokePushConstants { codeblock_index };
+        let coefficient_count = records
+            .iter()
+            .map(|record| record.coefficient_offset + record.coefficient_count)
+            .max()
+            .unwrap_or(0) as usize;
+        let coefficient_seed = vec![0i32; coefficient_count];
+        let coefficient_buffer =
+            device.create_host_buffer(bytes_len::<i32>(coefficient_count)?)?;
+        coefficient_buffer.write_slice(&coefficient_seed)?;
+        let push = Tier1CleanupSmokePushConstants {
+            codeblock_count: records.len() as u32,
+        };
         program.dispatch(
             device,
             queue_family_index,
@@ -505,17 +511,20 @@ pub fn run_tier1_cleanup_smoke(
                 records_buffer.descriptor_info(),
                 compressed_buffer.descriptor_info(),
                 output_buffer.descriptor_info(),
+                coefficient_buffer.descriptor_info(),
             ],
             bytes_of(&push),
-            1,
+            records.len() as u32,
             1,
         )?;
         let output = output_buffer.read_vec::<u32>(output_len)?;
+        let coefficients = coefficient_buffer.read_vec::<i32>(coefficient_count)?;
         device.wait_idle()?;
         Ok(Tier1CleanupSmokeResult {
             device_name: summary.name.clone(),
             queue_family_index,
             output,
+            coefficients,
         })
     })
 }

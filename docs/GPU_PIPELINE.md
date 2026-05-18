@@ -102,15 +102,16 @@ locks down the SSBO shape needed for the real MQ/codeblock shader.
 it against real codeblock bytes. The CLI compares decoded bits, byte position,
 `A/C/CT` registers, and context state against the CPU `MqDecoder`.
 
-`tier1_cleanup_smoke.comp.glsl` takes the next step and decodes the first
-cleanup pass for one real codeblock on GPU. It maintains per-coefficient
-significance/sign/coefficient state, handles cleanup run-length coding,
-significance context selection, sign context selection, and exact reversible
-coefficient reconstruction. The current smoke compares GPU nonzero count,
-coefficient checksum, MQ byte position, and pass summary counters against the
-CPU Tier-1 pass. The next implementation step is changing this from a one-block
-smoke into a one-workgroup-per-codeblock kernel that writes coefficient planes or
-a compact coefficient buffer for the downstream GPU DWT path.
+`tier1_cleanup_smoke.comp.glsl` now runs every MQ-coded pass for every real
+codeblock on GPU. It maintains per-coefficient significance/sign/refinement
+state, handles cleanup run-length coding, significance propagation, magnitude
+refinement, context selection, and exact reversible coefficient reconstruction.
+The current smoke writes a flat GPU coefficient buffer and compares all
+3,177,152 coefficients, MQ byte positions, and pass summary counters against CPU
+Tier-1. This is still a correctness kernel: it uses large private per-invocation
+state and reads coefficients back for verification. The next implementation step
+is replacing that private state shape with an efficient one-workgroup-per-codeblock
+layout and feeding the coefficient buffer directly into downstream GPU DWT.
 
 ## Shader build
 

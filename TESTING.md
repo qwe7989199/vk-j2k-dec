@@ -370,17 +370,21 @@ tier1 gpu plan: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
     first: C0 R0 LL cblk 0,0 60x34, bytes 0..2386, coeff 0..2040, passes 0..34
     vulkan smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 records, 24256 byte words
     vulkan mq smoke: device NVIDIA GeForce RTX 5060, queue 2, cblk 0, context 0, 32 bits 0x08000200
-    vulkan cleanup smoke: device NVIDIA GeForce RTX 5060, queue 2, cblk 0, nonzero 897, checksum 0xfff58800
+    vulkan tier1 full smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 cblk summaries, 3177152 coeff, first nonzero 2040, checksum 0xfffe2412
+      tier1 full smoke timings: gpu_roundtrip 1112.020 ms, cpu_reference 262.901 ms
 ```
 
 The smoke shader reads the flattened codeblock records and the packed compressed
 byte stream on GPU, then validates per-codeblock byte ranges and checksums
 against the CPU plan. The MQ smoke runs the JPEG 2000 MQ state machine on the
 GPU against real codeblock bytes and compares the decoded bits plus registers
-against the CPU `MqDecoder`. The cleanup smoke runs the first cleanup pass for
-the first codeblock on GPU, including run-length mode, significance contexts,
-sign contexts, and coefficient/significance state updates, then compares the
-summary and coefficient checksum against the CPU Tier-1 pass.
+against the CPU `MqDecoder`. The full Tier-1 smoke runs every MQ-coded pass for
+every codeblock on GPU, including cleanup, significance propagation, magnitude
+refinement, run-length mode, significance contexts, sign contexts, and
+coefficient/significance state updates. It writes a flat GPU coefficient buffer
+and compares all 3,177,152 coefficients against CPU Tier-1. This is a
+correctness-oriented shader with per-invocation private state and full readback;
+it is intentionally not the optimized performance kernel yet.
 
 - This sample is inside the first target profile.
 
