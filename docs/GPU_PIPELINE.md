@@ -120,17 +120,18 @@ cargo run --release -- tier1-gpu-bench target\samples\test_j2k_rgb12_1080p24_3mi
 ```
 
 Current local RTX 5060 result after device-local buffers, cached neighbor state,
-packing neighbor counts into the coefficient-state word, visit-generation
-tracking, skipping cleanup-only visit writes, one fused pre-recorded
-Tier-1+scatter+IDWT+color command buffer, and the device-local RGB48 fast-path
-bench:
+packing neighbor counts into the coefficient-state word, reading packed state
+once per sample in the hot scan loops, direct interior-sample neighbor updates,
+division-free Tier-1 pass scheduling, visit-generation tracking, skipping
+cleanup-only visit writes, one fused pre-recorded Tier-1+scatter+IDWT+color
+command buffer, and the device-local RGB48 fast-path bench:
 
 ```text
-vulkan tier1_cleanup_pass+scatter bench: setup 1.988 ms, hot_dispatch 348.301 ms total / 34.830 ms avg, readback 7.599 ms
-vulkan full RGB48 hot bench: setup_once 671.068 ms, 377.152 ms total / 37.715 ms avg, 26.51 fps
-  avg breakdown: fused_gpu_dispatch 34.051 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.151 ms, color_readback 2.074 ms
-cpu full RGB48 reference: 1397.636 ms total / 139.764 ms avg, 7.15 fps; GPU speedup 3.71x
-cpu tier1 reference: 2780.596 ms total / 278.060 ms avg, hot GPU speedup 7.68x
+vulkan full RGB48 hot bench: setup_once 1150.758 ms, 375.701 ms total / 37.570 ms avg, 26.62 fps
+  avg breakdown: fused_gpu_dispatch 32.447 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.230 ms, color_readback 3.095 ms
+vulkan tier1 bench: hot_dispatch 330.999 ms total / 33.100 ms avg, readback 4.105 ms
+cpu full RGB48 reference: 1545.630 ms total / 154.563 ms avg, 6.47 fps; GPU speedup 4.11x
+cpu tier1 reference: 2967.602 ms total / 296.760 ms avg, hot GPU speedup 8.97x
 ```
 
 In these logs, `tier1_cleanup_pass` is the JPEG 2000 Tier-1 cleanup coding pass,
@@ -143,6 +144,8 @@ A CUDA ProRes-style multi-lane-per-block variant was tested against this shader
 shape. It remained bit-exact, but the larger per-workgroup state reduced
 occupancy and lost to the packed single-codeblock workgroup, so the current
 fast path keeps one codeblock per workgroup while squeezing shared memory first.
+Packing MQ context state plus MPS into one private array was also tested and
+rejected: it saved array slots but added enough ALU to slow the local shader.
 
 `tier1_scatter_smoke.comp.glsl` is the first handoff shader after GPU Tier-1. It
 maps the flat per-codeblock coefficient buffer into concatenated component
