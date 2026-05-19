@@ -73,9 +73,10 @@ roughly 0.5 ms shader, 1.3 ms device-to-host copy, and 2.1 ms CPU map/read for
 the final 12.4 MB RGB48 buffer after DWT outputs are kept device-local through
 color conversion. With the high-level path using parallel Tier-1 codeblock
 decode, batched DWT subband uploads, and batched DWT dispatch command buffers,
-the same frame currently averages about 86 ms/frame through the
-persistent GPU RGB48 benchmark, compared with about 119 ms/frame for the local
-FFmpeg native JPEG2000 RGB48 loop. The next GPU milestones are:
+the same frame currently averages about 86 ms/frame through the persistent
+CPU-Tier1/GPU-DWT RGB48 benchmark. The device-local GPU Tier-1 fast path now
+averages about 38 ms/frame, compared with about 136 ms/frame for the local
+FFmpeg native JPEG2000 null loop. The next GPU milestones are:
 
 - add persistent buffer pools for repeated full-frame decode;
 - overlap CPU Tier-1, coefficient uploads, and GPU reconstruction;
@@ -119,19 +120,29 @@ cargo run --release -- tier1-gpu-bench target\samples\test_j2k_rgb12_1080p24_3mi
 ```
 
 Current local RTX 5060 result after device-local buffers, cached neighbor state,
-visit-generation tracking, skipping cleanup-only visit writes, and the
-device-local RGB48 fast-path bench:
+packing neighbor counts into the coefficient-state word, visit-generation
+tracking, skipping cleanup-only visit writes, one fused pre-recorded
+Tier-1+scatter+IDWT+color command buffer, and the device-local RGB48 fast-path
+bench:
 
 ```text
-vulkan tier1_cleanup_pass+scatter bench: setup 2.155 ms, hot_dispatch 599.086 ms total / 59.909 ms avg, readback 10.313 ms
-vulkan full RGB48 hot bench: setup_once 713.990 ms, 647.097 ms total / 64.710 ms avg, 15.45 fps
-  avg breakdown: tier1_cleanup_pass 59.720 ms, scatter 0.249 ms, idwt_dispatch 0.990 ms, idwt_alloc 0.000 ms, color_shader 0.118 ms, color_copy 1.030 ms, color_readback 2.094 ms
-cpu full RGB48 reference: 1429.653 ms total / 142.965 ms avg, 6.99 fps; GPU speedup 2.21x
-cpu tier1 reference: 2677.652 ms total / 267.765 ms avg, hot GPU speedup 4.43x
+vulkan tier1_cleanup_pass+scatter bench: setup 1.988 ms, hot_dispatch 348.301 ms total / 34.830 ms avg, readback 7.599 ms
+vulkan full RGB48 hot bench: setup_once 671.068 ms, 377.152 ms total / 37.715 ms avg, 26.51 fps
+  avg breakdown: fused_gpu_dispatch 34.051 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.151 ms, color_readback 2.074 ms
+cpu full RGB48 reference: 1397.636 ms total / 139.764 ms avg, 7.15 fps; GPU speedup 3.71x
+cpu tier1 reference: 2780.596 ms total / 278.060 ms avg, hot GPU speedup 7.68x
 ```
 
 In these logs, `tier1_cleanup_pass` is the JPEG 2000 Tier-1 cleanup coding pass,
-not resource cleanup/destruction.
+not resource cleanup/destruction. The fused RGB48 bench records cleanup,
+scatter, all IDWT dispatches, and color packing into one reusable command
+buffer, so `fused_gpu_dispatch` is the measured GPU compute section and the
+individual stage slots are left at zero in that mode.
+
+A CUDA ProRes-style multi-lane-per-block variant was tested against this shader
+shape. It remained bit-exact, but the larger per-workgroup state reduced
+occupancy and lost to the packed single-codeblock workgroup, so the current
+fast path keeps one codeblock per workgroup while squeezing shared memory first.
 
 `tier1_scatter_smoke.comp.glsl` is the first handoff shader after GPU Tier-1. It
 maps the flat per-codeblock coefficient buffer into concatenated component
@@ -155,8 +166,8 @@ back the packed RGB48 frame for validation. The hot full-chain bench avoids CPU
 coefficient placement and intermediate coefficient-plane transfers; the
 remaining dominant cost is the one-invocation-per-codeblock Tier-1 cleanup pass.
 The bench now preallocates scattered-IDWT scratch/output buffers, pre-records
-IDWT and color command buffers, and reuses the RGB48 device/staging buffers
-across iterations.
+one fused cleanup/scatter/IDWT/color command buffer, and reuses the RGB48
+device/staging buffers across iterations.
 
 The next implementation step is turning this smoke/bench path into a reusable
 high-level `profile-rgb48-bench` mode with persistent DWT scratch buffers and

@@ -157,6 +157,12 @@ struct StorageDispatchBatch<'a> {
     groups: [u32; 3],
 }
 
+const TIER1_CLEANUP_CODEBLOCKS_PER_WORKGROUP: u32 = 1;
+
+fn tier1_cleanup_groups(codeblock_count: usize) -> u32 {
+    (codeblock_count as u32).div_ceil(TIER1_CLEANUP_CODEBLOCKS_PER_WORKGROUP)
+}
+
 struct StorageComputeProgram {
     descriptor_set_layout: DescriptorSetLayoutHandle,
     pipeline_layout: PipelineLayoutHandle,
@@ -432,6 +438,7 @@ pub struct Tier1CleanupScatterRgb48BenchResult {
     pub setup_ms: f64,
     pub decode_total_ms: f64,
     pub decode_average_ms: f64,
+    pub fused_dispatch_average_ms: f64,
     pub cleanup_dispatch_average_ms: f64,
     pub scatter_dispatch_average_ms: f64,
     pub idwt_dispatch_average_ms: f64,
@@ -663,7 +670,7 @@ pub fn run_tier1_cleanup_smoke(
                 coefficient_buffer.descriptor_info(),
             ],
             bytes_of(&push),
-            records.len() as u32,
+            tier1_cleanup_groups(records.len()),
             1,
         )?;
         let dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
@@ -770,7 +777,7 @@ pub fn run_tier1_cleanup_bench(
             queue_family_index,
             &descriptors,
             bytes_of(&push),
-            records.len() as u32,
+            tier1_cleanup_groups(records.len()),
             1,
             iterations,
         )?;
@@ -1070,7 +1077,7 @@ pub fn run_tier1_cleanup_scatter_smoke(
                 flat_coefficient_buffer.descriptor_info(),
             ],
             bytes_of(&cleanup_push),
-            cleanup_records.len() as u32,
+            tier1_cleanup_groups(cleanup_records.len()),
             1,
         )?;
         let cleanup_dispatch_ms = cleanup_dispatch_start.elapsed().as_secs_f64() * 1000.0;
@@ -1244,7 +1251,7 @@ pub fn run_tier1_cleanup_scatter_bench(
                 pipeline_layout: cleanup_program.pipeline_layout.handle,
                 descriptor_set: cleanup_descriptor_set,
                 push_constants: bytes_of(&cleanup_push),
-                groups: [cleanup_records.len() as u32, 1, 1],
+                groups: [tier1_cleanup_groups(cleanup_records.len()), 1, 1],
             });
             dispatches.push(StorageDispatch {
                 pipeline: scatter_program.pipeline.handle,
@@ -1391,7 +1398,7 @@ pub fn run_tier1_cleanup_scatter_idwt53_smoke(
                 flat_coefficient_buffer.descriptor_info(),
             ],
             bytes_of(&cleanup_push),
-            cleanup_records.len() as u32,
+            tier1_cleanup_groups(cleanup_records.len()),
             1,
         )?;
         let cleanup_dispatch_ms = cleanup_dispatch_start.elapsed().as_secs_f64() * 1000.0;
@@ -1589,7 +1596,7 @@ pub fn run_tier1_cleanup_scatter_rgb48_smoke(
                 flat_coefficient_buffer.descriptor_info(),
             ],
             bytes_of(&cleanup_push),
-            cleanup_records.len() as u32,
+            tier1_cleanup_groups(cleanup_records.len()),
             1,
         )?;
         let cleanup_dispatch_ms = cleanup_dispatch_start.elapsed().as_secs_f64() * 1000.0;
@@ -1674,13 +1681,13 @@ pub fn run_tier1_cleanup_scatter_rgb48_smoke(
 }
 
 struct ReusableScatteredIdwt53Component {
-    component: u16,
     width: u32,
     height: u32,
     levels: Vec<ReusableScatteredIdwt53Level>,
+    descriptor_sets: Vec<VkDescriptorSet>,
+    pushes: Vec<Idwt53OffsetPushConstants>,
+    groups: Vec<[u32; 3]>,
     _descriptor_pool: DescriptorPoolHandle,
-    _command_pool: CommandPoolHandle,
-    command_buffer: VkCommandBuffer,
 }
 
 struct ReusableScatteredIdwt53Level {
@@ -1698,7 +1705,6 @@ struct ReusableScatteredIdwt53Level {
 impl ReusableScatteredIdwt53Component {
     fn new(
         device: &VulkanDevice,
-        queue_family_index: u32,
         program: &StorageComputeProgram,
         plane_buffer: &HostBuffer,
         planes: &[crate::gpu::GpuTier1ScatterPlane],
@@ -1851,50 +1857,38 @@ impl ReusableScatteredIdwt53Component {
                 ]);
             }
         }
-        let command_pool = device.create_command_pool(queue_family_index)?;
-        let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
-        let storage_dispatches = pushes
+        Ok(Self {
+            width: current_width,
+            height: current_height,
+            levels,
+            descriptor_sets,
+            pushes,
+            groups,
+            _descriptor_pool: descriptor_pool,
+        })
+    }
+
+    fn extend_storage_dispatches<'a>(
+        &'a self,
+        program: &StorageComputeProgram,
+        dispatches: &mut Vec<StorageDispatch<'a>>,
+    ) {
+        for ((push, descriptor_set), groups) in self
+            .pushes
             .iter()
-            .zip(&descriptor_sets)
-            .zip(&groups)
-            .map(|((push, descriptor_set), groups)| StorageDispatch {
+            .zip(&self.descriptor_sets)
+            .zip(&self.groups)
+        {
+            dispatches.push(StorageDispatch {
                 pipeline: program.pipeline.handle,
                 pipeline_layout: program.pipeline_layout.handle,
                 descriptor_set: *descriptor_set,
                 push_constants: bytes_of(push),
                 groups: *groups,
-            })
-            .collect::<Vec<_>>();
-        device.record_storage_dispatches(command_buffer, &storage_dispatches)?;
-
-        Ok(Self {
-            component,
-            width: current_width,
-            height: current_height,
-            levels,
-            _descriptor_pool: descriptor_pool,
-            _command_pool: command_pool,
-            command_buffer,
-        })
+            });
+        }
     }
 
-    fn dispatch<'a>(
-        &'a self,
-        device: &VulkanDevice,
-    ) -> Result<GpuPlaneI32BufferRef<'a>, VulkanError> {
-        device.submit_and_wait(self.command_buffer)?;
-        let Some(output_buffer) = self.levels.last().map(|level| &level.output_buffer) else {
-            return Err(VulkanError::new(format!(
-                "GPU scattered IDWT for component {} produced no output",
-                self.component
-            )));
-        };
-        Ok(GpuPlaneI32BufferRef {
-            width: self.width,
-            height: self.height,
-            buffer: output_buffer,
-        })
-    }
 }
 
 struct ReusableRgb48Packer {
@@ -1902,15 +1896,15 @@ struct ReusableRgb48Packer {
     output_byte_len: u64,
     output_buffer: HostBuffer,
     staging_buffer: HostBuffer,
+    descriptor_set: VkDescriptorSet,
+    push: ColorPushConstants,
+    groups: [u32; 3],
     _descriptor_pool: DescriptorPoolHandle,
-    _command_pool: CommandPoolHandle,
-    command_buffer: VkCommandBuffer,
 }
 
 impl ReusableRgb48Packer {
     fn new(
         device: &VulkanDevice,
-        queue_family_index: u32,
         program: &StorageComputeProgram,
         component_planes: &[ReusableScatteredIdwt53Component],
         color_transform: u32,
@@ -1967,8 +1961,6 @@ impl ReusableRgb48Packer {
         let descriptor_set =
             device.allocate_descriptor_set(descriptor_pool.handle, program.descriptor_set_layout.handle)?;
         device.update_storage_descriptor_set(descriptor_set, &descriptors);
-        let command_pool = device.create_command_pool(queue_family_index)?;
-        let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
         let output_max = (1u32 << precision) - 1;
         let push = ColorPushConstants {
             sample_count: sample_count as u32,
@@ -1976,34 +1968,37 @@ impl ReusableRgb48Packer {
             output_max,
             level_shift: (1u32 << (precision - 1)) as f32,
         };
-        let storage_dispatch = StorageDispatch {
-            pipeline: program.pipeline.handle,
-            pipeline_layout: program.pipeline_layout.handle,
-            descriptor_set,
-            push_constants: bytes_of(&push),
-            groups: [(pixel_pair_count as u32).div_ceil(256), 1, 1],
-        };
-        device.record_storage_dispatches(command_buffer, &[storage_dispatch])?;
         Ok(Self {
             output_count,
             output_byte_len,
             output_buffer,
             staging_buffer,
+            descriptor_set,
+            push,
+            groups: [(pixel_pair_count as u32).div_ceil(256), 1, 1],
             _descriptor_pool: descriptor_pool,
-            _command_pool: command_pool,
-            command_buffer,
         })
     }
 
-    fn pack(
+    fn extend_storage_dispatches<'a>(
+        &'a self,
+        program: &StorageComputeProgram,
+        dispatches: &mut Vec<StorageDispatch<'a>>,
+    ) {
+        dispatches.push(StorageDispatch {
+            pipeline: program.pipeline.handle,
+            pipeline_layout: program.pipeline_layout.handle,
+            descriptor_set: self.descriptor_set,
+            push_constants: bytes_of(&self.push),
+            groups: self.groups,
+        });
+    }
+
+    fn readback(
         &self,
         device: &VulkanDevice,
         queue_family_index: u32,
     ) -> Result<GpuPackedRgb48Result, VulkanError> {
-        let shader_start = std::time::Instant::now();
-        device.submit_and_wait(self.command_buffer)?;
-        let shader_ms = shader_start.elapsed().as_secs_f64() * 1000.0;
-
         let copy_start = std::time::Instant::now();
         device.copy_buffer(
             queue_family_index,
@@ -2018,7 +2013,7 @@ impl ReusableRgb48Packer {
         let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
         Ok(GpuPackedRgb48Result {
             samples,
-            shader_ms,
+            shader_ms: 0.0,
             copy_ms,
             readback_ms,
         })
@@ -2127,7 +2122,6 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
             .map(|component| {
                 ReusableScatteredIdwt53Component::new(
                     device,
-                    queue_family_index,
                     &idwt53_program,
                     &plane_buffer,
                     scatter_planes,
@@ -2138,69 +2132,83 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
             .collect::<Result<Vec<_>, _>>()?;
         let rgb48_packer = ReusableRgb48Packer::new(
             device,
-            queue_family_index,
             &color_program,
             &idwt_components,
             color_transform,
             precision,
         )?;
-        let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
-
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
         };
         let scatter_push = Tier1ScatterSmokePushConstants {
             codeblock_count: scatter_records.len() as u32,
         };
+        let cleanup_descriptors = [
+            cleanup_records_buffer.descriptor_info(),
+            compressed_buffer.descriptor_info(),
+            output_buffer.descriptor_info(),
+            flat_coefficient_buffer.descriptor_info(),
+        ];
+        let cleanup_descriptor_pool = device.create_descriptor_pool(4, 1)?;
+        let cleanup_descriptor_set = device.allocate_descriptor_set(
+            cleanup_descriptor_pool.handle,
+            cleanup_program.descriptor_set_layout.handle,
+        )?;
+        device.update_storage_descriptor_set(cleanup_descriptor_set, &cleanup_descriptors);
+        let scatter_descriptors = [
+            scatter_records_buffer.descriptor_info(),
+            flat_coefficient_buffer.descriptor_info(),
+            plane_buffer.descriptor_info(),
+        ];
+        let scatter_descriptor_pool = device.create_descriptor_pool(3, 1)?;
+        let scatter_descriptor_set = device.allocate_descriptor_set(
+            scatter_descriptor_pool.handle,
+            scatter_program.descriptor_set_layout.handle,
+        )?;
+        device.update_storage_descriptor_set(scatter_descriptor_set, &scatter_descriptors);
+        let fused_command_pool = device.create_command_pool(queue_family_index)?;
+        let fused_command_buffer = device.allocate_command_buffer(fused_command_pool.handle)?;
+        let mut fused_dispatches = Vec::new();
+        fused_dispatches.push(StorageDispatch {
+            pipeline: cleanup_program.pipeline.handle,
+            pipeline_layout: cleanup_program.pipeline_layout.handle,
+            descriptor_set: cleanup_descriptor_set,
+            push_constants: bytes_of(&cleanup_push),
+            groups: [tier1_cleanup_groups(cleanup_records.len()), 1, 1],
+        });
+        fused_dispatches.push(StorageDispatch {
+            pipeline: scatter_program.pipeline.handle,
+            pipeline_layout: scatter_program.pipeline_layout.handle,
+            descriptor_set: scatter_descriptor_set,
+            push_constants: bytes_of(&scatter_push),
+            groups: [
+                max_scatter_coefficients.div_ceil(256),
+                scatter_records.len() as u32,
+                1,
+            ],
+        });
+        for component in &idwt_components {
+            component.extend_storage_dispatches(&idwt53_program, &mut fused_dispatches);
+        }
+        rgb48_packer.extend_storage_dispatches(&color_program, &mut fused_dispatches);
+        device.record_storage_dispatches(fused_command_buffer, &fused_dispatches)?;
+        let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
 
-        let mut cleanup_dispatch_ms = 0.0;
-        let mut scatter_dispatch_ms = 0.0;
-        let mut idwt_dispatch_ms = 0.0;
+        let cleanup_dispatch_ms = 0.0;
+        let scatter_dispatch_ms = 0.0;
+        let idwt_dispatch_ms = 0.0;
         let idwt_alloc_ms = 0.0;
         let mut color_shader_ms = 0.0;
         let mut color_copy_ms = 0.0;
         let mut color_readback_ms = 0.0;
+        let mut fused_dispatch_ms = 0.0;
         let mut samples = Vec::new();
         let decode_start = std::time::Instant::now();
         for _ in 0..iterations {
-            let cleanup_dispatch_start = std::time::Instant::now();
-            cleanup_program.dispatch(
-                device,
-                queue_family_index,
-                &[
-                    cleanup_records_buffer.descriptor_info(),
-                    compressed_buffer.descriptor_info(),
-                    output_buffer.descriptor_info(),
-                    flat_coefficient_buffer.descriptor_info(),
-                ],
-                bytes_of(&cleanup_push),
-                cleanup_records.len() as u32,
-                1,
-            )?;
-            cleanup_dispatch_ms += cleanup_dispatch_start.elapsed().as_secs_f64() * 1000.0;
-
-            let scatter_dispatch_start = std::time::Instant::now();
-            scatter_program.dispatch(
-                device,
-                queue_family_index,
-                &[
-                    scatter_records_buffer.descriptor_info(),
-                    flat_coefficient_buffer.descriptor_info(),
-                    plane_buffer.descriptor_info(),
-                ],
-                bytes_of(&scatter_push),
-                max_scatter_coefficients.div_ceil(256),
-                scatter_records.len() as u32,
-            )?;
-            scatter_dispatch_ms += scatter_dispatch_start.elapsed().as_secs_f64() * 1000.0;
-
-            let idwt_dispatch_start = std::time::Instant::now();
-            for component in &idwt_components {
-                component.dispatch(device)?;
-            }
-            idwt_dispatch_ms += idwt_dispatch_start.elapsed().as_secs_f64() * 1000.0;
-
-            let packed = rgb48_packer.pack(device, queue_family_index)?;
+            let fused_dispatch_start = std::time::Instant::now();
+            device.submit_and_wait(fused_command_buffer)?;
+            fused_dispatch_ms += fused_dispatch_start.elapsed().as_secs_f64() * 1000.0;
+            let packed = rgb48_packer.readback(device, queue_family_index)?;
             color_shader_ms += packed.shader_ms;
             color_copy_ms += packed.copy_ms;
             color_readback_ms += packed.readback_ms;
@@ -2231,6 +2239,7 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
             setup_ms,
             decode_total_ms,
             decode_average_ms: decode_total_ms / iterations_f64,
+            fused_dispatch_average_ms: fused_dispatch_ms / iterations_f64,
             cleanup_dispatch_average_ms: cleanup_dispatch_ms / iterations_f64,
             scatter_dispatch_average_ms: scatter_dispatch_ms / iterations_f64,
             idwt_dispatch_average_ms: idwt_dispatch_ms / iterations_f64,

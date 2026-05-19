@@ -921,7 +921,8 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
                     gpu_fps
                 );
                 println!(
-                    "      avg breakdown: tier1_cleanup_pass {:.3} ms, scatter {:.3} ms, idwt_dispatch {:.3} ms, idwt_alloc {:.3} ms, color_shader {:.3} ms, color_copy {:.3} ms, color_readback {:.3} ms, summary_readback_once {:.3} ms",
+                    "      avg breakdown: fused_gpu_dispatch {:.3} ms, tier1_cleanup_pass {:.3} ms, scatter {:.3} ms, idwt_dispatch {:.3} ms, idwt_alloc {:.3} ms, color_shader {:.3} ms, color_copy {:.3} ms, color_readback {:.3} ms, summary_readback_once {:.3} ms",
+                    rgb_bench.fused_dispatch_average_ms,
                     rgb_bench.cleanup_dispatch_average_ms,
                     rgb_bench.scatter_dispatch_average_ms,
                     rgb_bench.idwt_dispatch_average_ms,

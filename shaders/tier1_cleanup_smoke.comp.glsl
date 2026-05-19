@@ -48,6 +48,8 @@ const uint STATE_NEGATIVE = 2u;
 const uint STATE_REFINED = 4u;
 const uint STATE_VISIT_SHIFT = 8u;
 const uint STATE_VISIT_MASK = 0xff00u;
+const uint STATE_NEIGHBOR_SHIFT = 16u;
+const uint STATE_NEIGHBOR_MASK = 0x0fff0000u;
 const uint MQ_QE[47] = uint[](
     0x5601u, 0x3401u, 0x1801u, 0x0ac1u, 0x0521u, 0x0221u,
     0x5601u, 0x5401u, 0x4801u, 0x3801u, 0x3001u, 0x2401u,
@@ -82,7 +84,6 @@ const uint MQ_SWITCH_MPS[47] = uint[](
 uint context_state[19];
 uint context_mps[19];
 shared uint coefficient_state[4096];
-shared uint neighbor_state[4096];
 Tier1Codeblock codeblock;
 uint byte_pos;
 uint c_reg;
@@ -238,14 +239,14 @@ uint sign_at(int x, int y) {
 }
 
 uvec3 neighbor_counts(uint x, uint y) {
-    return unpack_neighbors(neighbor_state[index_at(x, y)]);
+    return unpack_neighbors((coefficient_state[index_at(x, y)] & STATE_NEIGHBOR_MASK) >> STATE_NEIGHBOR_SHIFT);
 }
 
 void increment_neighbor(int x, int y, uint bit_shift) {
     if (x < 0 || y < 0 || x >= int(codeblock.width) || y >= int(codeblock.height)) {
         return;
     }
-    neighbor_state[index_at(uint(x), uint(y))] += 1u << bit_shift;
+    coefficient_state[index_at(uint(x), uint(y))] += 1u << (STATE_NEIGHBOR_SHIFT + bit_shift);
 }
 
 void update_neighbors_for_significant(uint x, uint y) {
@@ -352,7 +353,9 @@ void decode_significant_sample(uint x, uint y, uint bitplane, bool mark_visit) {
     int magnitude = int(1u << bitplane);
     output_coefficients[coeff_offset(index)] = sign_bit != 0u ? -magnitude : magnitude;
     update_neighbors_for_significant(x, y);
-    coefficient_state[index] = STATE_SIGNIFICANT | (sign_bit != 0u ? STATE_NEGATIVE : 0u);
+    coefficient_state[index] = (coefficient_state[index] & STATE_NEIGHBOR_MASK)
+        | STATE_SIGNIFICANT
+        | (sign_bit != 0u ? STATE_NEGATIVE : 0u);
     if (mark_visit) {
         mark_visited_index(index);
     }
@@ -485,7 +488,6 @@ void main() {
     context_state[18] = 46u;
     for (uint i = 0u; i < codeblock.coefficient_count; i++) {
         coefficient_state[i] = 0u;
-        neighbor_state[i] = 0u;
     }
 
     byte_pos = 0u;
