@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use vk_j2k_dec::codestream::{Codestream, WaveletTransform};
 use vk_j2k_dec::decode::decode_rgb48_with_discard;
-use vk_j2k_dec::gpu::GpuTier1Plan;
+use vk_j2k_dec::gpu::{GpuTier1CodeblockRecord, GpuTier1Plan};
 use vk_j2k_dec::packet::parse_lrcp_tile_packets;
 use vk_j2k_dec::reconstruct::TileCoefficientPlanes;
 use vk_j2k_dec::tier1::{
@@ -13,6 +13,13 @@ use vk_j2k_dec::tier1::{
 };
 
 use super::{coefficient_reconstruction_for_transform, elapsed_ms};
+
+struct BatchedTier1CleanupInputs {
+    records: Vec<GpuTier1CodeblockRecord>,
+    compressed_words: Vec<u32>,
+    expected_output: Vec<u32>,
+    expected_coefficients: Vec<i32>,
+}
 
 pub fn tier1_gpu_plan(path: &str) -> ExitCode {
     let data = match fs::read(path) {
@@ -114,6 +121,7 @@ pub fn tier1_gpu_plan(path: &str) -> ExitCode {
             plan.arithmetic_passes,
             plan.raw_bypass_passes
         );
+        print_codeblock_parallelism_stats(&plan, "    ");
         if let Some(first) = plan.codeblocks.first() {
             println!(
                 "    first: C{} R{} {} cblk {},{} {}x{}, bytes {}..{}, coeff {}..{}, passes {}..{}",
@@ -602,6 +610,176 @@ pub fn tier1_gpu_plan(path: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn print_codeblock_parallelism_stats(plan: &GpuTier1Plan, indent: &str) {
+    if plan.codeblocks.is_empty() {
+        return;
+    }
+    let mut byte_lengths = plan
+        .codeblocks
+        .iter()
+        .map(|codeblock| codeblock.byte_len)
+        .collect::<Vec<_>>();
+    let mut pass_counts = plan
+        .codeblocks
+        .iter()
+        .map(|codeblock| codeblock.pass_count)
+        .collect::<Vec<_>>();
+    byte_lengths.sort_unstable();
+    pass_counts.sort_unstable();
+    let total_bytes = plan
+        .codeblocks
+        .iter()
+        .map(|codeblock| u64::from(codeblock.byte_len))
+        .sum::<u64>();
+    let total_passes = plan
+        .codeblocks
+        .iter()
+        .map(|codeblock| u64::from(codeblock.pass_count))
+        .sum::<u64>();
+    let mut by_work = plan.codeblocks.iter().enumerate().collect::<Vec<_>>();
+    by_work.sort_by_key(|(_, codeblock)| {
+        std::cmp::Reverse(u64::from(codeblock.byte_len) * u64::from(codeblock.pass_count))
+    });
+    let top1_bytes = by_work
+        .first()
+        .map(|(_, codeblock)| u64::from(codeblock.byte_len))
+        .unwrap_or(0);
+    let top10_bytes = by_work
+        .iter()
+        .take(10)
+        .map(|(_, codeblock)| u64::from(codeblock.byte_len))
+        .sum::<u64>();
+    println!(
+        "{indent}cblk byte_len stats: min {}, p50 {}, p90 {}, p99 {}, max {}, top1 {:.1}% bytes, top10 {:.1}% bytes",
+        byte_lengths[0],
+        percentile_u32(&byte_lengths, 50),
+        percentile_u32(&byte_lengths, 90),
+        percentile_u32(&byte_lengths, 99),
+        byte_lengths[byte_lengths.len() - 1],
+        percent_of(top1_bytes, total_bytes),
+        percent_of(top10_bytes, total_bytes)
+    );
+    println!(
+        "{indent}cblk pass_count stats: min {}, p50 {}, p90 {}, p99 {}, max {}, total {}",
+        pass_counts[0],
+        percentile_u32(&pass_counts, 50),
+        percentile_u32(&pass_counts, 90),
+        percentile_u32(&pass_counts, 99),
+        pass_counts[pass_counts.len() - 1],
+        total_passes
+    );
+    println!("{indent}top Tier-1 work candidates (byte_len*passes):");
+    for (index, codeblock) in by_work.into_iter().take(5) {
+        let work = u64::from(codeblock.byte_len) * u64::from(codeblock.pass_count);
+        println!(
+            "{indent}  #{index}: C{} R{} {} cblk {},{} {}x{}, bytes {}, passes {}, work {}",
+            codeblock.component,
+            codeblock.resolution,
+            codeblock.subband,
+            codeblock.codeblock_x,
+            codeblock.codeblock_y,
+            codeblock.width,
+            codeblock.height,
+            codeblock.byte_len,
+            codeblock.pass_count,
+            work
+        );
+    }
+}
+
+fn percentile_u32(sorted: &[u32], percentile: usize) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let index = ((sorted.len() - 1) * percentile + 50) / 100;
+    sorted[index]
+}
+
+fn percent_of(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / total as f64
+    }
+}
+
+fn compressed_u32_words_from_bytes(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks(4)
+        .map(|chunk| {
+            let mut word = 0u32;
+            for (shift, byte) in chunk.iter().enumerate() {
+                word |= u32::from(*byte) << (shift * 8);
+            }
+            word
+        })
+        .collect()
+}
+
+fn build_batched_tier1_cleanup_inputs(
+    plan: &GpuTier1Plan,
+    expected_output: &[u32],
+    expected_coefficients: &[i32],
+    batch_frames: usize,
+) -> Result<BatchedTier1CleanupInputs, String> {
+    if batch_frames == 0 {
+        return Err("batch frames must be at least 1".to_string());
+    }
+    let frame_byte_len = u32::try_from(plan.compressed_bytes.len())
+        .map_err(|_| "compressed byte length exceeds u32".to_string())?;
+    let frame_coefficient_count = u32::try_from(plan.output_coefficients)
+        .map_err(|_| "coefficient count exceeds u32".to_string())?;
+    let frame_pass_count = plan.total_passes;
+    let base_records = plan.codeblock_records();
+
+    let mut compressed_bytes =
+        Vec::with_capacity(plan.compressed_bytes.len().saturating_mul(batch_frames));
+    let mut records = Vec::with_capacity(base_records.len().saturating_mul(batch_frames));
+    let mut expected_output_batched =
+        Vec::with_capacity(expected_output.len().saturating_mul(batch_frames));
+    let mut expected_coefficients_batched =
+        Vec::with_capacity(expected_coefficients.len().saturating_mul(batch_frames));
+
+    for frame in 0..batch_frames {
+        let frame_u32 = u32::try_from(frame).map_err(|_| "batch frame index exceeds u32")?;
+        let byte_base = frame_u32
+            .checked_mul(frame_byte_len)
+            .ok_or_else(|| "batched byte offset overflow".to_string())?;
+        let coefficient_base = frame_u32
+            .checked_mul(frame_coefficient_count)
+            .ok_or_else(|| "batched coefficient offset overflow".to_string())?;
+        let pass_base = frame_u32
+            .checked_mul(frame_pass_count)
+            .ok_or_else(|| "batched pass offset overflow".to_string())?;
+        compressed_bytes.extend_from_slice(&plan.compressed_bytes);
+        for record in &base_records {
+            let mut record = *record;
+            record.byte_offset = record
+                .byte_offset
+                .checked_add(byte_base)
+                .ok_or_else(|| "batched record byte offset overflow".to_string())?;
+            record.coefficient_offset = record
+                .coefficient_offset
+                .checked_add(coefficient_base)
+                .ok_or_else(|| "batched record coefficient offset overflow".to_string())?;
+            record.pass_offset = record
+                .pass_offset
+                .checked_add(pass_base)
+                .ok_or_else(|| "batched record pass offset overflow".to_string())?;
+            records.push(record);
+        }
+        expected_output_batched.extend_from_slice(expected_output);
+        expected_coefficients_batched.extend_from_slice(expected_coefficients);
+    }
+
+    Ok(BatchedTier1CleanupInputs {
+        records,
+        compressed_words: compressed_u32_words_from_bytes(&compressed_bytes),
+        expected_output: expected_output_batched,
+        expected_coefficients: expected_coefficients_batched,
+    })
+}
+
 pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
     if iterations == 0 {
         eprintln!("tier1 gpu bench: iterations must be at least 1");
@@ -711,6 +889,7 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
             plan.arithmetic_passes,
             plan.raw_bypass_passes
         );
+        print_codeblock_parallelism_stats(&plan, "    ");
 
         let records = plan.codeblock_records();
         let compressed_words = plan.compressed_u32_words();
@@ -961,6 +1140,215 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
         println!(
             "    cpu tier1 reference: {:.3} ms total / {:.3} ms avg, hot GPU speedup {:.2}x, first nonzero {}, checksum 0x{:08x}",
             cpu_total_ms, cpu_average_ms, hot_speedup, bench.output[0], bench.output[1]
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+pub fn tier1_gpu_batch_bench(path: &str, iterations: usize, batch_frames: usize) -> ExitCode {
+    if iterations == 0 {
+        eprintln!("tier1 gpu batch bench: iterations must be at least 1");
+        return ExitCode::FAILURE;
+    }
+    if batch_frames == 0 {
+        eprintln!("tier1 gpu batch bench: batch frames must be at least 1");
+        return ExitCode::FAILURE;
+    }
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("tier1 gpu batch bench: failed to read {path}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let codestream = match Codestream::parse(&data) {
+        Ok(codestream) => codestream,
+        Err(err) => {
+            eprintln!("tier1 gpu batch bench: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(cod) = &codestream.cod else {
+        eprintln!("tier1 gpu batch bench: missing COD marker");
+        return ExitCode::FAILURE;
+    };
+    let layouts = match codestream.tile_layouts() {
+        Ok(layouts) => layouts,
+        Err(err) => {
+            eprintln!("tier1 gpu batch bench: tile layout unavailable ({err})");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cleanup_shader_path = "target\\shaders\\tier1_cleanup_smoke.comp.spv";
+    if !std::path::Path::new(cleanup_shader_path).exists() {
+        eprintln!("tier1 gpu batch bench: missing {cleanup_shader_path}");
+        return ExitCode::FAILURE;
+    }
+
+    println!(
+        "tier1 gpu batch bench: {path}, {iterations} iteration(s), {batch_frames} frame(s)/dispatch"
+    );
+    for tile_part in &codestream.tile_parts {
+        let Some(layout) = layouts
+            .iter()
+            .find(|layout| layout.tile_index == tile_part.tile_index)
+        else {
+            eprintln!(
+                "tier1 gpu batch bench: missing layout for tile {}",
+                tile_part.tile_index
+            );
+            return ExitCode::FAILURE;
+        };
+        let Some(tile_data) = data.get(tile_part.data_start..tile_part.data_end) else {
+            eprintln!(
+                "tier1 gpu batch bench: tile {} payload outside input",
+                tile_part.tile_index
+            );
+            return ExitCode::FAILURE;
+        };
+        let packet_summary = match parse_lrcp_tile_packets(tile_data, layout, cod.layers) {
+            Ok(summary) => summary,
+            Err(err) => {
+                eprintln!(
+                    "tier1 gpu batch bench: packet parse failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let work_plan = match Tier1WorkPlan::from_packet_summary_with_quantization(
+            &packet_summary,
+            codestream.qcd.as_ref(),
+            &codestream.qccs,
+        ) {
+            Ok(plan) => plan,
+            Err(err) => {
+                eprintln!(
+                    "tier1 gpu batch bench: work plan failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let bound = match work_plan.bind_segment_data(tile_data) {
+            Ok(bound) => bound,
+            Err(err) => {
+                eprintln!(
+                    "tier1 gpu batch bench: segment bind failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let plan = match GpuTier1Plan::from_bound_work_plan(&bound, cod.codeblock_style_flags()) {
+            Ok(plan) => plan,
+            Err(err) => {
+                eprintln!(
+                    "tier1 gpu batch bench: flatten failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "  tile {}: {} cblk/frame, {} compressed bytes/frame, {} coeff/frame, {} passes/frame ({} mq, {} raw)",
+            tile_part.tile_index,
+            plan.codeblocks.len(),
+            plan.compressed_bytes.len(),
+            plan.output_coefficients,
+            plan.total_passes,
+            plan.arithmetic_passes,
+            plan.raw_bypass_passes
+        );
+        print_codeblock_parallelism_stats(&plan, "    ");
+
+        let reconstruction = coefficient_reconstruction_for_transform(cod.transform);
+        let cpu_start = Instant::now();
+        let (expected_output, expected_coefficients) =
+            match tier1_cleanup_smoke_expected_all(&bound.codeblocks, reconstruction) {
+                Ok(expected) => expected,
+                Err(err) => {
+                    eprintln!("tier1 gpu batch bench: CPU cleanup reference failed: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        let cpu_reference_ms = elapsed_ms(cpu_start);
+        let batched = match build_batched_tier1_cleanup_inputs(
+            &plan,
+            &expected_output,
+            &expected_coefficients,
+            batch_frames,
+        ) {
+            Ok(batched) => batched,
+            Err(err) => {
+                eprintln!("tier1 gpu batch bench: batch build failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "    batched workload: {} cblk, {} coeff, {} compressed u32 words",
+            batched.records.len(),
+            batched.expected_coefficients.len(),
+            batched.compressed_words.len()
+        );
+
+        let bench = match vk_j2k_dec::vulkan::run_tier1_cleanup_bench(
+            cleanup_shader_path,
+            &batched.records,
+            &batched.compressed_words,
+            iterations,
+        ) {
+            Ok(bench) => bench,
+            Err(err) => {
+                eprintln!("tier1 gpu batch bench: Vulkan cleanup bench failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if bench.output != batched.expected_output {
+            let mismatch = bench
+                .output
+                .iter()
+                .zip(&batched.expected_output)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or(bench.output.len());
+            eprintln!(
+                "tier1 gpu batch bench: cleanup output mismatch at {mismatch}: got {:?}, expected {:?}",
+                bench.output.get(mismatch),
+                batched.expected_output.get(mismatch)
+            );
+            return ExitCode::FAILURE;
+        }
+        if bench.coefficients != batched.expected_coefficients {
+            let mismatch = bench
+                .coefficients
+                .iter()
+                .zip(&batched.expected_coefficients)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or(bench.coefficients.len());
+            eprintln!(
+                "tier1 gpu batch bench: coefficient mismatch at {mismatch}: got {:?}, expected {:?}",
+                bench.coefficients.get(mismatch),
+                batched.expected_coefficients.get(mismatch)
+            );
+            return ExitCode::FAILURE;
+        }
+        let dispatch_average_per_frame_ms = bench.dispatch_average_ms / batch_frames as f64;
+        let aggregate_fps = 1000.0 / dispatch_average_per_frame_ms;
+        println!(
+            "    vulkan tier1 batch bench: device {}, queue {}, setup {:.3} ms, hot_dispatch {:.3} ms total / {:.3} ms per dispatch / {:.3} ms per frame, aggregate {:.2} fps, readback {:.3} ms",
+            bench.device_name,
+            bench.queue_family_index,
+            bench.setup_ms,
+            bench.dispatch_total_ms,
+            bench.dispatch_average_ms,
+            dispatch_average_per_frame_ms,
+            aggregate_fps,
+            bench.readback_ms
+        );
+        println!(
+            "    cpu single-frame tier1 reference: {:.3} ms; GPU per-frame hot speedup {:.2}x",
+            cpu_reference_ms,
+            cpu_reference_ms / dispatch_average_per_frame_ms
         );
     }
     ExitCode::SUCCESS

@@ -511,6 +511,38 @@ tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 itera
       cpu full RGB48 reference: 1545.630 ms total / 154.563 ms avg, 6.47 fps; GPU speedup 4.11x
 ```
 
+`tier1-gpu-batch-bench` duplicates the same frame into one larger GPU Tier-1
+dispatch and validates the full batched coefficient output. This probes whether
+the one-frame path is starved by too few independent codeblocks:
+
+```text
+target\release\vk-j2k-dec.exe tier1-gpu-batch-bench target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 10 16
+```
+
+Current local RTX 5060 Tier-1 batch results:
+
+| batch frames | cblk/dispatch | ms/dispatch | ms/frame | aggregate fps |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 879 | 31.456 | 31.456 | 31.79 |
+| 2 | 1,758 | 61.297 | 30.648 | 32.63 |
+| 4 | 3,516 | 117.618 | 29.405 | 34.01 |
+| 8 | 7,032 | 225.207 | 28.151 | 35.52 |
+| 16 | 14,064 | 448.550 | 28.034 | 35.67 |
+
+The same command also prints codeblock distribution to explain tail behavior on
+single-frame dispatches:
+
+```text
+cblk byte_len stats: min 3, p50 52, p90 293, p99 708, max 2386, top1 2.5% bytes, top10 12.6% bytes
+cblk pass_count stats: min 1, p50 31, p90 34, p99 37, max 37, total 25206
+```
+
+The batch curve confirms that the single-frame GPU path is partially occupancy
+limited by only 879 independent codeblock workgroups and a visible long tail,
+but not purely occupancy limited: by 8-16 frames/dispatch the per-frame Tier-1
+compute flattens near 28 ms, so the remaining wall is mostly the serial MQ work
+inside each codeblock.
+
 The comparable FFmpeg native JPEG2000 10-frame loop against the same frame
 source, writing wrapped frames to `null`, reports about 136.1 ms/frame
 (~7.35 fps) on the local machine:
@@ -542,9 +574,10 @@ cleanup-pass hot paths, reducing repeated shared-state reads in cleanup/
 significance/refinement scans, using direct interior-sample neighbor updates,
 walking the fixed Tier-1 pass schedule without per-pass division/modulo, using
 an integer GPU color shader for reversible RCT, pre-recording one fused
-Tier-1+scatter+IDWT+color command buffer, and reading RGB48 through a
+Tier-1+scatter+IDWT+color command buffer, reading RGB48 through a
 HOST_CACHED staging buffer instead of CPU-reading uncached host-visible storage
-memory. A CUDA ProRes-style multi-lane-per-block variant was tested, but for
+memory, and collaborative zero-initialization of the shared coefficient state by
+workgroup threads (with local_size_x changed to 32). A CUDA ProRes-style multi-lane-per-block variant was tested, but for
 this JPEG 2000 shader it increased shared-memory pressure and reduced occupancy
 enough to lose against the packed single-codeblock workgroup shape. Packing the
 MQ context state and MPS bit into one private array was also tested and rejected

@@ -1,6 +1,6 @@
 #version 450
 
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 struct Tier1Codeblock {
     uint component;
@@ -525,88 +525,95 @@ void decode_refinement_pass(uint bitplane) {
 }
 
 void main() {
-    uint codeblock_index = gl_GlobalInvocationID.x;
+    uint codeblock_index = gl_WorkGroupID.x;
     if (codeblock_index >= pc.codeblock_count) {
         return;
     }
 
     codeblock = codeblocks[codeblock_index];
-    for (uint i = 0u; i < MQ_CONTEXT_COUNT; i++) {
-        context_state[i] = 0u;
-        context_mps[i] = 0u;
-    }
-    context_state[0] = 4u;
-    context_state[17] = 3u;
-    context_state[18] = 46u;
-    for (uint i = 0u; i < codeblock.coefficient_count; i++) {
+    
+    // Collaborative shared memory zero-initialization
+    for (uint i = gl_LocalInvocationID.x; i < codeblock.coefficient_count; i += 32u) {
         coefficient_state[i] = 0u;
     }
+    barrier();
 
-    byte_pos = 0u;
-    c_reg = byte_at(0u) << 16u;
-    ct_reg = 0u;
-    byte_in();
-    c_reg <<= 7u;
-    ct_reg -= 7u;
-    a_reg = 0x8000u;
-    significance_bits = 0u;
-    sign_bits = 0u;
-    refinement_bits = 0u;
-    run_length_bits = 0u;
-    uniform_bits = 0u;
-    became_significant = 0u;
-    visited = 0u;
-    decoded_passes = 0u;
-    visit_generation = 1u;
+    // Only thread 0 performs MQ arithmetic decoding
+    if (gl_LocalInvocationID.x == 0u) {
+        for (uint i = 0u; i < MQ_CONTEXT_COUNT; i++) {
+            context_state[i] = 0u;
+            context_mps[i] = 0u;
+        }
+        context_state[0] = 4u;
+        context_state[17] = 3u;
+        context_state[18] = 46u;
 
-    if (codeblock.pass_count > 0u) {
-        uint first_bitplane = codeblock.magnitude_bitplanes - codeblock.zero_bit_planes - 1u;
-        decode_cleanup_pass(first_bitplane);
+        byte_pos = 0u;
+        c_reg = byte_at(0u) << 16u;
+        ct_reg = 0u;
+        byte_in();
+        c_reg <<= 7u;
+        ct_reg -= 7u;
+        a_reg = 0x8000u;
+        significance_bits = 0u;
+        sign_bits = 0u;
+        refinement_bits = 0u;
+        run_length_bits = 0u;
+        uniform_bits = 0u;
+        became_significant = 0u;
+        visited = 0u;
+        decoded_passes = 0u;
+        visit_generation = 1u;
 
-        uint pass_index = 1u;
-        uint bitplane = first_bitplane - 1u;
-        while (pass_index < codeblock.pass_count) {
-            clear_bitplane_visits();
-            decode_significance_pass(bitplane);
-            pass_index += 1u;
-            if (pass_index >= codeblock.pass_count) {
-                break;
-            }
+        if (codeblock.pass_count > 0u) {
+            uint first_bitplane = codeblock.magnitude_bitplanes - codeblock.zero_bit_planes - 1u;
+            decode_cleanup_pass(first_bitplane);
 
-            decode_refinement_pass(bitplane);
-            pass_index += 1u;
-            if (pass_index >= codeblock.pass_count) {
-                break;
-            }
+            uint pass_index = 1u;
+            uint bitplane = first_bitplane - 1u;
+            while (pass_index < codeblock.pass_count) {
+                clear_bitplane_visits();
+                decode_significance_pass(bitplane);
+                pass_index += 1u;
+                if (pass_index >= codeblock.pass_count) {
+                    break;
+                }
 
-            decode_cleanup_pass(bitplane);
-            pass_index += 1u;
-            if (bitplane > 0u) {
-                bitplane -= 1u;
+                decode_refinement_pass(bitplane);
+                pass_index += 1u;
+                if (pass_index >= codeblock.pass_count) {
+                    break;
+                }
+
+                decode_cleanup_pass(bitplane);
+                pass_index += 1u;
+                if (bitplane > 0u) {
+                    bitplane -= 1u;
+                }
             }
         }
-    }
 
-    uint nonzero = 0u;
-    uint checksum = 0u;
-    for (uint i = 0u; i < codeblock.coefficient_count; i++) {
-        uint offset = codeblock.coefficient_offset + i;
-        if (is_significant_index(i)) {
-            int coefficient = output_coefficients[offset];
-            nonzero += 1u;
-            checksum += uint(coefficient);
-        } else {
-            output_coefficients[offset] = 0;
+        uint nonzero = 0u;
+        uint checksum = 0u;
+        for (uint i = 0u; i < codeblock.coefficient_count; i++) {
+            uint offset = codeblock.coefficient_offset + i;
+            if (is_significant_index(i)) {
+                int coefficient = output_coefficients[offset];
+                nonzero += 1u;
+                checksum += uint(coefficient);
+            } else {
+                output_coefficients[offset] = 0;
+            }
         }
+        uint output_offset = codeblock_index * 9u;
+        output_words[output_offset + 0u] = nonzero;
+        output_words[output_offset + 1u] = checksum;
+        output_words[output_offset + 2u] = byte_pos;
+        output_words[output_offset + 3u] = decoded_passes;
+        output_words[output_offset + 4u] = significance_bits;
+        output_words[output_offset + 5u] = sign_bits;
+        output_words[output_offset + 6u] = refinement_bits;
+        output_words[output_offset + 7u] = became_significant;
+        output_words[output_offset + 8u] = visited;
     }
-    uint output_offset = codeblock_index * 9u;
-    output_words[output_offset + 0u] = nonzero;
-    output_words[output_offset + 1u] = checksum;
-    output_words[output_offset + 2u] = byte_pos;
-    output_words[output_offset + 3u] = decoded_passes;
-    output_words[output_offset + 4u] = significance_bits;
-    output_words[output_offset + 5u] = sign_bits;
-    output_words[output_offset + 6u] = refinement_bits;
-    output_words[output_offset + 7u] = became_significant;
-    output_words[output_offset + 8u] = visited;
 }
