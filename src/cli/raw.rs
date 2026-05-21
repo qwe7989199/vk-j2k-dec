@@ -12,12 +12,15 @@ use vk_j2k_dec::decode::{
     decode_rgb48_with_gpu_dwt_profiled, decode_rgb48_with_gpu_pipeline,
     decode_rgb48_with_gpu_pipeline_profiled, decode_rgb48_with_persistent_gpu_pipeline_profiled,
 };
+use vk_j2k_dec::gpu::{
+    GpuTier1CodeblockRecord, GpuTier1Plan, GpuTier1ScatterPlan, GpuTier1ScatterRecord,
+};
 use vk_j2k_dec::packet::parse_lrcp_tile_packets;
 use vk_j2k_dec::reconstruct::{ComponentSubbandPlanes, ResolutionSubbandPlane};
 use vk_j2k_dec::tier1::{
     CoefficientReconstruction, DecodedCodeblock, MqDecoder, Tier1CodingMode, Tier1WorkPlan,
 };
-use vk_j2k_dec::vulkan::VulkanRgb48Pipeline;
+use vk_j2k_dec::vulkan::{VulkanRgb48Pipeline, VulkanTier1Rgb48Pipeline};
 
 pub fn decode_rgb48_file(input: &str, output: &str) -> ExitCode {
     decode_rgb48_file_with_discard(input, 0, output)
@@ -334,8 +337,10 @@ pub fn profile_mxf_ffmpeg_file(
         eprintln!("profile-mxf-ffmpeg failed: frames must be greater than 0");
         return ExitCode::FAILURE;
     }
-    if !matches!(mode, "cpu" | "gpu-dwt" | "gpu") {
-        eprintln!("profile-mxf-ffmpeg failed: mode must be cpu, gpu-dwt, or gpu, got {mode}");
+    if !matches!(mode, "cpu" | "gpu-dwt" | "gpu" | "gpu-tier1") {
+        eprintln!(
+            "profile-mxf-ffmpeg failed: mode must be cpu, gpu-dwt, gpu, or gpu-tier1, got {mode}"
+        );
         return ExitCode::FAILURE;
     }
 
@@ -377,6 +382,20 @@ pub fn profile_mxf_ffmpeg_file(
             eprintln!("profile-mxf-ffmpeg failed: failed to run {ffmpeg_path}: {err}");
             return ExitCode::FAILURE;
         }
+    }
+
+    if mode == "gpu-tier1" {
+        return profile_mxf_ffmpeg_gpu_tier1_file(
+            input,
+            frame_count,
+            discard_levels,
+            output,
+            ffmpeg_path,
+            work_dir,
+            demux_ms,
+            idwt53_shader_path,
+            color_shader_path,
+        );
     }
 
     let pipeline_setup_start = Instant::now();
@@ -485,6 +504,469 @@ pub fn profile_mxf_ffmpeg_file(
 
 fn frame_path(work_dir: &Path, one_based_index: usize) -> PathBuf {
     work_dir.join(format!("frame_{one_based_index:06}.j2k"))
+}
+
+struct FastTier1Rgb48Frame {
+    records: Vec<GpuTier1CodeblockRecord>,
+    compressed_words: Vec<u32>,
+    flat_coefficient_count: usize,
+    scatter_plan: GpuTier1ScatterPlan,
+    target_resolution: u8,
+    color_transform: u32,
+    precision: u8,
+}
+
+fn profile_mxf_ffmpeg_gpu_tier1_file(
+    input: &str,
+    frame_count: usize,
+    discard_levels: u8,
+    output: &str,
+    ffmpeg_path: &str,
+    work_dir: &Path,
+    demux_ms: f64,
+    idwt53_shader_path: &str,
+    color_shader_path: &str,
+) -> ExitCode {
+    if discard_levels != 0 {
+        eprintln!("profile-mxf-ffmpeg gpu-tier1 currently supports discard 0 only");
+        return ExitCode::FAILURE;
+    }
+    let cleanup_shader_path = r"target\shaders\tier1_cleanup_smoke.comp.spv";
+    let scatter_shader_path = r"target\shaders\tier1_scatter_smoke.comp.spv";
+    let mut read_total_ms = 0.0;
+    let mut frame_plans = Vec::with_capacity(frame_count);
+    let mut total_bytes = 0usize;
+    for frame_index in 0..frame_count {
+        let frame_path = frame_path(work_dir, frame_index + 1);
+        let read_start = Instant::now();
+        let data = match fs::read(&frame_path) {
+            Ok(data) => data,
+            Err(err) => {
+                eprintln!(
+                    "profile-mxf-ffmpeg gpu-tier1 failed: cannot read {}: {err}",
+                    frame_path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        read_total_ms += elapsed_ms(read_start);
+        total_bytes += data.len();
+        let frame_plan = match build_fast_tier1_rgb48_frame(&data) {
+            Ok(frame_plan) => frame_plan,
+            Err(err) => {
+                eprintln!(
+                    "profile-mxf-ffmpeg gpu-tier1 failed on frame {}: {err}",
+                    frame_index + 1
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        frame_plans.push(frame_plan);
+    }
+    if frame_plans.is_empty() {
+        eprintln!("profile-mxf-ffmpeg gpu-tier1 failed: no frames decoded");
+        return ExitCode::FAILURE;
+    };
+    let (template_records, template_scatter_records, flat_coefficient_count) =
+        match build_tier1_union_template(&frame_plans) {
+            Ok(template) => template,
+            Err(err) => {
+                eprintln!("profile-mxf-ffmpeg gpu-tier1 failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+    for (index, frame) in frame_plans.iter_mut().enumerate() {
+        if let Err(err) =
+            align_tier1_records_to_template(&template_records, &template_scatter_records, frame)
+        {
+            eprintln!(
+                "profile-mxf-ffmpeg gpu-tier1 failed: frame {} cannot use frame 1 layout: {err}",
+                index + 1
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    let first_frame = frame_plans
+        .first()
+        .expect("frame_plans was checked to be non-empty");
+    let codeblock_count = first_frame.records.len();
+    let scatter_plan = first_frame.scatter_plan.clone();
+    let target_resolution = first_frame.target_resolution;
+    let color_transform = first_frame.color_transform;
+    let precision = first_frame.precision;
+    let compressed_word_capacity = frame_plans
+        .iter()
+        .map(|frame| frame.compressed_words.len())
+        .max()
+        .unwrap_or(0);
+    for (index, frame) in frame_plans.iter().enumerate() {
+        if frame.records.len() != codeblock_count {
+            eprintln!(
+                "profile-mxf-ffmpeg gpu-tier1 failed: frame {} has {} records, expected {}",
+                index + 1,
+                frame.records.len(),
+                codeblock_count
+            );
+            return ExitCode::FAILURE;
+        }
+        if frame.flat_coefficient_count != flat_coefficient_count
+            || frame.scatter_plan.records != scatter_plan.records
+            || frame.scatter_plan.planes != scatter_plan.planes
+            || frame.scatter_plan.output_coefficients != scatter_plan.output_coefficients
+            || frame.target_resolution != target_resolution
+            || frame.color_transform != color_transform
+            || frame.precision != precision
+        {
+            eprintln!(
+                "profile-mxf-ffmpeg gpu-tier1 failed: frame {} layout differs from frame 1",
+                index + 1
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let pipeline = match VulkanTier1Rgb48Pipeline::new(
+        cleanup_shader_path,
+        scatter_shader_path,
+        idwt53_shader_path,
+        color_shader_path,
+        codeblock_count,
+        compressed_word_capacity,
+        flat_coefficient_count,
+        &scatter_plan.records,
+        &scatter_plan.planes,
+        scatter_plan.output_coefficients,
+        target_resolution,
+        color_transform,
+        precision,
+    ) {
+        Ok(pipeline) => pipeline,
+        Err(err) => {
+            eprintln!("profile-mxf-ffmpeg gpu-tier1 failed: pipeline setup failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut frame_total_ms = Vec::with_capacity(frame_count);
+    let mut upload_ms = Vec::with_capacity(frame_count);
+    let mut dispatch_ms = Vec::with_capacity(frame_count);
+    let mut copy_ms = Vec::with_capacity(frame_count);
+    let mut readback_ms = Vec::with_capacity(frame_count);
+    let mut last_samples = None;
+    let decode_loop_start = Instant::now();
+    for (frame_index, frame) in frame_plans.iter().enumerate() {
+        let decoded = match pipeline.decode_frame(&frame.records, &frame.compressed_words) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                eprintln!(
+                    "profile-mxf-ffmpeg gpu-tier1 failed on frame {}: {err}",
+                    frame_index + 1
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "  frame {:>4}: gpu_tier1_total_ms {:.3} upload_ms {:.3} fused_dispatch_ms {:.3} color_copy_ms {:.3} color_readback_ms {:.3}",
+            frame_index + 1,
+            decoded.total_ms,
+            decoded.upload_ms,
+            decoded.fused_dispatch_ms,
+            decoded.color_copy_ms,
+            decoded.color_readback_ms
+        );
+        frame_total_ms.push(decoded.total_ms);
+        upload_ms.push(decoded.upload_ms);
+        dispatch_ms.push(decoded.fused_dispatch_ms);
+        copy_ms.push(decoded.color_copy_ms);
+        readback_ms.push(decoded.color_readback_ms);
+        last_samples = Some(decoded.samples);
+    }
+    let decode_loop_ms = elapsed_ms(decode_loop_start);
+    let Some(samples) = last_samples else {
+        eprintln!("profile-mxf-ffmpeg gpu-tier1 failed: no frames decoded");
+        return ExitCode::FAILURE;
+    };
+    let write_start = Instant::now();
+    if let Err(err) = fs::write(output, samples_to_le_bytes(&samples)) {
+        eprintln!("failed to write {output}: {err}");
+        return ExitCode::FAILURE;
+    }
+    let write_ms = elapsed_ms(write_start);
+    let sample_count = samples.len() / 3;
+    println!(
+        "profile-mxf-ffmpeg: mode gpu-tier1, {} samples/frame, discard {}, frames {}, demuxed {} bytes -> {output}",
+        samples.len(),
+        discard_levels,
+        frame_count,
+        total_bytes
+    );
+    println!("  ffmpeg_path {ffmpeg_path}");
+    println!("  input {input}");
+    println!("  work_dir {}", work_dir.display());
+    println!("  vulkan_device {}", pipeline.device_name());
+    println!("  ffmpeg_demux_ms {:.3}", demux_ms);
+    println!("  read_frames_ms {:.3}", read_total_ms);
+    println!("  pipeline_setup_ms {:.3}", pipeline.setup_ms());
+    println!("  decode_loop_ms {:.3}", decode_loop_ms);
+    println!("  write_last_ms {:.3}", write_ms);
+    print_fast_tier1_average(
+        "avg_all_frames",
+        &frame_total_ms,
+        &upload_ms,
+        &dispatch_ms,
+        &copy_ms,
+        &readback_ms,
+    );
+    if frame_total_ms.len() > 1 {
+        print_fast_tier1_average(
+            "avg_skip_first_frame",
+            &frame_total_ms[1..],
+            &upload_ms[1..],
+            &dispatch_ms[1..],
+            &copy_ms[1..],
+            &readback_ms[1..],
+        );
+    }
+    println!("  output_pixels {}", sample_count);
+    ExitCode::SUCCESS
+}
+
+fn build_fast_tier1_rgb48_frame(data: &[u8]) -> Result<FastTier1Rgb48Frame, String> {
+    let codestream = Codestream::parse(data).map_err(|err| err.to_string())?;
+    let siz = codestream
+        .siz
+        .as_ref()
+        .ok_or_else(|| "missing SIZ marker".to_string())?;
+    let cod = codestream
+        .cod
+        .as_ref()
+        .ok_or_else(|| "missing COD marker".to_string())?;
+    if cod.transform != WaveletTransform::Reversible53 {
+        return Err(format!(
+            "gpu-tier1 currently requires reversible 5/3, got {}",
+            cod.transform
+        ));
+    }
+    if codestream.tile_parts.len() != 1 {
+        return Err(format!(
+            "gpu-tier1 currently supports one tile-part, found {}",
+            codestream.tile_parts.len()
+        ));
+    }
+    let layouts = codestream.tile_layouts().map_err(|err| err.to_string())?;
+    let tile_part = &codestream.tile_parts[0];
+    let layout = layouts
+        .iter()
+        .find(|layout| layout.tile_index == tile_part.tile_index)
+        .ok_or_else(|| format!("missing layout for tile {}", tile_part.tile_index))?;
+    let tile_data = data
+        .get(tile_part.data_start..tile_part.data_end)
+        .ok_or_else(|| "tile payload outside codestream".to_string())?;
+    let packet_summary =
+        parse_lrcp_tile_packets(tile_data, layout, cod.layers).map_err(|err| err.to_string())?;
+    let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
+        &packet_summary,
+        codestream.qcd.as_ref(),
+        &codestream.qccs,
+    )
+    .map_err(|err| err.to_string())?;
+    let bound = work_plan
+        .bind_segment_data(tile_data)
+        .map_err(|err| err.to_string())?;
+    let plan = GpuTier1Plan::from_bound_work_plan(&bound, cod.codeblock_style_flags())
+        .map_err(|err| err.to_string())?;
+    let scatter_plan = plan
+        .scatter_plan(&layout.components)
+        .map_err(|err| err.to_string())?;
+    let precision = siz
+        .components
+        .first()
+        .map(|component| component.precision)
+        .unwrap_or(0);
+    Ok(FastTier1Rgb48Frame {
+        records: plan.codeblock_records(),
+        compressed_words: plan.compressed_u32_words(),
+        flat_coefficient_count: plan.output_coefficients,
+        scatter_plan,
+        target_resolution: cod.decomposition_levels,
+        color_transform: u32::from(cod.multiple_component_transform),
+        precision,
+    })
+}
+
+fn align_tier1_records_to_template(
+    template: &[GpuTier1CodeblockRecord],
+    template_scatter_records: &[vk_j2k_dec::gpu::GpuTier1ScatterRecord],
+    frame: &mut FastTier1Rgb48Frame,
+) -> Result<(), String> {
+    let mut by_key = BTreeMap::new();
+    for record in frame.records.iter().copied() {
+        by_key.insert(tier1_record_key(&record), record);
+    }
+    let mut aligned = Vec::with_capacity(template.len());
+    for template_record in template {
+        let mut record = match by_key.remove(&tier1_record_key(template_record)) {
+            Some(record) => record,
+            None => {
+                let mut zero = *template_record;
+                zero.magnitude_bitplanes = 0;
+                zero.zero_bit_planes = 0;
+                zero.byte_offset = 0;
+                zero.byte_len = 0;
+                zero.pass_offset = 0;
+                zero.pass_count = 0;
+                zero
+            }
+        };
+        if record.width != template_record.width || record.height != template_record.height {
+            return Err(format!(
+                "codeblock C{} R{} S{} {},{} changed from {}x{} to {}x{}",
+                template_record.component,
+                template_record.resolution,
+                template_record.subband,
+                template_record.codeblock_x,
+                template_record.codeblock_y,
+                template_record.width,
+                template_record.height,
+                record.width,
+                record.height
+            ));
+        }
+        record.coefficient_offset = template_record.coefficient_offset;
+        record.coefficient_count = template_record.coefficient_count;
+        aligned.push(record);
+    }
+    if let Some(record) = by_key.values().next() {
+        return Err(format!(
+            "frame contains codeblock not present in frame 1 template: C{} R{} S{} {},{}",
+            record.component,
+            record.resolution,
+            record.subband,
+            record.codeblock_x,
+            record.codeblock_y
+        ));
+    }
+    frame.records = aligned;
+    frame.scatter_plan.records = template_scatter_records.to_vec();
+    frame.flat_coefficient_count = template
+        .iter()
+        .map(|record| record.coefficient_offset + record.coefficient_count)
+        .max()
+        .unwrap_or(0) as usize;
+    Ok(())
+}
+
+fn build_tier1_union_template(
+    frames: &[FastTier1Rgb48Frame],
+) -> Result<
+    (
+        Vec<GpuTier1CodeblockRecord>,
+        Vec<GpuTier1ScatterRecord>,
+        usize,
+    ),
+    String,
+> {
+    let mut by_key = BTreeMap::<
+        (u32, u32, u32, u32, u32),
+        (GpuTier1CodeblockRecord, GpuTier1ScatterRecord),
+    >::new();
+    for (frame_index, frame) in frames.iter().enumerate() {
+        if frame.records.len() != frame.scatter_plan.records.len() {
+            return Err(format!(
+                "frame {} has {} codeblock records but {} scatter records",
+                frame_index + 1,
+                frame.records.len(),
+                frame.scatter_plan.records.len()
+            ));
+        }
+        for (record, scatter) in frame.records.iter().zip(&frame.scatter_plan.records) {
+            let key = tier1_record_key(record);
+            if let Some((existing, _)) = by_key.get(&key) {
+                if existing.width != record.width
+                    || existing.height != record.height
+                    || existing.coefficient_count != record.coefficient_count
+                {
+                    return Err(format!(
+                        "codeblock C{} R{} S{} {},{} geometry changed across frames",
+                        record.component,
+                        record.resolution,
+                        record.subband,
+                        record.codeblock_x,
+                        record.codeblock_y
+                    ));
+                }
+            } else {
+                by_key.insert(key, (*record, *scatter));
+            }
+        }
+    }
+
+    let mut coefficient_offset = 0u32;
+    let mut template_records = Vec::with_capacity(by_key.len());
+    let mut template_scatter = Vec::with_capacity(by_key.len());
+    for (_, (mut record, mut scatter)) in by_key {
+        record.byte_offset = 0;
+        record.byte_len = 0;
+        record.pass_offset = 0;
+        record.pass_count = 0;
+        record.coefficient_offset = coefficient_offset;
+        scatter.coefficient_offset = coefficient_offset;
+        template_records.push(record);
+        template_scatter.push(scatter);
+        coefficient_offset = coefficient_offset
+            .checked_add(record.coefficient_count)
+            .ok_or_else(|| "GPU Tier-1 union coefficient offset overflow".to_string())?;
+    }
+    Ok((
+        template_records,
+        template_scatter,
+        coefficient_offset as usize,
+    ))
+}
+
+fn tier1_record_key(record: &GpuTier1CodeblockRecord) -> (u32, u32, u32, u32, u32) {
+    (
+        record.component,
+        record.resolution,
+        record.subband,
+        record.codeblock_x,
+        record.codeblock_y,
+    )
+}
+
+fn samples_to_le_bytes(samples: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
+fn print_fast_tier1_average(
+    label: &str,
+    total_ms: &[f64],
+    upload_ms: &[f64],
+    dispatch_ms: &[f64],
+    copy_ms: &[f64],
+    readback_ms: &[f64],
+) {
+    let total = average_f64(total_ms);
+    println!(
+        "  {label}_ms total {:.3} fps {:.2} upload {:.3} fused_dispatch {:.3} color_copy {:.3} color_readback {:.3}",
+        total,
+        1000.0 / total,
+        average_f64(upload_ms),
+        average_f64(dispatch_ms),
+        average_f64(copy_ms),
+        average_f64(readback_ms)
+    );
+}
+
+fn average_f64(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<f64>() / values.len() as f64
 }
 
 pub fn diff_rgb48_files(actual: &str, reference: &str) -> ExitCode {

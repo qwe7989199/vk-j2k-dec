@@ -449,6 +449,16 @@ pub struct Tier1CleanupScatterRgb48BenchResult {
     pub summary_readback_ms: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct VulkanTier1Rgb48FrameResult {
+    pub samples: Vec<u16>,
+    pub upload_ms: f64,
+    pub fused_dispatch_ms: f64,
+    pub color_copy_ms: f64,
+    pub color_readback_ms: f64,
+    pub total_ms: f64,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct Tier1PlanSmokePushConstants {
@@ -1894,6 +1904,7 @@ impl ReusableScatteredIdwt53Component {
 struct ReusableRgb48Packer {
     output_count: usize,
     output_byte_len: u64,
+    output_shift: u32,
     output_buffer: HostBuffer,
     staging_buffer: HostBuffer,
     descriptor_set: VkDescriptorSet,
@@ -1971,6 +1982,7 @@ impl ReusableRgb48Packer {
         Ok(Self {
             output_count,
             output_byte_len,
+            output_shift: u32::from(16 - precision),
             output_buffer,
             staging_buffer,
             descriptor_set,
@@ -2009,13 +2021,294 @@ impl ReusableRgb48Packer {
         let copy_ms = copy_start.elapsed().as_secs_f64() * 1000.0;
 
         let readback_start = std::time::Instant::now();
-        let samples = self.staging_buffer.read_vec::<u16>(self.output_count)?;
+        let mut samples = self.staging_buffer.read_vec::<u16>(self.output_count)?;
+        if self.output_shift > 0 {
+            for sample in &mut samples {
+                *sample = sample.wrapping_shl(self.output_shift);
+            }
+        }
         let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
         Ok(GpuPackedRgb48Result {
             samples,
             shader_ms: 0.0,
             copy_ms,
             readback_ms,
+        })
+    }
+}
+
+pub struct VulkanTier1Rgb48Pipeline {
+    device_name: String,
+    queue_family_index: u32,
+    codeblock_count: usize,
+    compressed_word_capacity: usize,
+    setup_ms: f64,
+    cleanup_records_buffer: HostBuffer,
+    compressed_buffer: HostBuffer,
+    _scatter_records_buffer: HostBuffer,
+    _output_buffer: HostBuffer,
+    _flat_coefficient_buffer: HostBuffer,
+    _plane_buffer: HostBuffer,
+    _cleanup_descriptor_pool: DescriptorPoolHandle,
+    _scatter_descriptor_pool: DescriptorPoolHandle,
+    _fused_command_pool: CommandPoolHandle,
+    fused_command_buffer: VkCommandBuffer,
+    rgb48_packer: ReusableRgb48Packer,
+    _idwt_components: Vec<ReusableScatteredIdwt53Component>,
+    _cleanup_program: StorageComputeProgram,
+    _scatter_program: StorageComputeProgram,
+    _idwt53_program: StorageComputeProgram,
+    _color_program: StorageComputeProgram,
+    _context: VulkanComputeContext,
+}
+
+impl VulkanTier1Rgb48Pipeline {
+    pub fn new(
+        cleanup_shader_path: &str,
+        scatter_shader_path: &str,
+        idwt53_shader_path: &str,
+        color_shader_path: &str,
+        codeblock_count: usize,
+        compressed_word_capacity: usize,
+        flat_coefficient_count: usize,
+        scatter_records: &[crate::gpu::GpuTier1ScatterRecord],
+        scatter_planes: &[crate::gpu::GpuTier1ScatterPlane],
+        output_coefficients: usize,
+        target_resolution: u8,
+        color_transform: u32,
+        precision: u8,
+    ) -> Result<Self, VulkanError> {
+        if codeblock_count == 0 {
+            return Err(VulkanError::new(
+                "persistent GPU Tier-1 RGB48 pipeline requires at least one codeblock",
+            ));
+        }
+        if compressed_word_capacity == 0 {
+            return Err(VulkanError::new(
+                "persistent GPU Tier-1 RGB48 pipeline requires compressed word capacity",
+            ));
+        }
+        let max_scatter_coefficients =
+            validate_tier1_scatter_inputs(scatter_records, flat_coefficient_count, output_coefficients)?;
+        let cleanup_spirv = read_spirv(cleanup_shader_path)?;
+        let scatter_spirv = read_spirv(scatter_shader_path)?;
+        let idwt53_spirv = read_spirv(idwt53_shader_path)?;
+        let color_spirv = read_spirv(color_shader_path)?;
+        let (context, summary, queue_family_index) = create_compute_context()?;
+        let device = &context.device;
+        let setup_start = std::time::Instant::now();
+        let cleanup_program = StorageComputeProgram::new(
+            device,
+            &cleanup_spirv,
+            4,
+            std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
+        )?;
+        let scatter_program = StorageComputeProgram::new(
+            device,
+            &scatter_spirv,
+            3,
+            std::mem::size_of::<Tier1ScatterSmokePushConstants>() as u32,
+        )?;
+        let idwt53_program = StorageComputeProgram::new(
+            device,
+            &idwt53_spirv,
+            3,
+            std::mem::size_of::<Idwt53OffsetPushConstants>() as u32,
+        )?;
+        let color_program = StorageComputeProgram::new(
+            device,
+            &color_spirv,
+            4,
+            std::mem::size_of::<ColorPushConstants>() as u32,
+        )?;
+
+        let records_byte_len = bytes_len::<crate::gpu::GpuTier1CodeblockRecord>(codeblock_count)?;
+        let compressed_byte_len = bytes_len::<u32>(compressed_word_capacity)?;
+        let cleanup_records_buffer = device.create_host_cached_buffer(
+            records_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let compressed_buffer = device.create_host_cached_buffer(
+            compressed_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let scatter_records_buffer = create_device_buffer_from_slice(
+            device,
+            queue_family_index,
+            scatter_records,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let output_len = codeblock_count * 9;
+        let output_buffer = device.create_device_local_buffer(
+            bytes_len::<u32>(output_len)?,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        )?;
+        let flat_coefficient_buffer = device.create_device_local_buffer(
+            bytes_len::<i32>(flat_coefficient_count)?,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let plane_buffer = device.create_device_local_buffer(
+            bytes_len::<i32>(output_coefficients)?,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+
+        let mut component_ids = scatter_planes
+            .iter()
+            .map(|plane| plane.component)
+            .collect::<Vec<_>>();
+        component_ids.sort_unstable();
+        component_ids.dedup();
+        let idwt_components = component_ids
+            .iter()
+            .map(|component| {
+                ReusableScatteredIdwt53Component::new(
+                    device,
+                    &idwt53_program,
+                    &plane_buffer,
+                    scatter_planes,
+                    *component,
+                    target_resolution,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let rgb48_packer = ReusableRgb48Packer::new(
+            device,
+            &color_program,
+            &idwt_components,
+            color_transform,
+            precision,
+        )?;
+
+        let cleanup_push = Tier1CleanupSmokePushConstants {
+            codeblock_count: codeblock_count as u32,
+        };
+        let scatter_push = Tier1ScatterSmokePushConstants {
+            codeblock_count: scatter_records.len() as u32,
+        };
+        let cleanup_descriptors = [
+            cleanup_records_buffer.descriptor_info(),
+            compressed_buffer.descriptor_info(),
+            output_buffer.descriptor_info(),
+            flat_coefficient_buffer.descriptor_info(),
+        ];
+        let cleanup_descriptor_pool = device.create_descriptor_pool(4, 1)?;
+        let cleanup_descriptor_set = device.allocate_descriptor_set(
+            cleanup_descriptor_pool.handle,
+            cleanup_program.descriptor_set_layout.handle,
+        )?;
+        device.update_storage_descriptor_set(cleanup_descriptor_set, &cleanup_descriptors);
+        let scatter_descriptors = [
+            scatter_records_buffer.descriptor_info(),
+            flat_coefficient_buffer.descriptor_info(),
+            plane_buffer.descriptor_info(),
+        ];
+        let scatter_descriptor_pool = device.create_descriptor_pool(3, 1)?;
+        let scatter_descriptor_set = device.allocate_descriptor_set(
+            scatter_descriptor_pool.handle,
+            scatter_program.descriptor_set_layout.handle,
+        )?;
+        device.update_storage_descriptor_set(scatter_descriptor_set, &scatter_descriptors);
+
+        let fused_command_pool = device.create_command_pool(queue_family_index)?;
+        let fused_command_buffer = device.allocate_command_buffer(fused_command_pool.handle)?;
+        let mut fused_dispatches = Vec::new();
+        fused_dispatches.push(StorageDispatch {
+            pipeline: cleanup_program.pipeline.handle,
+            pipeline_layout: cleanup_program.pipeline_layout.handle,
+            descriptor_set: cleanup_descriptor_set,
+            push_constants: bytes_of(&cleanup_push),
+            groups: [tier1_cleanup_groups(codeblock_count), 1, 1],
+        });
+        fused_dispatches.push(StorageDispatch {
+            pipeline: scatter_program.pipeline.handle,
+            pipeline_layout: scatter_program.pipeline_layout.handle,
+            descriptor_set: scatter_descriptor_set,
+            push_constants: bytes_of(&scatter_push),
+            groups: [
+                max_scatter_coefficients.div_ceil(256),
+                scatter_records.len() as u32,
+                1,
+            ],
+        });
+        for component in &idwt_components {
+            component.extend_storage_dispatches(&idwt53_program, &mut fused_dispatches);
+        }
+        rgb48_packer.extend_storage_dispatches(&color_program, &mut fused_dispatches);
+        device.record_storage_dispatches(fused_command_buffer, &fused_dispatches)?;
+
+        Ok(Self {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            codeblock_count,
+            compressed_word_capacity,
+            setup_ms: setup_start.elapsed().as_secs_f64() * 1000.0,
+            cleanup_records_buffer,
+            compressed_buffer,
+            _scatter_records_buffer: scatter_records_buffer,
+            _output_buffer: output_buffer,
+            _flat_coefficient_buffer: flat_coefficient_buffer,
+            _plane_buffer: plane_buffer,
+            _cleanup_descriptor_pool: cleanup_descriptor_pool,
+            _scatter_descriptor_pool: scatter_descriptor_pool,
+            _fused_command_pool: fused_command_pool,
+            fused_command_buffer,
+            rgb48_packer,
+            _idwt_components: idwt_components,
+            _cleanup_program: cleanup_program,
+            _scatter_program: scatter_program,
+            _idwt53_program: idwt53_program,
+            _color_program: color_program,
+            _context: context,
+        })
+    }
+
+    pub fn setup_ms(&self) -> f64 {
+        self.setup_ms
+    }
+
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    pub fn decode_frame(
+        &self,
+        records: &[crate::gpu::GpuTier1CodeblockRecord],
+        compressed_words: &[u32],
+    ) -> Result<VulkanTier1Rgb48FrameResult, VulkanError> {
+        if records.len() != self.codeblock_count {
+            return Err(VulkanError::new(format!(
+                "persistent GPU Tier-1 RGB48 pipeline expected {} records, got {}",
+                self.codeblock_count,
+                records.len()
+            )));
+        }
+        if compressed_words.len() > self.compressed_word_capacity {
+            return Err(VulkanError::new(format!(
+                "persistent GPU Tier-1 RGB48 compressed words {} exceed capacity {}",
+                compressed_words.len(),
+                self.compressed_word_capacity
+            )));
+        }
+        let device = &self._context.device;
+        let total_start = std::time::Instant::now();
+        let upload_start = std::time::Instant::now();
+        self.cleanup_records_buffer.write_slice(records)?;
+        self.compressed_buffer.write_slice(compressed_words)?;
+        let upload_ms = upload_start.elapsed().as_secs_f64() * 1000.0;
+
+        let dispatch_start = std::time::Instant::now();
+        device.submit_and_wait(self.fused_command_buffer)?;
+        let fused_dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
+        let packed = self
+            .rgb48_packer
+            .readback(device, self.queue_family_index)?;
+        Ok(VulkanTier1Rgb48FrameResult {
+            samples: packed.samples,
+            upload_ms,
+            fused_dispatch_ms,
+            color_copy_ms: packed.copy_ms,
+            color_readback_ms: packed.readback_ms,
+            total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
         })
     }
 }

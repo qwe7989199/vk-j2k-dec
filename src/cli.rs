@@ -262,26 +262,26 @@ pub fn run() -> ExitCode {
             let Some(frame_count) = args.next().and_then(|value| value.parse::<usize>().ok())
             else {
                 eprintln!(
-                    "usage: {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
+                    "usage: {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu|gpu-tier1> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
                 );
                 return ExitCode::FAILURE;
             };
             let Some(discard_levels) = args.next().and_then(|value| value.parse::<u8>().ok())
             else {
                 eprintln!(
-                    "usage: {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
+                    "usage: {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu|gpu-tier1> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
                 );
                 return ExitCode::FAILURE;
             };
             let Some(mode) = args.next() else {
                 eprintln!(
-                    "usage: {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
+                    "usage: {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu|gpu-tier1> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
                 );
                 return ExitCode::FAILURE;
             };
             let Some(output) = args.next() else {
                 eprintln!(
-                    "usage: {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
+                    "usage: {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu|gpu-tier1> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
                 );
                 return ExitCode::FAILURE;
             };
@@ -494,7 +494,7 @@ pub fn run() -> ExitCode {
                 "  {program} profile-rgb48-bench <input.j2k> <discard-levels> <cpu|gpu-dwt|gpu> <iterations> <output.rgb48le> [idwt53.comp.spv] [color.comp.spv]"
             );
             eprintln!(
-                "  {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
+                "  {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu|gpu-tier1> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
             );
             eprintln!("  {program} diff-rgb48 <actual.rgb48le> <reference.rgb48le>");
             eprintln!("  {program} diff-component-plane <actual.i32le> <reference.i32le>");

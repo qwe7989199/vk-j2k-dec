@@ -74,13 +74,15 @@ the final 12.4 MB RGB48 buffer after DWT outputs are kept device-local through
 color conversion. With the high-level path using parallel Tier-1 codeblock
 decode, batched DWT subband uploads, and batched DWT dispatch command buffers,
 the same frame currently averages about 86 ms/frame through the persistent
-CPU-Tier1/GPU-DWT RGB48 benchmark. The device-local GPU Tier-1 fast path now
-averages about 38 ms/frame, compared with about 136 ms/frame for the local
-FFmpeg native JPEG2000 null loop. The next GPU milestones are:
+CPU-Tier1/GPU-DWT RGB48 benchmark. The device-local GPU Tier-1 fast path is now
+wired into the real-MXF profiler and averages about 37.8 ms/frame on 10 real
+frames, compared with about 149.7 ms/frame for the local CPU path on the same
+run. The next GPU milestones are:
 
 - add persistent buffer pools for repeated full-frame decode;
 - overlap CPU Tier-1, coefficient uploads, and GPU reconstruction;
-- replace CPU Tier-1 with a real GPU Tier-1 decoder;
+- reduce the remaining GPU Tier-1 fused dispatch cost;
+- add multi-frame in-flight decode to keep more codeblocks resident;
 - wire irreversible 9/7 DWT into real-frame decode once a representative sample is available.
 
 ## Tier-1 GPU handoff experiment
@@ -127,11 +129,11 @@ cleanup-only visit writes, one fused pre-recorded Tier-1+scatter+IDWT+color
 command buffer, and the device-local RGB48 fast-path bench:
 
 ```text
-vulkan full RGB48 hot bench: setup_once 1150.758 ms, 375.701 ms total / 37.570 ms avg, 26.62 fps
-  avg breakdown: fused_gpu_dispatch 32.447 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.230 ms, color_readback 3.095 ms
-vulkan tier1 bench: hot_dispatch 330.999 ms total / 33.100 ms avg, readback 4.105 ms
-cpu full RGB48 reference: 1545.630 ms total / 154.563 ms avg, 6.47 fps; GPU speedup 4.11x
-cpu tier1 reference: 2967.602 ms total / 296.760 ms avg, hot GPU speedup 8.97x
+vulkan full RGB48 hot bench: setup_once 653.617 ms, 36.399 ms total / 36.399 ms avg, 27.47 fps
+  avg breakdown: fused_gpu_dispatch 32.326 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.188 ms, color_readback 2.883 ms
+vulkan tier1 bench: hot_dispatch 32.629 ms total / 32.629 ms avg, readback 4.270 ms
+cpu full RGB48 reference: 141.722 ms total / 141.722 ms avg, 7.06 fps; GPU speedup 3.89x
+cpu tier1 reference: 271.289 ms total / 271.289 ms avg, hot GPU speedup 8.31x
 ```
 
 In these logs, `tier1_cleanup_pass` is the JPEG 2000 Tier-1 cleanup coding pass,
@@ -199,9 +201,11 @@ The bench now preallocates scattered-IDWT scratch/output buffers, pre-records
 one fused cleanup/scatter/IDWT/color command buffer, and reuses the RGB48
 device/staging buffers across iterations.
 
-The next implementation step is turning this smoke/bench path into a reusable
-high-level `profile-rgb48-bench` mode with persistent DWT scratch buffers and
-fewer per-stage descriptor/command allocations.
+This fused path is now exposed by `profile-mxf-ffmpeg ... gpu-tier1` for real
+container-backed frames. The profiler builds a union codeblock template across
+the measured frame set, pads absent codeblocks with zero-pass records, keeps the
+scatter/DWT/color command buffer reusable, and writes dynamic Tier-1 records plus
+compressed words into host-visible storage buffers each frame.
 
 ## Real MXF profiling
 
@@ -214,16 +218,18 @@ On `D:\Coding\cu-prores\test_assets\test_j2k_rgb12_1080p24_3min.mxf`, the local
 10-frame run reports:
 
 ```text
+profile-mxf-ffmpeg gpu-tier1: ffmpeg_demux 46.383 ms total, avg_skip_first_frame total 37.750 ms / 26.49 fps
+  avg_skip_first breakdown: upload 0.019 ms, fused_dispatch 33.675 ms, color_copy 1.211 ms, color_readback 2.843 ms
 profile-mxf-ffmpeg gpu: ffmpeg_demux 46.601 ms total, avg_skip_first_frame decode_total 84.241 ms / 11.87 fps
 profile-mxf-ffmpeg cpu: ffmpeg_demux 44.405 ms total, avg_skip_first_frame decode_total 149.672 ms / 6.68 fps
+gpu-tier1 vs cpu diff-rgb48: differing 0, max_abs 0
 ffmpeg native decode-to-null: rtime 0.708s for 10 frames, about 70.8 ms/frame wall time
 ```
 
-The demux cost is small compared with decode. The current production GPU profile
-path is still slower than FFmpeg on wall time because it uses CPU Tier-1 plus
-GPU DWT/color rather than the faster device-local GPU Tier-1 fast path. Wiring
-the fused GPU Tier-1+scatter+IDWT+RGB48 path into this real-MXF profile is now
-the most direct next performance milestone.
+The demux cost is small compared with decode. The fused GPU Tier-1 path is now
+about 4.0x faster than the local CPU path on this 10-frame real-MXF run and
+bit-exact against the CPU output. The remaining wall time is dominated by the
+Tier-1 fused dispatch, with readback still visible at roughly 2.8 ms/frame.
 
 ## Shader build
 

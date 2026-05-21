@@ -381,12 +381,12 @@ tier1 gpu plan: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
 tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 iteration(s)
   tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
     vulkan tier1_cleanup_pass+scatter bench: device NVIDIA GeForce RTX 5060, queue 2, setup 3.014 ms, hot_dispatch 399.755 ms total / 39.975 ms avg, readback 10.232 ms
-    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 1150.758 ms, 375.701 ms total / 37.570 ms avg, 26.62 fps
-      avg breakdown: fused_gpu_dispatch 32.447 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.230 ms, color_readback 3.095 ms, summary_readback_once 0.390 ms
-      cpu full RGB48 reference: 1545.630 ms total / 154.563 ms avg, 6.47 fps; GPU speedup 4.11x
-    vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 1.943 ms, hot_dispatch 330.999 ms total / 33.100 ms avg, readback 4.105 ms
+    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 653.617 ms, 36.399 ms total / 36.399 ms avg, 27.47 fps
+      avg breakdown: fused_gpu_dispatch 32.326 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.188 ms, color_readback 2.883 ms, summary_readback_once 0.389 ms
+      cpu full RGB48 reference: 141.722 ms total / 141.722 ms avg, 7.06 fps; GPU speedup 3.89x
+    vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 1.777 ms, hot_dispatch 32.629 ms total / 32.629 ms avg, readback 4.270 ms
     gpu cleanup+scatter vs cpu reference: 7.98x hot speedup
-    cpu tier1 reference: 2780.596 ms total / 278.060 ms avg, hot GPU speedup 7.68x, first nonzero 2040, checksum 0xfffe2412
+    cpu tier1 reference: 271.289 ms total / 271.289 ms avg, hot GPU speedup 8.31x, first nonzero 2040, checksum 0xfffe2412
 ```
 
 The smoke shader reads the flattened codeblock records and the packed compressed
@@ -501,14 +501,16 @@ profile-rgb48-bench: mode cpu, 1920x1080 12-bit, discard 0, iterations 10, 62208
 The new full GPU Tier-1 fast-path bench keeps Tier-1 records, compressed words,
 scatter records, flat coefficient storage, and subband-plane storage device-local
 across the loop, then runs Tier-1 cleanup coding, scatter, offset IDWT, integer
-color packing, and RGB48 readback each iteration:
+color packing, and RGB48 readback each iteration. The RGB48 readback expands
+native-precision 12-bit samples into the high bits of each 16-bit lane, matching
+the file-output path:
 
 ```text
 tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 iteration(s)
   tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
-    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 1150.758 ms, 375.701 ms total / 37.570 ms avg, 26.62 fps
-      avg breakdown: fused_gpu_dispatch 32.447 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.230 ms, color_readback 3.095 ms, summary_readback_once 0.390 ms
-      cpu full RGB48 reference: 1545.630 ms total / 154.563 ms avg, 6.47 fps; GPU speedup 4.11x
+    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 653.617 ms, 36.399 ms total / 36.399 ms avg, 27.47 fps
+      avg breakdown: fused_gpu_dispatch 32.326 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.188 ms, color_readback 2.883 ms, summary_readback_once 0.389 ms
+      cpu full RGB48 reference: 141.722 ms total / 141.722 ms avg, 7.06 fps; GPU speedup 3.89x
 ```
 
 `tier1-gpu-batch-bench` duplicates the same frame into one larger GPU Tier-1
@@ -557,15 +559,26 @@ bench: utime=1.312s stime=0.031s rtime=1.361s
 
 The `profile-mxf-ffmpeg` command uses the pinned FFmpeg build as a real MXF
 demuxer, copies JPEG 2000 frames into a temporary frame sequence, then reuses the
-normal CPU/GPU RGB48 profile path:
+normal CPU/GPU RGB48 profile path. Mode `gpu-tier1` uses the fused GPU
+Tier-1+scatter+IDWT+RGB48 chain, builds one union codeblock template for the
+measured frames, and pads per-frame absent codeblocks with zero-pass records so
+the command buffer remains reusable:
 
 ```text
 target\release\vk-j2k-dec.exe profile-mxf-ffmpeg D:\Coding\cu-prores\test_assets\test_j2k_rgb12_1080p24_3min.mxf 10 0 gpu target\samples\mxf_gpu_last.rgb48le D:\Coding\cu-prores\vendor\ffmpeg-8.1-full_build-shared\bin\ffmpeg.exe target\samples\ffmpeg_demux_mxf target\shaders\idwt53_1d.comp.spv target\shaders\color_convert_i32.comp.spv
+target\release\vk-j2k-dec.exe profile-mxf-ffmpeg D:\Coding\cu-prores\test_assets\test_j2k_rgb12_1080p24_3min.mxf 10 0 gpu-tier1 target\samples\mxf_gpu_tier1_last.rgb48le D:\Coding\cu-prores\vendor\ffmpeg-8.1-full_build-shared\bin\ffmpeg.exe target\samples\ffmpeg_demux_mxf_tier1 target\shaders\idwt53_offset_1d.comp.spv target\shaders\color_convert_i32.comp.spv
 ```
 
 Current real-MXF 10-frame results:
 
 ```text
+profile-mxf-ffmpeg: mode gpu-tier1, 6220800 samples/frame, discard 0, frames 10, demuxed 1002004 bytes
+  ffmpeg_demux_ms 46.383
+  pipeline_setup_ms 724.349
+  decode_loop_ms 380.733
+  avg_all_frames_ms total 37.646 fps 26.56 upload 0.072 fused_dispatch 33.523 color_copy 1.216 color_readback 2.834
+  avg_skip_first_frame_ms total 37.750 fps 26.49 upload 0.019 fused_dispatch 33.675 color_copy 1.211 color_readback 2.843
+
 profile-mxf-ffmpeg: mode gpu, 1920x1080 12-bit, discard 0, frames 10, demuxed 1002004 bytes
   ffmpeg_demux_ms 46.601
   read_frames_ms 1.682
@@ -583,10 +596,17 @@ profile-mxf-ffmpeg: mode cpu, 1920x1080 12-bit, discard 0, frames 10, demuxed 10
 
 For the same MXF file, FFmpeg's native JPEG 2000 decode-to-null for 10 frames
 reports `rtime=0.708s`, or about 70.8 ms/frame wall time, while CPU time is
-multi-threaded (`utime=5.453s`, `stime=0.562s`). The real-container test shows
-that demux overhead is small; the high-level GPU path still needs the
-device-local GPU Tier-1 fast path wired into the production profile path before
-it can beat FFmpeg on wall time.
+multi-threaded (`utime=5.453s`, `stime=0.562s`). The GPU Tier-1 real-container
+path is bit-exact against the CPU output for the 10th frame:
+
+```text
+diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0 (x 0, y 0, channel R), mean_abs 0.000000000000
+```
+
+The real-container test shows that demux overhead is small. The fused GPU
+Tier-1 path is now about 4.0x faster than the local CPU path on this run and
+about 1.9x faster than FFmpeg's native decode-to-null wall time; the remaining
+measured bottleneck is the ~33.7 ms fused GPU dispatch.
 
 The low-resolution path now prunes unused high-resolution codeblocks before
 Tier-1 decode:

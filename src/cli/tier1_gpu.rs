@@ -535,7 +535,7 @@ pub fn tier1_gpu_plan(path: &str) -> ExitCode {
                                     );
                                     return ExitCode::FAILURE;
                                 }
-                                let expected_rgb = match decode_rgb48_with_discard(&data, 0) {
+                                let mut expected_rgb = match decode_rgb48_with_discard(&data, 0) {
                                     Ok(image) => image,
                                     Err(err) => {
                                         eprintln!(
@@ -544,6 +544,7 @@ pub fn tier1_gpu_plan(path: &str) -> ExitCode {
                                         return ExitCode::FAILURE;
                                     }
                                 };
+                                expand_rgb48_samples_to_16bit(&mut expected_rgb.samples, precision);
                                 if combined_rgb.samples != expected_rgb.samples {
                                     let mismatch = combined_rgb
                                         .samples
@@ -1069,10 +1070,11 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
                     }
                 }
                 let cpu_rgb_total_ms = elapsed_ms(cpu_rgb_start);
-                let Some(expected_rgb) = expected_rgb else {
+                let Some(mut expected_rgb) = expected_rgb else {
                     eprintln!("tier1 gpu bench: CPU RGB48 reference produced no image");
                     return ExitCode::FAILURE;
                 };
+                expand_rgb48_samples_to_16bit(&mut expected_rgb.samples, precision);
                 if rgb_bench.samples != expected_rgb.samples {
                     let mismatch = rgb_bench
                         .samples
@@ -1512,4 +1514,14 @@ fn tier1_scatter_expected(
         }
     }
     Ok(output)
+}
+
+fn expand_rgb48_samples_to_16bit(samples: &mut [u16], precision: u8) {
+    if precision >= 16 {
+        return;
+    }
+    let shift = u32::from(16 - precision);
+    for sample in samples {
+        *sample = sample.wrapping_shl(shift);
+    }
 }

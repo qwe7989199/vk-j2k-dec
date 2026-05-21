@@ -473,6 +473,26 @@ impl VulkanDevice {
                 "vkEndCommandBuffer",
             );
         };
+        let transfer_barrier = VkMemoryBarrier {
+            s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            p_next: ptr::null(),
+            src_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
+            dst_access_mask: VK_ACCESS_SHADER_READ_BIT,
+        };
+        unsafe {
+            (self.functions.cmd_pipeline_barrier)(
+                command_buffer,
+                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                1,
+                &transfer_barrier,
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+            );
+        }
         let mut bound_pipeline = 0usize;
         for (index, dispatch) in dispatches.iter().enumerate() {
             unsafe {
