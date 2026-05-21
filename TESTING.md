@@ -523,7 +523,7 @@ Current local RTX 5060 Tier-1 batch results:
 
 | batch frames | cblk/dispatch | ms/dispatch | ms/frame | aggregate fps |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 879 | 31.456 | 31.456 | 31.79 |
+| 1 | 879 | 30.912 | 30.912 | 32.35 |
 | 2 | 1,758 | 61.297 | 30.648 | 32.63 |
 | 4 | 3,516 | 117.618 | 29.405 | 34.01 |
 | 8 | 7,032 | 225.207 | 28.151 | 35.52 |
@@ -542,6 +542,9 @@ limited by only 879 independent codeblock workgroups and a visible long tail,
 but not purely occupancy limited: by 8-16 frames/dispatch the per-frame Tier-1
 compute flattens near 28 ms, so the remaining wall is mostly the serial MQ work
 inside each codeblock.
+The cleanup shader's 32-lane workgroup remains the best local zero-init shape
+tested so far; 16-lane and 64-lane variants were bit-exact but slower on the
+batch=1 Tier-1 bench.
 
 The comparable FFmpeg native JPEG2000 10-frame loop against the same frame
 source, writing wrapped frames to `null`, reports about 136.1 ms/frame

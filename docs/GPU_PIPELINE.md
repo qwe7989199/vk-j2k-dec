@@ -147,6 +147,33 @@ fast path keeps one codeblock per workgroup while squeezing shared memory first.
 Packing MQ context state plus MPS into one private array was also tested and
 rejected: it saved array slots but added enough ALU to slow the local shader.
 
+`tier1-gpu-batch-bench` replicates the same frame into a larger Tier-1 GPU
+dispatch to test whether the single-frame path is occupancy-starved. On the
+local frame, the codeblock distribution is uneven enough to create a tail:
+
+```text
+cblk byte_len stats: min 3, p50 52, p90 293, p99 708, max 2386, top1 2.5% bytes, top10 12.6% bytes
+cblk pass_count stats: min 1, p50 31, p90 34, p99 37, max 37, total 25206
+```
+
+Batching confirms that more in-flight codeblocks help, but only up to a point:
+
+| batch frames | cblk/dispatch | Tier-1 ms/frame | aggregate fps |
+| ---: | ---: | ---: | ---: |
+| 1 | 879 | 30.912 | 32.35 |
+| 4 | 3,516 | 29.405 | 34.01 |
+| 8 | 7,032 | 28.151 | 35.52 |
+| 16 | 14,064 | 28.034 | 35.67 |
+
+This points to a mixed bottleneck: single-frame work does not fully occupy the
+GPU, while the remaining flat spot is the serial MQ path inside each codeblock.
+The next practical scheduling step is multi-frame in-flight decode; the next
+hard shader step is a lower-state/cooperative codeblock kernel rather than more
+simple codeblocks per workgroup.
+The current 32-lane workgroup is also the best local zero-initialization shape
+so far: 16-lane and 64-lane variants were both bit-exact but slower on the
+batch=1 Tier-1 bench.
+
 `tier1_scatter_smoke.comp.glsl` is the first handoff shader after GPU Tier-1. It
 maps the flat per-codeblock coefficient buffer into concatenated component
 subband planes using precomputed codeblock rectangles. On the local frame it
