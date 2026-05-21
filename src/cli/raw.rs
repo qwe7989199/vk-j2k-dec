@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -315,6 +317,174 @@ pub fn profile_rgb48_bench_file(
         print_profile_average("avg_warm_skip1", &profiles[1..]);
     }
     ExitCode::SUCCESS
+}
+
+pub fn profile_mxf_ffmpeg_file(
+    input: &str,
+    frame_count: usize,
+    discard_levels: u8,
+    mode: &str,
+    output: &str,
+    ffmpeg_path: &str,
+    work_dir: &str,
+    idwt53_shader_path: &str,
+    color_shader_path: &str,
+) -> ExitCode {
+    if frame_count == 0 {
+        eprintln!("profile-mxf-ffmpeg failed: frames must be greater than 0");
+        return ExitCode::FAILURE;
+    }
+    if !matches!(mode, "cpu" | "gpu-dwt" | "gpu") {
+        eprintln!("profile-mxf-ffmpeg failed: mode must be cpu, gpu-dwt, or gpu, got {mode}");
+        return ExitCode::FAILURE;
+    }
+
+    let work_dir = Path::new(work_dir);
+    if let Err(err) = fs::create_dir_all(work_dir) {
+        eprintln!(
+            "profile-mxf-ffmpeg failed: cannot create {}: {err}",
+            work_dir.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let pattern = work_dir.join("frame_%06d.j2k");
+    let demux_start = Instant::now();
+    let status = Command::new(ffmpeg_path)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-i")
+        .arg(input)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-frames:v")
+        .arg(frame_count.to_string())
+        .arg("-c:v")
+        .arg("copy")
+        .arg("-f")
+        .arg("image2")
+        .arg(&pattern)
+        .status();
+    let demux_ms = elapsed_ms(demux_start);
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("profile-mxf-ffmpeg failed: ffmpeg exited with {status}");
+            return ExitCode::FAILURE;
+        }
+        Err(err) => {
+            eprintln!("profile-mxf-ffmpeg failed: failed to run {ffmpeg_path}: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let pipeline_setup_start = Instant::now();
+    let pipeline = if mode == "gpu" {
+        match VulkanRgb48Pipeline::new(idwt53_shader_path, color_shader_path) {
+            Ok(pipeline) => Some(pipeline),
+            Err(err) => {
+                eprintln!("profile-mxf-ffmpeg failed: GPU pipeline setup failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let pipeline_setup_ms = pipeline
+        .as_ref()
+        .map(VulkanRgb48Pipeline::setup_ms)
+        .unwrap_or_else(|| elapsed_ms(pipeline_setup_start));
+
+    let mut profiles = Vec::with_capacity(frame_count);
+    let mut read_total_ms = 0.0;
+    let mut decode_loop_ms = 0.0;
+    let mut last_image = None;
+    let mut total_bytes = 0usize;
+    for frame_index in 0..frame_count {
+        let frame_path = frame_path(work_dir, frame_index + 1);
+        let read_start = Instant::now();
+        let data = match fs::read(&frame_path) {
+            Ok(data) => data,
+            Err(err) => {
+                eprintln!(
+                    "profile-mxf-ffmpeg failed: cannot read {}: {err}",
+                    frame_path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        read_total_ms += elapsed_ms(read_start);
+        total_bytes += data.len();
+
+        let decode_start = Instant::now();
+        let decoded = match (mode, pipeline.as_ref()) {
+            ("cpu", _) => decode_rgb48_with_discard_profiled(&data, discard_levels),
+            ("gpu-dwt", _) => {
+                decode_rgb48_with_gpu_dwt_profiled(&data, discard_levels, idwt53_shader_path)
+            }
+            ("gpu", Some(pipeline)) => {
+                decode_rgb48_with_persistent_gpu_pipeline_profiled(&data, discard_levels, pipeline)
+            }
+            ("gpu", None) => unreachable!("GPU pipeline setup checked above"),
+            _ => unreachable!("mode checked above"),
+        };
+        decode_loop_ms += elapsed_ms(decode_start);
+        let decoded = match decoded {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                eprintln!(
+                    "profile-mxf-ffmpeg failed on frame {} ({}): {err}",
+                    frame_index + 1,
+                    frame_path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "  frame {:>4}: bytes {} decode_total_ms {:.3} tier1_ms {:.3} reconstruct_ms {:.3} pack_ms {:.3}",
+            frame_index + 1,
+            data.len(),
+            decoded.profile.timings.total_ms,
+            decoded.profile.timings.tier1_decode_ms,
+            decoded.profile.timings.reconstruct_ms,
+            decoded.profile.timings.pack_ms
+        );
+        profiles.push(decoded.profile);
+        last_image = Some(decoded.image);
+    }
+
+    let Some(image) = last_image else {
+        eprintln!("profile-mxf-ffmpeg failed: no frames decoded");
+        return ExitCode::FAILURE;
+    };
+    let write_start = Instant::now();
+    if let Err(err) = fs::write(output, image.to_le_bytes()) {
+        eprintln!("failed to write {output}: {err}");
+        return ExitCode::FAILURE;
+    }
+    let write_ms = elapsed_ms(write_start);
+
+    println!(
+        "profile-mxf-ffmpeg: mode {mode}, {}x{} {}-bit, discard {}, frames {}, demuxed {} bytes -> {output}",
+        image.width, image.height, image.precision, discard_levels, frame_count, total_bytes
+    );
+    println!("  ffmpeg_path {ffmpeg_path}");
+    println!("  work_dir {}", work_dir.display());
+    println!("  ffmpeg_demux_ms {:.3}", demux_ms);
+    println!("  read_frames_ms {:.3}", read_total_ms);
+    println!("  pipeline_setup_ms {:.3}", pipeline_setup_ms);
+    println!("  decode_loop_ms {:.3}", decode_loop_ms);
+    println!("  write_last_ms {:.3}", write_ms);
+    print_profile_average("avg_all_frames", &profiles);
+    if profiles.len() > 1 {
+        print_profile_average("avg_skip_first_frame", &profiles[1..]);
+    }
+    ExitCode::SUCCESS
+}
+
+fn frame_path(work_dir: &Path, one_based_index: usize) -> PathBuf {
+    work_dir.join(format!("frame_{one_based_index:06}.j2k"))
 }
 
 pub fn diff_rgb48_files(actual: &str, reference: &str) -> ExitCode {

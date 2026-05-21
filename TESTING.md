@@ -555,6 +555,39 @@ ffmpeg -hide_banner -benchmark -v info -stream_loop 9 -i target\samples\test_j2k
 bench: utime=1.312s stime=0.031s rtime=1.361s
 ```
 
+The `profile-mxf-ffmpeg` command uses the pinned FFmpeg build as a real MXF
+demuxer, copies JPEG 2000 frames into a temporary frame sequence, then reuses the
+normal CPU/GPU RGB48 profile path:
+
+```text
+target\release\vk-j2k-dec.exe profile-mxf-ffmpeg D:\Coding\cu-prores\test_assets\test_j2k_rgb12_1080p24_3min.mxf 10 0 gpu target\samples\mxf_gpu_last.rgb48le D:\Coding\cu-prores\vendor\ffmpeg-8.1-full_build-shared\bin\ffmpeg.exe target\samples\ffmpeg_demux_mxf target\shaders\idwt53_1d.comp.spv target\shaders\color_convert_i32.comp.spv
+```
+
+Current real-MXF 10-frame results:
+
+```text
+profile-mxf-ffmpeg: mode gpu, 1920x1080 12-bit, discard 0, frames 10, demuxed 1002004 bytes
+  ffmpeg_demux_ms 46.601
+  read_frames_ms 1.682
+  pipeline_setup_ms 213.877
+  decode_loop_ms 863.326
+  avg_all_frames_ms decode_total 84.940 fps 11.77 tier1 41.048 reconstruct 38.041 pack 4.728
+  avg_skip_first_frame_ms decode_total 84.241 fps 11.87 tier1 40.557 reconstruct 37.907 pack 4.687
+
+profile-mxf-ffmpeg: mode cpu, 1920x1080 12-bit, discard 0, frames 10, demuxed 1002004 bytes
+  ffmpeg_demux_ms 44.405
+  decode_loop_ms 1662.992
+  avg_all_frames_ms decode_total 164.763 fps 6.07 tier1 47.488 reconstruct 106.683 pack 7.909
+  avg_skip_first_frame_ms decode_total 149.672 fps 6.68 tier1 47.957 reconstruct 92.256 pack 6.892
+```
+
+For the same MXF file, FFmpeg's native JPEG 2000 decode-to-null for 10 frames
+reports `rtime=0.708s`, or about 70.8 ms/frame wall time, while CPU time is
+multi-threaded (`utime=5.453s`, `stime=0.562s`). The real-container test shows
+that demux overhead is small; the high-level GPU path still needs the
+device-local GPU Tier-1 fast path wired into the production profile path before
+it can beat FFmpeg on wall time.
+
 The low-resolution path now prunes unused high-resolution codeblocks before
 Tier-1 decode:
 

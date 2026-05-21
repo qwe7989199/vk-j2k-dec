@@ -258,6 +258,58 @@ pub fn run() -> ExitCode {
                 &color_shader_path,
             )
         }
+        (Some("profile-mxf-ffmpeg"), Some(path)) => {
+            let Some(frame_count) = args.next().and_then(|value| value.parse::<usize>().ok())
+            else {
+                eprintln!(
+                    "usage: {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(discard_levels) = args.next().and_then(|value| value.parse::<u8>().ok())
+            else {
+                eprintln!(
+                    "usage: {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(mode) = args.next() else {
+                eprintln!(
+                    "usage: {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
+                );
+                return ExitCode::FAILURE;
+            };
+            let Some(output) = args.next() else {
+                eprintln!(
+                    "usage: {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
+                );
+                return ExitCode::FAILURE;
+            };
+            let ffmpeg_path = args.next().unwrap_or_else(|| {
+                r"D:\Coding\cu-prores\vendor\ffmpeg-8.1-full_build-shared\bin\ffmpeg.exe"
+                    .to_string()
+            });
+            let work_dir = args
+                .next()
+                .unwrap_or_else(|| r"target\samples\ffmpeg_demux_mxf".to_string());
+            let idwt53_shader_path = args
+                .next()
+                .unwrap_or_else(|| r"target\shaders\idwt53_1d.comp.spv".to_string());
+            let color_shader_path = args
+                .next()
+                .unwrap_or_else(|| r"target\shaders\color_convert_i32.comp.spv".to_string());
+            raw::profile_mxf_ffmpeg_file(
+                &path,
+                frame_count,
+                discard_levels,
+                &mode,
+                &output,
+                &ffmpeg_path,
+                &work_dir,
+                &idwt53_shader_path,
+                &color_shader_path,
+            )
+        }
         (Some("diff-rgb48"), Some(actual)) => {
             let Some(reference) = args.next() else {
                 eprintln!("usage: {program} diff-rgb48 <actual.rgb48le> <reference.rgb48le>");
@@ -440,6 +492,9 @@ pub fn run() -> ExitCode {
             );
             eprintln!(
                 "  {program} profile-rgb48-bench <input.j2k> <discard-levels> <cpu|gpu-dwt|gpu> <iterations> <output.rgb48le> [idwt53.comp.spv] [color.comp.spv]"
+            );
+            eprintln!(
+                "  {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
             );
             eprintln!("  {program} diff-rgb48 <actual.rgb48le> <reference.rgb48le>");
             eprintln!("  {program} diff-component-plane <actual.i32le> <reference.i32le>");

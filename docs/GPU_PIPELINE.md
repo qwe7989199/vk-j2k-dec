@@ -203,6 +203,28 @@ The next implementation step is turning this smoke/bench path into a reusable
 high-level `profile-rgb48-bench` mode with persistent DWT scratch buffers and
 fewer per-stage descriptor/command allocations.
 
+## Real MXF profiling
+
+`profile-mxf-ffmpeg` uses the pinned FFmpeg build as the demuxer, copies JPEG
+2000 frames from MXF into a temporary `.j2k` sequence, then reuses the existing
+CPU/GPU RGB48 profile path. This keeps the measurement tied to real container
+input without introducing libavformat FFI yet.
+
+On `D:\Coding\cu-prores\test_assets\test_j2k_rgb12_1080p24_3min.mxf`, the local
+10-frame run reports:
+
+```text
+profile-mxf-ffmpeg gpu: ffmpeg_demux 46.601 ms total, avg_skip_first_frame decode_total 84.241 ms / 11.87 fps
+profile-mxf-ffmpeg cpu: ffmpeg_demux 44.405 ms total, avg_skip_first_frame decode_total 149.672 ms / 6.68 fps
+ffmpeg native decode-to-null: rtime 0.708s for 10 frames, about 70.8 ms/frame wall time
+```
+
+The demux cost is small compared with decode. The current production GPU profile
+path is still slower than FFmpeg on wall time because it uses CPU Tier-1 plus
+GPU DWT/color rather than the faster device-local GPU Tier-1 fast path. Wiring
+the fused GPU Tier-1+scatter+IDWT+RGB48 path into this real-MXF profile is now
+the most direct next performance milestone.
+
 ## Shader build
 
 Compile and validate the current compute shaders with:
