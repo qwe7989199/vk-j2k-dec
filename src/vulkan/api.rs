@@ -668,6 +668,7 @@ pub fn run_tier1_cleanup_smoke(
         )?;
         let push = Tier1CleanupSmokePushConstants {
             codeblock_count: records.len() as u32,
+
         };
         let dispatch_start = std::time::Instant::now();
         program.dispatch(
@@ -774,6 +775,7 @@ pub fn run_tier1_cleanup_bench(
 
         let push = Tier1CleanupSmokePushConstants {
             codeblock_count: records.len() as u32,
+
         };
         let descriptors = [
             records_buffer.descriptor_info(),
@@ -1075,6 +1077,7 @@ pub fn run_tier1_cleanup_scatter_smoke(
 
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
+
         };
         let cleanup_dispatch_start = std::time::Instant::now();
         cleanup_program.dispatch(
@@ -1250,6 +1253,7 @@ pub fn run_tier1_cleanup_scatter_bench(
 
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
+
         };
         let scatter_push = Tier1ScatterSmokePushConstants {
             codeblock_count: scatter_records.len() as u32,
@@ -1396,6 +1400,7 @@ pub fn run_tier1_cleanup_scatter_idwt53_smoke(
 
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
+
         };
         let cleanup_dispatch_start = std::time::Instant::now();
         cleanup_program.dispatch(
@@ -1594,6 +1599,7 @@ pub fn run_tier1_cleanup_scatter_rgb48_smoke(
 
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
+
         };
         let cleanup_dispatch_start = std::time::Instant::now();
         cleanup_program.dispatch(
@@ -1904,7 +1910,6 @@ impl ReusableScatteredIdwt53Component {
 struct ReusableRgb48Packer {
     output_count: usize,
     output_byte_len: u64,
-    output_shift: u32,
     output_buffer: HostBuffer,
     staging_buffer: HostBuffer,
     descriptor_set: VkDescriptorSet,
@@ -1978,11 +1983,11 @@ impl ReusableRgb48Packer {
             color_transform,
             output_max,
             level_shift: (1u32 << (precision - 1)) as f32,
+            output_shift: u32::from(16 - precision),
         };
         Ok(Self {
             output_count,
             output_byte_len,
-            output_shift: u32::from(16 - precision),
             output_buffer,
             staging_buffer,
             descriptor_set,
@@ -2021,12 +2026,7 @@ impl ReusableRgb48Packer {
         let copy_ms = copy_start.elapsed().as_secs_f64() * 1000.0;
 
         let readback_start = std::time::Instant::now();
-        let mut samples = self.staging_buffer.read_vec::<u16>(self.output_count)?;
-        if self.output_shift > 0 {
-            for sample in &mut samples {
-                *sample = sample.wrapping_shl(self.output_shift);
-            }
-        }
+        let samples = self.staging_buffer.read_vec::<u16>(self.output_count)?;
         let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
         Ok(GpuPackedRgb48Result {
             samples,
@@ -2035,11 +2035,22 @@ impl ReusableRgb48Packer {
             readback_ms,
         })
     }
+
+    fn read_staging(&self) -> Result<GpuPackedRgb48Result, VulkanError> {
+        let readback_start = std::time::Instant::now();
+        let samples = self.staging_buffer.read_vec::<u16>(self.output_count)?;
+        let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
+        Ok(GpuPackedRgb48Result {
+            samples,
+            shader_ms: 0.0,
+            copy_ms: 0.0,
+            readback_ms,
+        })
+    }
 }
 
 pub struct VulkanTier1Rgb48Pipeline {
     device_name: String,
-    queue_family_index: u32,
     codeblock_count: usize,
     compressed_word_capacity: usize,
     setup_ms: f64,
@@ -2181,6 +2192,7 @@ impl VulkanTier1Rgb48Pipeline {
 
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: codeblock_count as u32,
+
         };
         let scatter_push = Tier1ScatterSmokePushConstants {
             codeblock_count: scatter_records.len() as u32,
@@ -2234,11 +2246,18 @@ impl VulkanTier1Rgb48Pipeline {
             component.extend_storage_dispatches(&idwt53_program, &mut fused_dispatches);
         }
         rgb48_packer.extend_storage_dispatches(&color_program, &mut fused_dispatches);
-        device.record_storage_dispatches(fused_command_buffer, &fused_dispatches)?;
+        device.record_storage_dispatches_with_copies(
+            fused_command_buffer,
+            &fused_dispatches,
+            &[BufferCopy {
+                source: &rgb48_packer.output_buffer,
+                destination: &rgb48_packer.staging_buffer,
+                byte_len: rgb48_packer.output_byte_len,
+            }],
+        )?;
 
         Ok(Self {
             device_name: summary.name.clone(),
-            queue_family_index,
             codeblock_count,
             compressed_word_capacity,
             setup_ms: setup_start.elapsed().as_secs_f64() * 1000.0,
@@ -2299,9 +2318,7 @@ impl VulkanTier1Rgb48Pipeline {
         let dispatch_start = std::time::Instant::now();
         device.submit_and_wait(self.fused_command_buffer)?;
         let fused_dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
-        let packed = self
-            .rgb48_packer
-            .readback(device, self.queue_family_index)?;
+        let packed = self.rgb48_packer.read_staging()?;
         Ok(VulkanTier1Rgb48FrameResult {
             samples: packed.samples,
             upload_ms,
@@ -2432,6 +2449,7 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
         )?;
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
+
         };
         let scatter_push = Tier1ScatterSmokePushConstants {
             codeblock_count: scatter_records.len() as u32,
@@ -3467,6 +3485,7 @@ pub fn run_color_smoke(shader_path: &str) -> Result<ColorSmokeResult, VulkanErro
                 color_transform: 0,
                 output_max: 4095,
                 level_shift: 2048.0,
+                output_shift: 0,
             },
             &c0,
             &c1,
@@ -3532,6 +3551,7 @@ pub fn run_color_smoke(shader_path: &str) -> Result<ColorSmokeResult, VulkanErro
                 color_transform: 1,
                 output_max: 4095,
                 level_shift: 2048.0,
+                output_shift: 0,
             },
             &rct_y,
             &rct_db,
@@ -3568,6 +3588,7 @@ pub fn run_color_smoke(shader_path: &str) -> Result<ColorSmokeResult, VulkanErro
                 color_transform: 2,
                 output_max: 4095,
                 level_shift: 2048.0,
+                output_shift: 0,
             },
             &ict_y,
             &ict_cb,
@@ -3670,4 +3691,5 @@ struct ColorPushConstants {
     color_transform: u32,
     output_max: u32,
     level_shift: f32,
+    output_shift: u32,
 }

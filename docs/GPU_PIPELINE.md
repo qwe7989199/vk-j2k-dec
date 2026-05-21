@@ -75,7 +75,7 @@ color conversion. With the high-level path using parallel Tier-1 codeblock
 decode, batched DWT subband uploads, and batched DWT dispatch command buffers,
 the same frame currently averages about 86 ms/frame through the persistent
 CPU-Tier1/GPU-DWT RGB48 benchmark. The device-local GPU Tier-1 fast path is now
-wired into the real-MXF profiler and averages about 37.8 ms/frame on 10 real
+wired into the real-MXF profiler and averages about 36.1 ms/frame on 10 real
 frames, compared with about 149.7 ms/frame for the local CPU path on the same
 run. The next GPU milestones are:
 
@@ -218,8 +218,8 @@ On `D:\Coding\cu-prores\test_assets\test_j2k_rgb12_1080p24_3min.mxf`, the local
 10-frame run reports:
 
 ```text
-profile-mxf-ffmpeg gpu-tier1: ffmpeg_demux 46.383 ms total, avg_skip_first_frame total 37.750 ms / 26.49 fps
-  avg_skip_first breakdown: upload 0.019 ms, fused_dispatch 33.675 ms, color_copy 1.211 ms, color_readback 2.843 ms
+profile-mxf-ffmpeg gpu-tier1: ffmpeg_demux 46.995 ms total, avg_skip_first_frame total 36.095 ms / 27.70 fps
+  avg_skip_first breakdown: upload 0.014 ms, fused_dispatch 34.148 ms, color_copy 0.000 ms, color_readback 1.932 ms
 profile-mxf-ffmpeg gpu: ffmpeg_demux 46.601 ms total, avg_skip_first_frame decode_total 84.241 ms / 11.87 fps
 profile-mxf-ffmpeg cpu: ffmpeg_demux 44.405 ms total, avg_skip_first_frame decode_total 149.672 ms / 6.68 fps
 gpu-tier1 vs cpu diff-rgb48: differing 0, max_abs 0
@@ -227,9 +227,12 @@ ffmpeg native decode-to-null: rtime 0.708s for 10 frames, about 70.8 ms/frame wa
 ```
 
 The demux cost is small compared with decode. The fused GPU Tier-1 path is now
-about 4.0x faster than the local CPU path on this 10-frame real-MXF run and
-bit-exact against the CPU output. The remaining wall time is dominated by the
-Tier-1 fused dispatch, with readback still visible at roughly 2.8 ms/frame.
+about 4.1x faster than the local CPU path on this 10-frame real-MXF run and
+bit-exact against the CPU output. The RGB48 device-to-staging copy is recorded
+at the end of the fused command buffer, so `color_copy` is included in
+`fused_dispatch`; shader-side RGB48 high-bit expansion and uninitialized
+readback allocation keep CPU readback near 1.9 ms/frame. The remaining wall
+time is dominated by the Tier-1 fused dispatch.
 
 ## Shader build
 

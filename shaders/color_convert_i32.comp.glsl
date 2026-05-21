@@ -26,6 +26,7 @@ layout(push_constant) uniform PushConstants {
     uint color_transform;
     uint output_max;
     float level_shift;
+    uint output_shift;
 } pc;
 
 int floor_div_pow2(int value, uint shift) {
@@ -38,7 +39,8 @@ int floor_div_pow2(int value, uint shift) {
 
 uint clamp_to_u16(int value) {
     int shifted = value + int(pc.level_shift);
-    return uint(clamp(shifted, 0, int(pc.output_max)));
+    uint native = uint(clamp(shifted, 0, int(pc.output_max)));
+    return native << pc.output_shift;
 }
 
 void rgb_pixel_at(uint index, out uint r_out, out uint g_out, out uint b_out) {

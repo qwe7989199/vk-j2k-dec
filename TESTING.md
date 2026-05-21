@@ -573,11 +573,11 @@ Current real-MXF 10-frame results:
 
 ```text
 profile-mxf-ffmpeg: mode gpu-tier1, 6220800 samples/frame, discard 0, frames 10, demuxed 1002004 bytes
-  ffmpeg_demux_ms 46.383
-  pipeline_setup_ms 724.349
-  decode_loop_ms 380.733
-  avg_all_frames_ms total 37.646 fps 26.56 upload 0.072 fused_dispatch 33.523 color_copy 1.216 color_readback 2.834
-  avg_skip_first_frame_ms total 37.750 fps 26.49 upload 0.019 fused_dispatch 33.675 color_copy 1.211 color_readback 2.843
+  ffmpeg_demux_ms 46.995
+  pipeline_setup_ms 678.962
+  decode_loop_ms 365.210
+  avg_all_frames_ms total 36.049 fps 27.74 upload 0.014 fused_dispatch 34.077 color_copy 0.000 color_readback 1.957
+  avg_skip_first_frame_ms total 36.095 fps 27.70 upload 0.014 fused_dispatch 34.148 color_copy 0.000 color_readback 1.932
 
 profile-mxf-ffmpeg: mode gpu, 1920x1080 12-bit, discard 0, frames 10, demuxed 1002004 bytes
   ffmpeg_demux_ms 46.601
@@ -604,9 +604,13 @@ diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0 (x 0, y 0, chann
 ```
 
 The real-container test shows that demux overhead is small. The fused GPU
-Tier-1 path is now about 4.0x faster than the local CPU path on this run and
-about 1.9x faster than FFmpeg's native decode-to-null wall time; the remaining
-measured bottleneck is the ~33.7 ms fused GPU dispatch.
+Tier-1 path is now about 4.1x faster than the local CPU path on this run and
+about 2.0x faster than FFmpeg's native decode-to-null wall time; the remaining
+measured bottleneck is the ~34.1 ms fused GPU dispatch. `color_copy` is zero in
+this profile because the RGB48 device-to-staging copy is recorded at the end of
+the fused command buffer; its time is included in `fused_dispatch`. Shader-side
+RGB48 high-bit expansion and uninitialized readback allocation keep CPU staging
+readback near 1.9 ms/frame.
 
 The low-resolution path now prunes unused high-resolution codeblocks before
 Tier-1 decode:

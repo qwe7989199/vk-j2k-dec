@@ -1467,6 +1467,7 @@ fn run_color_i32_buffer_refs_on_device_with_program(
         color_transform,
         output_max,
         level_shift: (1u32 << (precision - 1)) as f32,
+        output_shift: u32::from(16 - precision),
     };
     let shader_start = std::time::Instant::now();
     program.dispatch(
@@ -1534,6 +1535,7 @@ fn run_color_float_slices_on_device_with_program(
         color_transform,
         output_max,
         level_shift: (1u32 << (precision - 1)) as f32,
+        output_shift: u32::from(16 - precision),
     };
     program.dispatch(
         device,

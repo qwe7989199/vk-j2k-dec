@@ -457,6 +457,15 @@ impl VulkanDevice {
         command_buffer: VkCommandBuffer,
         dispatches: &[StorageDispatch<'_>],
     ) -> Result<(), VulkanError> {
+        self.record_storage_dispatches_with_copies(command_buffer, dispatches, &[])
+    }
+
+    fn record_storage_dispatches_with_copies(
+        &self,
+        command_buffer: VkCommandBuffer,
+        dispatches: &[StorageDispatch<'_>],
+        trailing_copies: &[BufferCopy<'_>],
+    ) -> Result<(), VulkanError> {
         let begin_info = VkCommandBufferBeginInfo {
             s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
             p_next: ptr::null(),
@@ -467,31 +476,33 @@ impl VulkanDevice {
             unsafe { (self.functions.begin_command_buffer)(command_buffer, &begin_info) },
             "vkBeginCommandBuffer",
         )?;
-        if dispatches.is_empty() {
+        if dispatches.is_empty() && trailing_copies.is_empty() {
             return vk_check(
                 unsafe { (self.functions.end_command_buffer)(command_buffer) },
                 "vkEndCommandBuffer",
             );
         };
-        let transfer_barrier = VkMemoryBarrier {
-            s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            p_next: ptr::null(),
-            src_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
-            dst_access_mask: VK_ACCESS_SHADER_READ_BIT,
-        };
-        unsafe {
-            (self.functions.cmd_pipeline_barrier)(
-                command_buffer,
-                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0,
-                1,
-                &transfer_barrier,
-                0,
-                ptr::null(),
-                0,
-                ptr::null(),
-            );
+        if !dispatches.is_empty() {
+            let transfer_barrier = VkMemoryBarrier {
+                s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                p_next: ptr::null(),
+                src_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
+                dst_access_mask: VK_ACCESS_SHADER_READ_BIT,
+            };
+            unsafe {
+                (self.functions.cmd_pipeline_barrier)(
+                    command_buffer,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0,
+                    1,
+                    &transfer_barrier,
+                    0,
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                );
+            }
         }
         let mut bound_pipeline = 0usize;
         for (index, dispatch) in dispatches.iter().enumerate() {
@@ -548,6 +559,44 @@ impl VulkanDevice {
                         ptr::null(),
                         0,
                         ptr::null(),
+                    );
+                }
+            }
+        }
+        if !trailing_copies.is_empty() {
+            let barrier = VkMemoryBarrier {
+                s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                p_next: ptr::null(),
+                src_access_mask: VK_ACCESS_SHADER_WRITE_BIT,
+                dst_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
+            };
+            unsafe {
+                (self.functions.cmd_pipeline_barrier)(
+                    command_buffer,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    1,
+                    &barrier,
+                    0,
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                );
+            }
+            for copy_request in trailing_copies {
+                let copy = VkBufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: copy_request.byte_len,
+                };
+                unsafe {
+                    (self.functions.cmd_copy_buffer)(
+                        command_buffer,
+                        copy_request.source.buffer,
+                        copy_request.destination.buffer,
+                        1,
+                        &copy,
                     );
                 }
             }
@@ -749,7 +798,7 @@ impl HostBuffer {
         Ok(())
     }
 
-    fn read_vec<T: Copy + Default>(&self, count: usize) -> Result<Vec<T>, VulkanError> {
+    fn read_vec<T: Copy>(&self, count: usize) -> Result<Vec<T>, VulkanError> {
         let byte_len = bytes_len::<T>(count)?;
         if byte_len > self.size {
             return Err(VulkanError::new(format!(
@@ -758,7 +807,7 @@ impl HostBuffer {
             )));
         }
         self.invalidate_range(byte_len)?;
-        let mut values = vec![T::default(); count];
+        let mut values = Vec::<T>::with_capacity(count);
         let mut mapped = ptr::null_mut();
         vk_check(
             unsafe {
@@ -772,6 +821,7 @@ impl HostBuffer {
                 values.as_mut_ptr() as *mut u8,
                 byte_len as usize,
             );
+            values.set_len(count);
             (self.functions.unmap_memory)(self.device, self.memory);
         }
         Ok(values)
