@@ -14,6 +14,7 @@ use vk_j2k_dec::decode::{
 };
 use vk_j2k_dec::gpu::{
     GpuTier1CodeblockRecord, GpuTier1Plan, GpuTier1ScatterPlan, GpuTier1ScatterRecord,
+    sort_codeblock_records_by_descending_work,
 };
 use vk_j2k_dec::packet::parse_lrcp_tile_packets;
 use vk_j2k_dec::reconstruct::{ComponentSubbandPlanes, ResolutionSubbandPlane};
@@ -585,6 +586,7 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
             );
             return ExitCode::FAILURE;
         }
+        sort_codeblock_records_by_descending_work(&mut frame.records);
     }
     let first_frame = frame_plans
         .first()

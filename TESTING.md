@@ -380,13 +380,13 @@ tier1 gpu plan: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
       tier1 full smoke timings: gpu_roundtrip 767.536 ms (upload 1.638, dispatch 59.667, readback 4.224), cpu_reference 272.495 ms
 tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 iteration(s)
   tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
-    vulkan tier1_cleanup_pass+scatter bench: device NVIDIA GeForce RTX 5060, queue 2, setup 3.014 ms, hot_dispatch 399.755 ms total / 39.975 ms avg, readback 10.232 ms
-    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 653.617 ms, 36.399 ms total / 36.399 ms avg, 27.47 fps
-      avg breakdown: fused_gpu_dispatch 32.326 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.188 ms, color_readback 2.883 ms, summary_readback_once 0.389 ms
-      cpu full RGB48 reference: 141.722 ms total / 141.722 ms avg, 7.06 fps; GPU speedup 3.89x
-    vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 1.777 ms, hot_dispatch 32.629 ms total / 32.629 ms avg, readback 4.270 ms
-    gpu cleanup+scatter vs cpu reference: 7.98x hot speedup
-    cpu tier1 reference: 271.289 ms total / 271.289 ms avg, hot GPU speedup 8.31x, first nonzero 2040, checksum 0xfffe2412
+    vulkan tier1_cleanup_pass+scatter bench: device NVIDIA GeForce RTX 5060, queue 2, setup 2.743 ms, hot_dispatch 301.054 ms total / 30.105 ms avg, readback 7.524 ms
+    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 652.453 ms, 337.171 ms total / 33.717 ms avg, 29.66 fps
+      avg breakdown: fused_gpu_dispatch 30.194 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.143 ms, color_readback 1.977 ms, summary_readback_once 0.405 ms
+      cpu full RGB48 reference: 1391.447 ms total / 139.145 ms avg, 7.19 fps; GPU speedup 4.13x
+    vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 1.632 ms, hot_dispatch 293.120 ms total / 29.312 ms avg, readback 4.283 ms
+    gpu cleanup+scatter vs cpu reference: 8.86x hot speedup
+    cpu tier1 reference: 2667.695 ms total / 266.769 ms avg, hot GPU speedup 9.10x, first nonzero 2040, checksum 0xfffe2412
 ```
 
 The smoke shader reads the flattened codeblock records and the packed compressed
@@ -397,7 +397,9 @@ against the CPU `MqDecoder`. The full Tier-1 smoke runs every MQ-coded pass for
 every codeblock on GPU, including cleanup, significance propagation, magnitude
 refinement, run-length mode, significance contexts, sign contexts, and
 coefficient/significance state updates. It writes a flat GPU coefficient buffer
-and compares all 3,177,152 coefficients against CPU Tier-1. The shader now keeps
+and compares all 3,177,152 coefficients against CPU Tier-1. The GPU input records
+are scheduled by descending `byte_len * pass_count` so the longest codeblocks
+start earlier in the single-frame dispatch. The shader now keeps
 state in workgroup memory, packs cached neighbor counts into high bits of the
 coefficient-state word, reads packed state once per sample in the hot scan
 loops, directly updates interior-sample neighbor counters, uses visit-generation
@@ -508,9 +510,9 @@ the file-output path:
 ```text
 tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 iteration(s)
   tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
-    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 653.617 ms, 36.399 ms total / 36.399 ms avg, 27.47 fps
-      avg breakdown: fused_gpu_dispatch 32.326 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.188 ms, color_readback 2.883 ms, summary_readback_once 0.389 ms
-      cpu full RGB48 reference: 141.722 ms total / 141.722 ms avg, 7.06 fps; GPU speedup 3.89x
+    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 652.453 ms, 337.171 ms total / 33.717 ms avg, 29.66 fps
+      avg breakdown: fused_gpu_dispatch 30.194 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.143 ms, color_readback 1.977 ms, summary_readback_once 0.405 ms
+      cpu full RGB48 reference: 1391.447 ms total / 139.145 ms avg, 7.19 fps; GPU speedup 4.13x
 ```
 
 `tier1-gpu-batch-bench` duplicates the same frame into one larger GPU Tier-1
@@ -573,11 +575,11 @@ Current real-MXF 10-frame results:
 
 ```text
 profile-mxf-ffmpeg: mode gpu-tier1, 6220800 samples/frame, discard 0, frames 10, demuxed 1002004 bytes
-  ffmpeg_demux_ms 46.995
-  pipeline_setup_ms 678.962
-  decode_loop_ms 365.210
-  avg_all_frames_ms total 36.049 fps 27.74 upload 0.014 fused_dispatch 34.077 color_copy 0.000 color_readback 1.957
-  avg_skip_first_frame_ms total 36.095 fps 27.70 upload 0.014 fused_dispatch 34.148 color_copy 0.000 color_readback 1.932
+  ffmpeg_demux_ms 46.472
+  pipeline_setup_ms 713.330
+  decode_loop_ms 335.530
+  avg_all_frames_ms total 33.180 fps 30.14 upload 0.014 fused_dispatch 31.190 color_copy 0.000 color_readback 1.974
+  avg_skip_first_frame_ms total 33.142 fps 30.17 upload 0.014 fused_dispatch 31.145 color_copy 0.000 color_readback 1.982
 
 profile-mxf-ffmpeg: mode gpu, 1920x1080 12-bit, discard 0, frames 10, demuxed 1002004 bytes
   ffmpeg_demux_ms 46.601
@@ -604,9 +606,9 @@ diff-rgb48: samples 6220800, differing 0, max_abs 0 at sample 0 (x 0, y 0, chann
 ```
 
 The real-container test shows that demux overhead is small. The fused GPU
-Tier-1 path is now about 4.1x faster than the local CPU path on this run and
-about 2.0x faster than FFmpeg's native decode-to-null wall time; the remaining
-measured bottleneck is the ~34.1 ms fused GPU dispatch. `color_copy` is zero in
+Tier-1 path is now about 4.5x faster than the local CPU path on this run and
+about 2.1x faster than FFmpeg's native decode-to-null wall time; the remaining
+measured bottleneck is the ~31.1 ms fused GPU dispatch. `color_copy` is zero in
 this profile because the RGB48 device-to-staging copy is recorded at the end of
 the fused command buffer; its time is included in `fused_dispatch`. Shader-side
 RGB48 high-bit expansion and uninitialized readback allocation keep CPU staging
@@ -633,7 +635,8 @@ pipelines within the frame, avoiding output buffer zero-fills, inlining
 cleanup-pass hot paths, reducing repeated shared-state reads in cleanup/
 significance/refinement scans, using direct interior-sample neighbor updates,
 walking the fixed Tier-1 pass schedule without per-pass division/modulo, using
-an integer GPU color shader for reversible RCT, pre-recording one fused
+an integer GPU color shader for reversible RCT, scheduling heavier codeblocks
+first by descending `byte_len * pass_count`, pre-recording one fused
 Tier-1+scatter+IDWT+color command buffer, reading RGB48 through a
 HOST_CACHED staging buffer instead of CPU-reading uncached host-visible storage
 memory, and collaborative zero-initialization of the shared coefficient state by

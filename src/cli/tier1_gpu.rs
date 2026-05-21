@@ -1,10 +1,13 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use vk_j2k_dec::codestream::{Codestream, WaveletTransform};
 use vk_j2k_dec::decode::decode_rgb48_with_discard;
-use vk_j2k_dec::gpu::{GpuTier1CodeblockRecord, GpuTier1Plan};
+use vk_j2k_dec::gpu::{
+    GpuTier1CodeblockRecord, GpuTier1Plan, sort_codeblock_records_by_descending_work,
+};
 use vk_j2k_dec::packet::parse_lrcp_tile_packets;
 use vk_j2k_dec::reconstruct::TileCoefficientPlanes;
 use vk_j2k_dec::tier1::{
@@ -892,7 +895,9 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
         );
         print_codeblock_parallelism_stats(&plan, "    ");
 
-        let records = plan.codeblock_records();
+        let original_records = plan.codeblock_records();
+        let mut records = original_records.clone();
+        sort_codeblock_records_by_descending_work(&mut records);
         let compressed_words = plan.compressed_u32_words();
         let bench = match vk_j2k_dec::vulkan::run_tier1_cleanup_bench(
             cleanup_shader_path,
@@ -926,6 +931,17 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
             }
         }
         let cpu_total_ms = elapsed_ms(cpu_start);
+        let expected_output = match reorder_tier1_summaries_for_records(
+            &records,
+            &original_records,
+            &expected_output,
+        ) {
+            Ok(expected) => expected,
+            Err(err) => {
+                eprintln!("tier1 gpu bench: summary reorder failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
         if bench.output != expected_output {
             eprintln!(
                 "tier1 gpu bench: cleanup output mismatch: got {:?}, expected {:?}",
@@ -1514,6 +1530,53 @@ fn tier1_scatter_expected(
         }
     }
     Ok(output)
+}
+
+fn reorder_tier1_summaries_for_records(
+    sorted_records: &[GpuTier1CodeblockRecord],
+    original_records: &[GpuTier1CodeblockRecord],
+    original_summaries: &[u32],
+) -> Result<Vec<u32>, String> {
+    if original_summaries.len() != original_records.len() * 9 {
+        return Err(format!(
+            "summary count {} does not match {} original records",
+            original_summaries.len(),
+            original_records.len()
+        ));
+    }
+    let mut by_key = BTreeMap::new();
+    for (index, record) in original_records.iter().enumerate() {
+        let start = index * 9;
+        by_key.insert(
+            tier1_record_key(record),
+            &original_summaries[start..start + 9],
+        );
+    }
+    let mut reordered = Vec::with_capacity(original_summaries.len());
+    for record in sorted_records {
+        let summary = by_key.get(&tier1_record_key(record)).ok_or_else(|| {
+            format!(
+                "missing original summary for C{} R{} S{} {},{}",
+                record.component,
+                record.resolution,
+                record.subband,
+                record.codeblock_x,
+                record.codeblock_y
+            )
+        })?;
+        reordered.extend_from_slice(summary);
+    }
+    Ok(reordered)
+}
+
+fn tier1_record_key(record: &GpuTier1CodeblockRecord) -> (u32, u32, u32, u32, u32) {
+    (
+        record.component,
+        record.resolution,
+        record.subband,
+        record.codeblock_x,
+        record.codeblock_y,
+    )
 }
 
 fn expand_rgb48_samples_to_16bit(samples: &mut [u16], precision: u8) {

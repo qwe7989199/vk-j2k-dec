@@ -84,6 +84,18 @@ pub struct GpuTier1ScatterRecord {
     pub plane_y0: u32,
 }
 
+pub fn sort_codeblock_records_by_descending_work(records: &mut [GpuTier1CodeblockRecord]) {
+    records.sort_by(|a, b| {
+        let a_work = u64::from(a.byte_len) * u64::from(a.pass_count);
+        let b_work = u64::from(b.byte_len) * u64::from(b.pass_count);
+        b_work
+            .cmp(&a_work)
+            .then_with(|| b.byte_len.cmp(&a.byte_len))
+            .then_with(|| b.pass_count.cmp(&a.pass_count))
+            .then_with(|| tier1_record_key(a).cmp(&tier1_record_key(b)))
+    });
+}
+
 impl GpuTier1Plan {
     pub fn from_bound_work_plan(
         work_plan: &Tier1BoundWorkPlan<'_>,
@@ -307,6 +319,16 @@ impl GpuTier1Plan {
             output_coefficients,
         })
     }
+}
+
+fn tier1_record_key(record: &GpuTier1CodeblockRecord) -> (u32, u32, u32, u32, u32) {
+    (
+        record.component,
+        record.resolution,
+        record.subband,
+        record.codeblock_x,
+        record.codeblock_y,
+    )
 }
 
 struct GpuTier1PlaneOffset<'a> {

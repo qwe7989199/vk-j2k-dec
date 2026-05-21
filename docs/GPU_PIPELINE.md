@@ -126,14 +126,15 @@ packing neighbor counts into the coefficient-state word, reading packed state
 once per sample in the hot scan loops, direct interior-sample neighbor updates,
 division-free Tier-1 pass scheduling, visit-generation tracking, skipping
 cleanup-only visit writes, one fused pre-recorded Tier-1+scatter+IDWT+color
-command buffer, and the device-local RGB48 fast-path bench:
+command buffer, heavy-codeblock-first scheduling by descending `byte_len *
+pass_count`, and the device-local RGB48 fast-path bench:
 
 ```text
-vulkan full RGB48 hot bench: setup_once 653.617 ms, 36.399 ms total / 36.399 ms avg, 27.47 fps
-  avg breakdown: fused_gpu_dispatch 32.326 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.188 ms, color_readback 2.883 ms
-vulkan tier1 bench: hot_dispatch 32.629 ms total / 32.629 ms avg, readback 4.270 ms
-cpu full RGB48 reference: 141.722 ms total / 141.722 ms avg, 7.06 fps; GPU speedup 3.89x
-cpu tier1 reference: 271.289 ms total / 271.289 ms avg, hot GPU speedup 8.31x
+vulkan full RGB48 hot bench: setup_once 652.453 ms, 337.171 ms total / 33.717 ms avg, 29.66 fps
+  avg breakdown: fused_gpu_dispatch 30.194 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.143 ms, color_readback 1.977 ms
+vulkan tier1 bench: hot_dispatch 293.120 ms total / 29.312 ms avg, readback 4.283 ms
+cpu full RGB48 reference: 1391.447 ms total / 139.145 ms avg, 7.19 fps; GPU speedup 4.13x
+cpu tier1 reference: 2667.695 ms total / 266.769 ms avg, hot GPU speedup 9.10x
 ```
 
 In these logs, `tier1_cleanup_pass` is the JPEG 2000 Tier-1 cleanup coding pass,
@@ -204,8 +205,9 @@ device/staging buffers across iterations.
 This fused path is now exposed by `profile-mxf-ffmpeg ... gpu-tier1` for real
 container-backed frames. The profiler builds a union codeblock template across
 the measured frame set, pads absent codeblocks with zero-pass records, keeps the
-scatter/DWT/color command buffer reusable, and writes dynamic Tier-1 records plus
-compressed words into host-visible storage buffers each frame.
+scatter/DWT/color command buffer reusable, writes dynamic Tier-1 records plus
+compressed words into host-visible storage buffers each frame, and schedules
+heavier codeblocks first within each frame.
 
 ## Real MXF profiling
 
@@ -218,8 +220,8 @@ On `D:\Coding\cu-prores\test_assets\test_j2k_rgb12_1080p24_3min.mxf`, the local
 10-frame run reports:
 
 ```text
-profile-mxf-ffmpeg gpu-tier1: ffmpeg_demux 46.995 ms total, avg_skip_first_frame total 36.095 ms / 27.70 fps
-  avg_skip_first breakdown: upload 0.014 ms, fused_dispatch 34.148 ms, color_copy 0.000 ms, color_readback 1.932 ms
+profile-mxf-ffmpeg gpu-tier1: ffmpeg_demux 46.472 ms total, avg_skip_first_frame total 33.142 ms / 30.17 fps
+  avg_skip_first breakdown: upload 0.014 ms, fused_dispatch 31.145 ms, color_copy 0.000 ms, color_readback 1.982 ms
 profile-mxf-ffmpeg gpu: ffmpeg_demux 46.601 ms total, avg_skip_first_frame decode_total 84.241 ms / 11.87 fps
 profile-mxf-ffmpeg cpu: ffmpeg_demux 44.405 ms total, avg_skip_first_frame decode_total 149.672 ms / 6.68 fps
 gpu-tier1 vs cpu diff-rgb48: differing 0, max_abs 0
@@ -227,7 +229,7 @@ ffmpeg native decode-to-null: rtime 0.708s for 10 frames, about 70.8 ms/frame wa
 ```
 
 The demux cost is small compared with decode. The fused GPU Tier-1 path is now
-about 4.1x faster than the local CPU path on this 10-frame real-MXF run and
+about 4.5x faster than the local CPU path on this 10-frame real-MXF run and
 bit-exact against the CPU output. The RGB48 device-to-staging copy is recorded
 at the end of the fused command buffer, so `color_copy` is included in
 `fused_dispatch`; shader-side RGB48 high-bit expansion and uninitialized
