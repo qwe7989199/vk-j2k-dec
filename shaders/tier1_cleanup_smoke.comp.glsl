@@ -50,35 +50,17 @@ const uint STATE_VISIT_SHIFT = 8u;
 const uint STATE_VISIT_MASK = 0xff00u;
 const uint STATE_NEIGHBOR_SHIFT = 16u;
 const uint STATE_NEIGHBOR_MASK = 0x0fff0000u;
-const uint MQ_QE[47] = uint[](
-    0x5601u, 0x3401u, 0x1801u, 0x0ac1u, 0x0521u, 0x0221u,
-    0x5601u, 0x5401u, 0x4801u, 0x3801u, 0x3001u, 0x2401u,
-    0x1c01u, 0x1601u, 0x5601u, 0x5401u, 0x5101u, 0x4801u,
-    0x3801u, 0x3401u, 0x3001u, 0x2801u, 0x2401u, 0x2201u,
-    0x1c01u, 0x1801u, 0x1601u, 0x1401u, 0x1201u, 0x1101u,
-    0x0ac1u, 0x09c1u, 0x08a1u, 0x0521u, 0x0441u, 0x02a1u,
-    0x0221u, 0x0141u, 0x0111u, 0x0085u, 0x0049u, 0x0025u,
-    0x0015u, 0x0009u, 0x0005u, 0x0001u, 0x5601u
-);
-const uint MQ_NEXT_MPS[47] = uint[](
-    1u, 2u, 3u, 4u, 5u, 38u, 7u, 8u, 9u, 10u, 11u, 12u,
-    13u, 29u, 15u, 16u, 17u, 18u, 19u, 20u, 21u, 22u,
-    23u, 24u, 25u, 26u, 27u, 28u, 29u, 30u, 31u, 32u,
-    33u, 34u, 35u, 36u, 37u, 38u, 39u, 40u, 41u, 42u,
-    43u, 44u, 45u, 45u, 46u
-);
-const uint MQ_NEXT_LPS[47] = uint[](
-    1u, 6u, 9u, 12u, 29u, 33u, 6u, 14u, 14u, 14u, 17u, 18u,
-    20u, 21u, 14u, 14u, 15u, 16u, 17u, 18u, 19u, 19u,
-    20u, 21u, 22u, 23u, 24u, 25u, 26u, 27u, 28u, 29u,
-    30u, 31u, 32u, 33u, 34u, 35u, 36u, 37u, 38u, 39u,
-    40u, 41u, 42u, 43u, 46u
-);
-const uint MQ_SWITCH_MPS[47] = uint[](
-    1u, 0u, 0u, 0u, 0u, 0u, 1u, 0u, 0u, 0u, 0u, 0u,
-    0u, 0u, 1u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
-    0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
-    0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u
+
+// Packed MQ table: bits [15:0]=QE, [21:16]=NEXT_MPS, [27:22]=NEXT_LPS, [28]=SWITCH_MPS
+const uint MQ_TABLE[47] = uint[](
+    0x10415601u, 0x01823401u, 0x02431801u, 0x03040ac1u, 0x07450521u, 0x08660221u,
+    0x11875601u, 0x03885401u, 0x03894801u, 0x038a3801u, 0x044b3001u, 0x048c2401u,
+    0x050d1c01u, 0x055d1601u, 0x138f5601u, 0x03905401u, 0x03d15101u, 0x04124801u,
+    0x04533801u, 0x04943401u, 0x04d53001u, 0x04d62801u, 0x05172401u, 0x05582201u,
+    0x05991c01u, 0x05da1801u, 0x061b1601u, 0x065c1401u, 0x069d1201u, 0x06de1101u,
+    0x071f0ac1u, 0x076009c1u, 0x07a108a1u, 0x07e20521u, 0x08230441u, 0x086402a1u,
+    0x08a50221u, 0x08e60141u, 0x09270111u, 0x09680085u, 0x09a90049u, 0x09ea0025u,
+    0x0a2b0015u, 0x0a6c0009u, 0x0aad0005u, 0x0aed0001u, 0x0bae5601u
 );
 
 const uvec2 SIGN_LUT[9] = uvec2[](
@@ -93,13 +75,19 @@ const uvec2 SIGN_LUT[9] = uvec2[](
     uvec2(13u, 0u)  // h=1, v=1
 );
 
-uint context_packed[19];
+shared uint s_context_packed[19];
+#define ctx_at(i) s_context_packed[i]
+
 shared uint coefficient_state[4096];
 Tier1Codeblock codeblock;
 uint byte_pos;
 uint c_reg;
 uint a_reg;
 uint ct_reg;
+uint cached_word;
+uint cached_word_index;
+uint cur_byte;
+uint next_byte;
 uint significance_bits;
 uint sign_bits;
 uint refinement_bits;
@@ -176,78 +164,85 @@ uint byte_at(uint index) {
         return 0xffu;
     }
     uint absolute = codeblock.byte_offset + index;
-    uint word = words[absolute >> 2];
+    uint word_idx = absolute >> 2u;
+    uint word;
+    if (word_idx == cached_word_index) {
+        word = cached_word;
+    } else {
+        word = words[word_idx];
+        cached_word = word;
+        cached_word_index = word_idx;
+    }
     return (word >> ((absolute & 3u) * 8u)) & 0xffu;
 }
 
 void byte_in() {
-    uint current = byte_at(byte_pos);
-    uint next = byte_at(byte_pos + 1u);
-    if (current == 0xffu) {
-        if (next > 0x8fu) {
+    if (cur_byte == 0xffu) {
+        if (next_byte > 0x8fu) {
             c_reg += 0xff00u;
             ct_reg = 8u;
         } else {
             byte_pos += 1u;
-            c_reg += next << 9u;
+            c_reg += next_byte << 9u;
             ct_reg = 7u;
+            cur_byte = next_byte;
+            next_byte = byte_at(byte_pos + 1u);
         }
     } else {
         byte_pos += 1u;
-        c_reg += next << 8u;
+        c_reg += next_byte << 8u;
         ct_reg = 8u;
+        cur_byte = next_byte;
+        next_byte = byte_at(byte_pos + 1u);
     }
-}
-
-void renormalize_once() {
-    if (ct_reg == 0u) {
-        byte_in();
-    }
-    a_reg <<= 1u;
-    c_reg <<= 1u;
-    ct_reg -= 1u;
 }
 
 void renormalize() {
-    while (a_reg < 0x8000u) {
-        renormalize_once();
+    if (a_reg >= 0x8000u) {
+        return;
     }
+    uint k = 15u - uint(findMSB(a_reg));
+    while (k >= ct_reg) {
+        k -= ct_reg;
+        a_reg <<= ct_reg;
+        c_reg <<= ct_reg;
+        byte_in();
+    }
+    a_reg <<= k;
+    c_reg <<= k;
+    ct_reg -= k;
 }
 
 uint decode_bit(uint context_index) {
-    uint packed = context_packed[context_index];
-    uint state = packed & 0x7fu;
-    uint mps = packed >> 7u;
-    uint qe = MQ_QE[state];
+    uint ctx_packed = ctx_at(context_index);
+    uint state = ctx_packed & 0x7fu;
+    uint mps = ctx_packed >> 7u;
+
+    uint mq_entry = MQ_TABLE[state];
+    uint qe = mq_entry & 0xffffu;
+    uint next_mps_val = (mq_entry >> 16u) & 0x3fu;
+    uint next_lps_val = (mq_entry >> 22u) & 0x3fu;
+    uint switch_mps_val = (mq_entry >> 28u) & 1u;
+
     a_reg -= qe;
+    bool cond_lps = (c_reg >> 16u) < qe;
+    bool choose_mps = (cond_lps == (a_reg < qe));
+
     uint decoded;
-    if ((c_reg >> 16u) < qe) {
-        if (a_reg < qe) {
-            a_reg = qe;
-            context_packed[context_index] = MQ_NEXT_MPS[state] | (mps << 7u);
-            decoded = mps;
-        } else {
-            a_reg = qe;
-            uint next_mps = mps ^ MQ_SWITCH_MPS[state];
-            context_packed[context_index] = MQ_NEXT_LPS[state] | (next_mps << 7u);
-            decoded = 1u - mps;
-        }
-        renormalize();
+    if (cond_lps) {
+        a_reg = qe;
     } else {
         c_reg -= qe << 16u;
-        if ((a_reg & 0x8000u) == 0u) {
-            if (a_reg < qe) {
-                uint next_mps = mps ^ MQ_SWITCH_MPS[state];
-                context_packed[context_index] = MQ_NEXT_LPS[state] | (next_mps << 7u);
-                decoded = 1u - mps;
-            } else {
-                context_packed[context_index] = MQ_NEXT_MPS[state] | (mps << 7u);
-                decoded = mps;
-            }
-            renormalize();
-        } else {
-            decoded = mps;
-        }
+    }
+
+    if (cond_lps || (a_reg < 0x8000u)) {
+        uint new_state = choose_mps ? next_mps_val : next_lps_val;
+        uint new_mps = choose_mps ? mps : (mps ^ switch_mps_val);
+        ctx_at(context_index) = new_state | (new_mps << 7u);
+        decoded = choose_mps ? mps : (1u - mps);
+        renormalize();
+    } else {
+        decoded = mps;
     }
     return decoded;
 }
@@ -303,43 +298,43 @@ void update_neighbors_for_significant(uint x, uint y) {
     increment_neighbor(ix + 1, iy + 1, 8u);
 }
 
-uint lh_or_ll_context(uint primary, uint secondary, uint diagonal) {
-    if (primary == 2u) { return 8u; }
-    if (primary == 1u && secondary >= 1u) { return 7u; }
-    if (primary == 1u && diagonal >= 1u) { return 6u; }
-    if (primary == 1u) { return 5u; }
-    if (secondary == 2u) { return 4u; }
-    if (secondary == 1u) { return 3u; }
-    if (diagonal >= 2u) { return 2u; }
-    if (diagonal == 1u) { return 1u; }
-    return 0u;
-}
+const uint LH_LL_LUT_FAST[85] = uint[](
+    0u, 1u, 2u, 2u, 2u, 0u, 0u, 0u, 3u, 3u, 3u, 3u, 3u, 0u, 0u, 0u,
+    4u, 4u, 4u, 4u, 4u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
+    5u, 6u, 6u, 6u, 6u, 0u, 0u, 0u, 7u, 7u, 7u, 7u, 7u, 0u, 0u, 0u,
+    7u, 7u, 7u, 7u, 7u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
+    8u, 8u, 8u, 8u, 8u, 0u, 0u, 0u, 8u, 8u, 8u, 8u, 8u, 0u, 0u, 0u,
+    8u, 8u, 8u, 8u, 8u
+);
 
-uint hh_context(uvec3 n) {
-    uint hv = n.x + n.y;
-    if (n.z >= 3u) { return 8u; }
-    if (hv >= 1u && n.z == 2u) { return 7u; }
-    if (hv == 0u && n.z == 2u) { return 6u; }
-    if (hv >= 2u && n.z == 1u) { return 5u; }
-    if (hv == 1u && n.z == 1u) { return 4u; }
-    if (hv == 0u && n.z == 1u) { return 3u; }
-    if (hv >= 2u) { return 2u; }
-    if (hv == 1u) { return 1u; }
-    return 0u;
-}
+const uint HH_LUT_FAST[37] = uint[](
+    0u, 3u, 6u, 8u, 8u, 0u, 0u, 0u, 1u, 4u, 7u, 8u, 8u, 0u, 0u, 0u,
+    2u, 5u, 7u, 8u, 8u, 0u, 0u, 0u, 2u, 5u, 7u, 8u, 8u, 0u, 0u, 0u,
+    2u, 5u, 7u, 8u, 8u
+);
 
-uint significance_context_from_neighbors(uvec3 n) {
-    if (codeblock.subband == 1u) {
-        return lh_or_ll_context(n.y, n.x, n.z);
-    }
+uint significance_context_from_neighbors(uint state) {
+    uint n_x = (state >> 16u) & 0xfu;
+    uint n_y = (state >> 20u) & 0xfu;
+    uint n_z = (state >> 24u) & 0xfu;
+
+    uint diagonal = min(n_z, 4u);
     if (codeblock.subband == 3u) {
-        return hh_context(n);
+        uint hv = min(n_x + n_y, 4u);
+        return HH_LUT_FAST[(hv << 3u) | diagonal];
     }
-    return lh_or_ll_context(n.x, n.y, n.z);
+    uint primary = min(n_x, 2u);
+    uint secondary = min(n_y, 2u);
+    if (codeblock.subband == 1u) {
+        uint temp = primary;
+        primary = secondary;
+        secondary = temp;
+    }
+    return LH_LL_LUT_FAST[(primary << 5u) | (secondary << 3u) | diagonal];
 }
 
 uint significance_context(uint x, uint y) {
-    return significance_context_from_neighbors(neighbor_counts(x, y));
+    return significance_context_from_neighbors(coefficient_state[index_at(x, y)]);
 }
 
 uvec2 sign_context(uint x, uint y) {
@@ -400,7 +395,7 @@ void decode_cleanup_sample(uint x, uint y, uint bitplane) {
     if ((state & STATE_NEIGHBOR_MASK) == 0u) {
         context = 0u;
     } else {
-        context = significance_context_from_neighbors(neighbors_from_state(state));
+        context = significance_context_from_neighbors(state);
     }
     uint is_significant = decode_bit(context);
     if (is_significant != 0u) {
@@ -469,8 +464,7 @@ void decode_significance_pass(uint bitplane) {
                     if (state_is_visited(state) || state_is_significant(state) || (state & STATE_NEIGHBOR_MASK) == 0u) {
                         continue;
                     }
-                    uvec3 n = neighbors_from_state(state);
-                    uint is_significant = decode_bit(significance_context_from_neighbors(n));
+                    uint is_significant = decode_bit(significance_context_from_neighbors(state));
                     if (is_significant != 0u) {
                         decode_significant_sample(x, y, bitplane, true);
                     } else {
@@ -489,8 +483,7 @@ void decode_significance_pass(uint bitplane) {
                     if (state_is_visited(state) || state_is_significant(state) || (state & STATE_NEIGHBOR_MASK) == 0u) {
                         continue;
                     }
-                    uvec3 n = neighbors_from_state(state);
-                    uint is_significant = decode_bit(significance_context_from_neighbors(n));
+                    uint is_significant = decode_bit(significance_context_from_neighbors(state));
                     if (is_significant != 0u) {
                         decode_significant_sample(x, y, bitplane, true);
                     } else {
@@ -571,14 +564,19 @@ void main() {
     // Only thread 0 performs MQ arithmetic decoding
     if (gl_LocalInvocationID.x == 0u) {
         for (uint i = 0u; i < MQ_CONTEXT_COUNT; i++) {
-            context_packed[i] = 0u;
+            ctx_at(i) = 0u;
         }
-        context_packed[0] = 4u;
-        context_packed[17] = 3u;
-        context_packed[18] = 46u;
+        ctx_at(0) = 4u;
+        ctx_at(17) = 3u;
+        ctx_at(18) = 46u;
+
+        cached_word_index = 0xffffffffu;
 
         byte_pos = 0u;
-        c_reg = byte_at(0u) << 16u;
+        cur_byte = byte_at(0u);
+        next_byte = byte_at(1u);
+
+        c_reg = cur_byte << 16u;
         ct_reg = 0u;
         byte_in();
         c_reg <<= 7u;
@@ -622,27 +620,54 @@ void main() {
             }
         }
 
-        uint nonzero = 0u;
-        uint checksum = 0u;
-        for (uint i = 0u; i < codeblock.coefficient_count; i++) {
-            uint offset = codeblock.coefficient_offset + i;
-            if (is_significant_index(i)) {
-                int coefficient = output_coefficients[offset];
-                nonzero += 1u;
-                checksum += uint(coefficient);
-            } else {
-                output_coefficients[offset] = 0;
-            }
+    } // End of thread 0 MQ arithmetic decoding block
+
+    barrier();
+
+    // Collaborative parallel write-back and local counting
+    uint thread_nonzero = 0u;
+    uint thread_checksum = 0u;
+    uint coeff_count = codeblock.coefficient_count;
+    uint coeff_offset_base = codeblock.coefficient_offset;
+
+    for (uint i = gl_LocalInvocationID.x; i < coeff_count; i += 32u) {
+        uint offset = coeff_offset_base + i;
+        if (is_significant_index(i)) {
+            int coefficient = output_coefficients[offset];
+            thread_nonzero += 1u;
+            thread_checksum += uint(coefficient);
+        } else {
+            output_coefficients[offset] = 0;
         }
-        uint output_offset = codeblock_index * 9u;
-        output_words[output_offset + 0u] = nonzero;
-        output_words[output_offset + 1u] = checksum;
-        output_words[output_offset + 2u] = byte_pos;
-        output_words[output_offset + 3u] = decoded_passes;
-        output_words[output_offset + 4u] = significance_bits;
-        output_words[output_offset + 5u] = sign_bits;
-        output_words[output_offset + 6u] = refinement_bits;
-        output_words[output_offset + 7u] = became_significant;
-        output_words[output_offset + 8u] = visited;
+    }
+
+    coefficient_state[gl_LocalInvocationID.x] = thread_nonzero;
+    barrier();
+
+    if (gl_LocalInvocationID.x == 0u) {
+        uint nonzero = 0u;
+        for (uint j = 0u; j < 32u; j++) {
+            nonzero += coefficient_state[j];
+        }
+        output_words[codeblock_index * 9u + 0u] = nonzero;
+    }
+
+    barrier();
+    coefficient_state[gl_LocalInvocationID.x] = thread_checksum;
+    barrier();
+
+    if (gl_LocalInvocationID.x == 0u) {
+        uint checksum = 0u;
+        for (uint j = 0u; j < 32u; j++) {
+            checksum += coefficient_state[j];
+        }
+        output_words[codeblock_index * 9u + 1u] = checksum;
+        output_words[codeblock_index * 9u + 2u] = byte_pos;
+        output_words[codeblock_index * 9u + 3u] = decoded_passes;
+        output_words[codeblock_index * 9u + 4u] = significance_bits;
+        output_words[codeblock_index * 9u + 5u] = sign_bits;
+        output_words[codeblock_index * 9u + 6u] = refinement_bits;
+        output_words[codeblock_index * 9u + 7u] = became_significant;
+        output_words[codeblock_index * 9u + 8u] = visited;
     }
 }
