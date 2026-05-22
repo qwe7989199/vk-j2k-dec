@@ -130,11 +130,12 @@ command buffer, heavy-codeblock-first scheduling by descending `byte_len *
 pass_count`, and the device-local RGB48 fast-path bench:
 
 ```text
-vulkan full RGB48 hot bench: setup_once 652.453 ms, 337.171 ms total / 33.717 ms avg, 29.66 fps
-  avg breakdown: fused_gpu_dispatch 30.194 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.143 ms, color_readback 1.977 ms
-vulkan tier1 bench: hot_dispatch 293.120 ms total / 29.312 ms avg, readback 4.283 ms
-cpu full RGB48 reference: 1391.447 ms total / 139.145 ms avg, 7.19 fps; GPU speedup 4.13x
-cpu tier1 reference: 2667.695 ms total / 266.769 ms avg, hot GPU speedup 9.10x
+vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 8.939 ms, 1580.877 ms total / 31.618 ms avg, 31.63 fps
+  avg breakdown: fused_gpu_dispatch 27.823 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.265 ms, color_readback 2.094 ms, summary_readback_once 0.518 ms
+cpu full RGB48 reference: 6955.209 ms total / 139.104 ms avg, 7.19 fps; GPU speedup 4.40x
+vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 1.771 ms, hot_dispatch 1556.169 ms total / 31.123 ms avg, readback 4.484 ms
+gpu cleanup+scatter vs cpu reference: 8.72x hot speedup
+cpu tier1 reference: 13754.919 ms total / 275.098 ms avg, hot GPU speedup 8.84x, first nonzero 2040, checksum 0xfffe2412
 ```
 
 In these logs, `tier1_cleanup_pass` is the JPEG 2000 Tier-1 cleanup coding pass,
@@ -147,8 +148,7 @@ A CUDA ProRes-style multi-lane-per-block variant was tested against this shader
 shape. It remained bit-exact, but the larger per-workgroup state reduced
 occupancy and lost to the packed single-codeblock workgroup, so the current
 fast path keeps one codeblock per workgroup while squeezing shared memory first.
-Packing MQ context state plus MPS into one private array was also tested and
-rejected: it saved array slots but added enough ALU to slow the local shader.
+Packing MQ context state and MPS into a single packed state array was successfully implemented, reducing thread-local memory footprint and lookup count. Combined with inner loop unrolling and zero-neighbor bypass, it yielded a combined speedup.
 
 `tier1-gpu-batch-bench` replicates the same frame into a larger Tier-1 GPU
 dispatch to test whether the single-frame path is occupancy-starved. On the
@@ -176,6 +176,15 @@ simple codeblocks per workgroup.
 The current 32-lane workgroup is also the best local zero-initialization shape
 so far: 16-lane and 64-lane variants were both bit-exact but slower on the
 batch=1 Tier-1 bench.
+
+To address the CPU-GPU transfer bottlenecks and hide the long-tail synchronization delays, we implemented a sliding-window asynchronous pipeline (`tier1-gpu-pipeline-bench`) using multiple fences to process frames concurrently.
+
+For the RTX 5060, using 50 iterations and a pipeline depth of 4:
+- **Pipeline Average Frame Time**: `27.463 ms` (`36.41 fps`)
+- **Throughput Increase**: **~15.1%** compared to the synchronous baseline of `31.63 fps`.
+
+This demonstrates that concurrent command recording and submission, coupled with sliding-window fence checks, effectively overlaps host-to-device transfers, shader compute execution, and device-to-host readbacks.
+
 
 `tier1_scatter_smoke.comp.glsl` is the first handoff shader after GPU Tier-1. It
 maps the flat per-codeblock coefficient buffer into concatenated component

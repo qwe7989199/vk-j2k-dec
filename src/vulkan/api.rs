@@ -833,6 +833,368 @@ pub fn run_tier1_cleanup_bench(
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct Tier1CleanupPipelineBenchResult {
+    pub device_name: String,
+    pub queue_family_index: u32,
+    pub iterations: usize,
+    pub pipeline_depth: usize,
+    pub setup_ms: f64,
+    pub total_pipeline_ms: f64,
+    pub average_frame_ms: f64,
+    pub last_frame_output: Vec<u32>,
+    pub last_frame_coefficients: Vec<i32>,
+}
+
+pub fn run_tier1_cleanup_pipeline_bench(
+    shader_path: &str,
+    records: &[crate::gpu::GpuTier1CodeblockRecord],
+    compressed_words: &[u32],
+    iterations: usize,
+    pipeline_depth: usize,
+) -> Result<Tier1CleanupPipelineBenchResult, VulkanError> {
+    validate_tier1_cleanup_inputs(records, compressed_words)?;
+    if iterations == 0 {
+        return Err(VulkanError::new(
+            "Tier-1 cleanup pipeline bench requires at least one iteration",
+        ));
+    }
+    if pipeline_depth == 0 {
+        return Err(VulkanError::new(
+            "Pipeline depth must be at least 1",
+        ));
+    }
+    let spirv = read_spirv(shader_path)?;
+    with_compute_device(|device, summary, queue_family_index| {
+        let program = StorageComputeProgram::new(
+            device,
+            &spirv,
+            4,
+            std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
+        )?;
+        let setup_start = std::time::Instant::now();
+
+        let records_byte_len = bytes_len::<crate::gpu::GpuTier1CodeblockRecord>(records.len())?;
+        let compressed_byte_len = bytes_len::<u32>(compressed_words.len())?;
+        let output_len = records.len() * 9;
+        let output_byte_len = bytes_len::<u32>(output_len)?;
+        let coefficient_count = records
+            .iter()
+            .map(|record| record.coefficient_offset + record.coefficient_count)
+            .max()
+            .unwrap_or(0) as usize;
+        let coefficient_byte_len = bytes_len::<i32>(coefficient_count)?;
+
+        struct PipelineSlot {
+            records_staging: HostBuffer,
+            records_device: HostBuffer,
+            compressed_staging: HostBuffer,
+            compressed_device: HostBuffer,
+            output_staging: HostBuffer,
+            output_device: HostBuffer,
+            coefficient_staging: HostBuffer,
+            coefficient_device: HostBuffer,
+            _descriptor_pool: DescriptorPoolHandle,
+            descriptor_set: VkDescriptorSet,
+            _command_pool: CommandPoolHandle,
+            command_buffer: VkCommandBuffer,
+            active_fence: Option<FenceHandle>,
+        }
+
+        let mut slots = Vec::with_capacity(pipeline_depth);
+        for _ in 0..pipeline_depth {
+            let records_staging = device.create_host_cached_buffer(records_byte_len, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)?;
+            let records_device = device.create_device_local_buffer(records_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+
+            let compressed_staging = device.create_host_cached_buffer(compressed_byte_len, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)?;
+            let compressed_device = device.create_device_local_buffer(compressed_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+
+            let output_staging = device.create_host_cached_buffer(output_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+            let output_device = device.create_device_local_buffer(output_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT)?;
+
+            let coefficient_staging = device.create_host_cached_buffer(coefficient_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+            let coefficient_device = device.create_device_local_buffer(coefficient_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT)?;
+
+            let descriptor_pool = device.create_descriptor_pool(4, 1)?;
+            let descriptor_set = device.allocate_descriptor_set(descriptor_pool.handle, program.descriptor_set_layout.handle)?;
+
+            let descriptors = [
+                records_device.descriptor_info(),
+                compressed_device.descriptor_info(),
+                output_device.descriptor_info(),
+                coefficient_device.descriptor_info(),
+            ];
+            device.update_storage_descriptor_set(descriptor_set, &descriptors);
+
+            let command_pool = device.create_command_pool(queue_family_index)?;
+            let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
+
+            slots.push(PipelineSlot {
+                records_staging,
+                records_device,
+                compressed_staging,
+                compressed_device,
+                output_staging,
+                output_device,
+                coefficient_staging,
+                coefficient_device,
+                _descriptor_pool: descriptor_pool,
+                descriptor_set,
+                _command_pool: command_pool,
+                command_buffer,
+                active_fence: None,
+            });
+        }
+
+        let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
+
+        let push = Tier1CleanupSmokePushConstants {
+            codeblock_count: records.len() as u32,
+        };
+        let push_bytes = bytes_of(&push);
+        let groups = [tier1_cleanup_groups(records.len()), 1, 1];
+
+        let mut last_output = Vec::new();
+        let mut last_coefficients = Vec::new();
+
+        let pipeline_start = std::time::Instant::now();
+
+        for i in 0..iterations {
+            let slot_idx = i % pipeline_depth;
+
+            if i >= pipeline_depth {
+                if let Some(fence) = slots[slot_idx].active_fence.take() {
+                    vk_check(
+                        unsafe { (device.functions.wait_for_fences)(device.device, 1, &fence.handle, 1, u64::MAX) },
+                        "vkWaitForFences",
+                    )?;
+                    if i + 1 == iterations || i + 1 - pipeline_depth == iterations {
+                        last_output = slots[slot_idx].output_staging.read_vec::<u32>(output_len)?;
+                        last_coefficients = slots[slot_idx].coefficient_staging.read_vec::<i32>(coefficient_count)?;
+                    } else {
+                        let _ = slots[slot_idx].output_staging.read_vec::<u32>(output_len)?;
+                        let _ = slots[slot_idx].coefficient_staging.read_vec::<i32>(coefficient_count)?;
+                    }
+                }
+            }
+
+            let slot = &mut slots[slot_idx];
+            slot.records_staging.write_slice(records)?;
+            slot.compressed_staging.write_slice(compressed_words)?;
+
+            let begin_info = VkCommandBufferBeginInfo {
+                s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                p_next: ptr::null(),
+                flags: 0,
+                p_inheritance_info: ptr::null(),
+            };
+            vk_check(
+                unsafe { (device.functions.begin_command_buffer)(slot.command_buffer, &begin_info) },
+                "vkBeginCommandBuffer",
+            )?;
+
+            let copy_records = VkBufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: records_byte_len,
+            };
+            unsafe {
+                (device.functions.cmd_copy_buffer)(
+                    slot.command_buffer,
+                    slot.records_staging.buffer,
+                    slot.records_device.buffer,
+                    1,
+                    &copy_records,
+                );
+            }
+            let copy_compressed = VkBufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: compressed_byte_len,
+            };
+            unsafe {
+                (device.functions.cmd_copy_buffer)(
+                    slot.command_buffer,
+                    slot.compressed_staging.buffer,
+                    slot.compressed_device.buffer,
+                    1,
+                    &copy_compressed,
+                );
+            }
+
+            let h2d_barrier = VkMemoryBarrier {
+                s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                p_next: ptr::null(),
+                src_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT,
+                dst_access_mask: VK_ACCESS_SHADER_READ_BIT,
+            };
+            unsafe {
+                (device.functions.cmd_pipeline_barrier)(
+                    slot.command_buffer,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0,
+                    1,
+                    &h2d_barrier,
+                    0,
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                );
+            }
+
+            unsafe {
+                (device.functions.cmd_bind_pipeline)(
+                    slot.command_buffer,
+                    VK_PIPELINE_BIND_POINT_COMPUTE,
+                    program.pipeline.handle,
+                );
+                (device.functions.cmd_bind_descriptor_sets)(
+                    slot.command_buffer,
+                    VK_PIPELINE_BIND_POINT_COMPUTE,
+                    program.pipeline_layout.handle,
+                    0,
+                    1,
+                    &slot.descriptor_set,
+                    0,
+                    ptr::null(),
+                );
+                (device.functions.cmd_push_constants)(
+                    slot.command_buffer,
+                    program.pipeline_layout.handle,
+                    VK_SHADER_STAGE_COMPUTE_BIT,
+                    0,
+                    push_bytes.len() as u32,
+                    push_bytes.as_ptr() as *const c_void,
+                );
+                (device.functions.cmd_dispatch)(
+                    slot.command_buffer,
+                    groups[0],
+                    groups[1],
+                    groups[2],
+                );
+            }
+
+            let d2h_barrier = VkMemoryBarrier {
+                s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                p_next: ptr::null(),
+                src_access_mask: VK_ACCESS_SHADER_WRITE_BIT,
+                dst_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
+            };
+            unsafe {
+                (device.functions.cmd_pipeline_barrier)(
+                    slot.command_buffer,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    1,
+                    &d2h_barrier,
+                    0,
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                );
+            }
+
+            let copy_output = VkBufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: output_byte_len,
+            };
+            unsafe {
+                (device.functions.cmd_copy_buffer)(
+                    slot.command_buffer,
+                    slot.output_device.buffer,
+                    slot.output_staging.buffer,
+                    1,
+                    &copy_output,
+                );
+            }
+            let copy_coefficients = VkBufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: coefficient_byte_len,
+            };
+            unsafe {
+                (device.functions.cmd_copy_buffer)(
+                    slot.command_buffer,
+                    slot.coefficient_device.buffer,
+                    slot.coefficient_staging.buffer,
+                    1,
+                    &copy_coefficients,
+                );
+            }
+
+            vk_check(
+                unsafe { (device.functions.end_command_buffer)(slot.command_buffer) },
+                "vkEndCommandBuffer",
+            )?;
+
+            let fence_info = VkFenceCreateInfo {
+                s_type: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                p_next: ptr::null(),
+                flags: 0,
+            };
+            let mut fence_handle = 0usize;
+            vk_check(
+                unsafe {
+                    (device.functions.create_fence)(device.device, &fence_info, ptr::null(), &mut fence_handle)
+                },
+                "vkCreateFence",
+            )?;
+            let fence = FenceHandle {
+                device: device.device,
+                functions: device.functions,
+                handle: fence_handle,
+            };
+
+            let submit_info = VkSubmitInfo {
+                s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                p_next: ptr::null(),
+                wait_semaphore_count: 0,
+                p_wait_semaphores: ptr::null(),
+                p_wait_dst_stage_mask: ptr::null(),
+                command_buffer_count: 1,
+                p_command_buffers: &slot.command_buffer,
+                signal_semaphore_count: 0,
+                p_signal_semaphores: ptr::null(),
+            };
+            vk_check(
+                unsafe { (device.functions.queue_submit)(device.queue, 1, &submit_info, fence.handle) },
+                "vkQueueSubmit",
+            )?;
+
+            slot.active_fence = Some(fence);
+        }
+
+        for slot in &mut slots {
+            if let Some(fence) = slot.active_fence.take() {
+                vk_check(
+                    unsafe { (device.functions.wait_for_fences)(device.device, 1, &fence.handle, 1, u64::MAX) },
+                    "vkWaitForFences",
+                )?;
+                last_output = slot.output_staging.read_vec::<u32>(output_len)?;
+                last_coefficients = slot.coefficient_staging.read_vec::<i32>(coefficient_count)?;
+            }
+        }
+
+        let total_pipeline_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
+        device.wait_idle()?;
+
+        Ok(Tier1CleanupPipelineBenchResult {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            iterations,
+            pipeline_depth,
+            setup_ms,
+            total_pipeline_ms,
+            average_frame_ms: total_pipeline_ms / iterations as f64,
+            last_frame_output: last_output,
+            last_frame_coefficients: last_coefficients,
+        })
+    })
+}
+
 fn validate_tier1_cleanup_inputs(
     records: &[crate::gpu::GpuTier1CodeblockRecord],
     compressed_words: &[u32],

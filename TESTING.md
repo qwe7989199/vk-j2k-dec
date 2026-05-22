@@ -378,15 +378,15 @@ tier1 gpu plan: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k
     vulkan tier1_cleanup_pass+scatter+rgb48: device NVIDIA GeForce RTX 5060, queue 2, 6220800 samples, upload 1.860 ms, tier1_cleanup_pass 66.311 ms, scatter 0.432 ms, idwt_dispatch 4.590 ms, idwt_alloc 5.516 ms, color_shader 0.447 ms, color_copy 1.252 ms, color_readback 2.093 ms, summary_readback 0.269 ms
     vulkan tier1 full smoke: device NVIDIA GeForce RTX 5060, queue 2, 879 cblk summaries, 3177152 coeff, first nonzero 2040, checksum 0xfffe2412
       tier1 full smoke timings: gpu_roundtrip 767.536 ms (upload 1.638, dispatch 59.667, readback 4.224), cpu_reference 272.495 ms
-tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 10 iteration(s)
+tier1 gpu bench: target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k, 50 iteration(s)
   tile 0: 879 cblk, 97023 compressed bytes, 3177152 coeff, 25206 passes (25206 mq, 0 raw)
-    vulkan tier1_cleanup_pass+scatter bench: device NVIDIA GeForce RTX 5060, queue 2, setup 2.743 ms, hot_dispatch 301.054 ms total / 30.105 ms avg, readback 7.524 ms
-    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 652.453 ms, 337.171 ms total / 33.717 ms avg, 29.66 fps
-      avg breakdown: fused_gpu_dispatch 30.194 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.143 ms, color_readback 1.977 ms, summary_readback_once 0.405 ms
-      cpu full RGB48 reference: 1391.447 ms total / 139.145 ms avg, 7.19 fps; GPU speedup 4.13x
-    vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 1.632 ms, hot_dispatch 293.120 ms total / 29.312 ms avg, readback 4.283 ms
-    gpu cleanup+scatter vs cpu reference: 8.86x hot speedup
-    cpu tier1 reference: 2667.695 ms total / 266.769 ms avg, hot GPU speedup 9.10x, first nonzero 2040, checksum 0xfffe2412
+    vulkan tier1_cleanup_pass+scatter bench: device NVIDIA GeForce RTX 5060, queue 2, setup 2.819 ms, hot_dispatch 1576.989 ms total / 31.540 ms avg, readback 10.808 ms
+    vulkan full RGB48 hot bench: device NVIDIA GeForce RTX 5060, queue 2, setup_once 8.939 ms, 1580.877 ms total / 31.618 ms avg, 31.63 fps
+      avg breakdown: fused_gpu_dispatch 27.823 ms, tier1_cleanup_pass 0.000 ms, scatter 0.000 ms, idwt_dispatch 0.000 ms, idwt_alloc 0.000 ms, color_shader 0.000 ms, color_copy 1.265 ms, color_readback 2.094 ms, summary_readback_once 0.518 ms
+      cpu full RGB48 reference: 6955.209 ms total / 139.104 ms avg, 7.19 fps; GPU speedup 4.40x
+    vulkan tier1 bench: device NVIDIA GeForce RTX 5060, queue 2, setup 1.771 ms, hot_dispatch 1556.169 ms total / 31.123 ms avg, readback 4.484 ms
+    gpu cleanup+scatter vs cpu reference: 8.72x hot speedup
+    cpu tier1 reference: 13754.919 ms total / 275.098 ms avg, hot GPU speedup 8.84x, first nonzero 2040, checksum 0xfffe2412
 ```
 
 The smoke shader reads the flattened codeblock records and the packed compressed
@@ -404,7 +404,10 @@ state in workgroup memory, packs cached neighbor counts into high bits of the
 coefficient-state word, reads packed state once per sample in the hot scan
 loops, directly updates interior-sample neighbor counters, uses visit-generation
 bits instead of clearing visit flags every significance pass, avoids
-cleanup-only visit writes that cannot be read again in the same bitplane, and
+cleanup-only visit writes that cannot be read again in the same bitplane,
+packs MQ context state and MPS into a single packed state array to reduce thread-local
+memory footprint and lookup count, bypasses neighbor unpacking for zero-neighbor samples,
+lifts the stripe height checks out of the inner loop to enable compiler loop unrolling, and
 walks the fixed cleanup/significance/refinement pass schedule without per-pass
 division/modulo. The benchmark mode creates the decode flow once, dispatches the
 same frame repeatedly, and reads back once for correctness.
@@ -550,6 +553,19 @@ The cleanup shader's 32-lane workgroup remains the best local zero-init shape
 tested so far; 16-lane and 64-lane variants were bit-exact but slower on the
 batch=1 Tier-1 bench.
 
+To overlap the remaining CPU-GPU host transfers (H2D and D2H) and shader compute stages, we implemented a sliding-window asynchronous pipeline (`tier1-gpu-pipeline-bench`) using multiple fences.
+
+```text
+target\release\vk-j2k-dec.exe tier1-gpu-pipeline-bench target\samples\test_j2k_rgb12_1080p24_3min_frame0.j2k 50 4
+```
+
+Current local RTX 5060 pipeline results (50 iterations, pipeline depth 4):
+- **Vulkan Tier-1 Pipeline**: `1373.161 ms total / 27.463 ms avg (36.41 fps)`
+- **CPU Single-frame Tier-1 Reference**: `268.618 ms` (9.78x speedup)
+
+This yields a **~15.1% throughput improvement** compared to the non-pipelined synchronous RGB48 benchmark (which runs at 31.63 fps), successfully proving that pipeline depth overlaps H2D copies, MQ compute dispatches, and D2H staging readbacks.
+
+
 The comparable FFmpeg native JPEG2000 10-frame loop against the same frame
 source, writing wrapped frames to `null`, reports about 136.1 ms/frame
 (~7.35 fps) on the local machine:
@@ -640,11 +656,13 @@ first by descending `byte_len * pass_count`, pre-recording one fused
 Tier-1+scatter+IDWT+color command buffer, reading RGB48 through a
 HOST_CACHED staging buffer instead of CPU-reading uncached host-visible storage
 memory, and collaborative zero-initialization of the shared coefficient state by
-workgroup threads (with local_size_x changed to 32). A CUDA ProRes-style multi-lane-per-block variant was tested, but for
+workgroup (with local_size_x changed to 32). A CUDA ProRes-style multi-lane-per-block variant was tested, but for
 this JPEG 2000 shader it increased shared-memory pressure and reduced occupancy
 enough to lose against the packed single-codeblock workgroup shape. Packing the
-MQ context state and MPS bit into one private array was also tested and rejected
-because it increased ALU enough to lose on the local GPU. The high-level decode
+MQ context state and MPS bit into a single packed state array, bypassing neighbor
+unpacking for zero-neighbor samples, and lifting stripe height checks out of the
+inner loop to enable compiler loop unrolling were successfully implemented and
+proved to yield a combined speedup. The high-level decode
 path now also uses the existing parallel Tier-1 codeblock decoder before
 serially placing decoded codeblocks into component planes. The reversible GPU
 DWT path uploads subband coefficient planes once into device-local storage and

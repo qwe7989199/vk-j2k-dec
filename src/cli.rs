@@ -70,6 +70,17 @@ pub fn run() -> ExitCode {
                 .unwrap_or(8);
             tier1_gpu::tier1_gpu_batch_bench(&path, iterations, batch_frames)
         }
+        (Some("tier1-gpu-pipeline-bench"), Some(path)) => {
+            let iterations = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(50);
+            let pipeline_depth = args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(4);
+            tier1_gpu::tier1_gpu_pipeline_bench(&path, iterations, pipeline_depth)
+        }
         (Some("tier1-codeblock-trace"), Some(path)) => {
             let Some(component) = args.next().and_then(|value| value.parse::<u16>().ok()) else {
                 eprintln!(
@@ -473,6 +484,7 @@ pub fn run() -> ExitCode {
             eprintln!("  {program} tier1-gpu-plan <input.j2k>");
             eprintln!("  {program} tier1-gpu-bench <input.j2k> [iterations]");
             eprintln!("  {program} tier1-gpu-batch-bench <input.j2k> [iterations] [batch-frames]");
+            eprintln!("  {program} tier1-gpu-pipeline-bench <input.j2k> [iterations] [pipeline-depth]");
             eprintln!(
                 "  {program} tier1-codeblock-trace <input.j2k> <component> <resolution> <LL|HL|LH|HH> <codeblock-x> <codeblock-y>"
             );

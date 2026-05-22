@@ -1372,6 +1372,215 @@ pub fn tier1_gpu_batch_bench(path: &str, iterations: usize, batch_frames: usize)
     ExitCode::SUCCESS
 }
 
+pub fn tier1_gpu_pipeline_bench(path: &str, iterations: usize, pipeline_depth: usize) -> ExitCode {
+    if iterations == 0 {
+        eprintln!("tier1 gpu pipeline bench: iterations must be at least 1");
+        return ExitCode::FAILURE;
+    }
+    if pipeline_depth == 0 {
+        eprintln!("tier1 gpu pipeline bench: pipeline depth must be at least 1");
+        return ExitCode::FAILURE;
+    }
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("tier1 gpu pipeline bench: failed to read {path}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let codestream = match Codestream::parse(&data) {
+        Ok(codestream) => codestream,
+        Err(err) => {
+            eprintln!("tier1 gpu pipeline bench: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(cod) = &codestream.cod else {
+        eprintln!("tier1 gpu pipeline bench: missing COD marker");
+        return ExitCode::FAILURE;
+    };
+    let layouts = match codestream.tile_layouts() {
+        Ok(layouts) => layouts,
+        Err(err) => {
+            eprintln!("tier1 gpu pipeline bench: tile layout unavailable ({err})");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cleanup_shader_path = "target\\shaders\\tier1_cleanup_smoke.comp.spv";
+    if !std::path::Path::new(cleanup_shader_path).exists() {
+        eprintln!("tier1 gpu pipeline bench: missing {cleanup_shader_path}");
+        return ExitCode::FAILURE;
+    }
+
+    println!(
+        "tier1 gpu pipeline bench: {path}, {iterations} iteration(s), pipeline depth {pipeline_depth}"
+    );
+
+    for tile_part in &codestream.tile_parts {
+        let Some(layout) = layouts
+            .iter()
+            .find(|layout| layout.tile_index == tile_part.tile_index)
+        else {
+            eprintln!(
+                "tier1 gpu pipeline bench: missing layout for tile {}",
+                tile_part.tile_index
+            );
+            return ExitCode::FAILURE;
+        };
+        let Some(tile_data) = data.get(tile_part.data_start..tile_part.data_end) else {
+            eprintln!(
+                "tier1 gpu pipeline bench: tile {} payload outside input",
+                tile_part.tile_index
+            );
+            return ExitCode::FAILURE;
+        };
+        let packet_summary = match parse_lrcp_tile_packets(tile_data, layout, cod.layers) {
+            Ok(summary) => summary,
+            Err(err) => {
+                eprintln!(
+                    "tier1 gpu pipeline bench: packet parse failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let work_plan = match Tier1WorkPlan::from_packet_summary_with_quantization(
+            &packet_summary,
+            codestream.qcd.as_ref(),
+            &codestream.qccs,
+        ) {
+            Ok(plan) => plan,
+            Err(err) => {
+                eprintln!(
+                    "tier1 gpu pipeline bench: work plan failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let bound = match work_plan.bind_segment_data(tile_data) {
+            Ok(bound) => bound,
+            Err(err) => {
+                eprintln!(
+                    "tier1 gpu pipeline bench: segment bind failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let plan = match GpuTier1Plan::from_bound_work_plan(&bound, cod.codeblock_style_flags()) {
+            Ok(plan) => plan,
+            Err(err) => {
+                eprintln!(
+                    "tier1 gpu pipeline bench: flatten failed for tile {}: {err}",
+                    tile_part.tile_index
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "  tile {}: {} cblk/frame, {} compressed bytes/frame, {} coeff/frame, {} passes/frame ({} mq, {} raw)",
+            tile_part.tile_index,
+            plan.codeblocks.len(),
+            plan.compressed_bytes.len(),
+            plan.output_coefficients,
+            plan.total_passes,
+            plan.arithmetic_passes,
+            plan.raw_bypass_passes
+        );
+        print_codeblock_parallelism_stats(&plan, "    ");
+
+        let original_records = plan.codeblock_records();
+        let mut records = original_records.clone();
+        sort_codeblock_records_by_descending_work(&mut records);
+        let compressed_words = plan.compressed_u32_words();
+
+        let reconstruction = coefficient_reconstruction_for_transform(cod.transform);
+        let cpu_start = Instant::now();
+        let (expected_output, expected_coefficients) =
+            match tier1_cleanup_smoke_expected_all(&bound.codeblocks, reconstruction) {
+                Ok(expected) => expected,
+                Err(err) => {
+                    eprintln!("tier1 gpu pipeline bench: CPU cleanup reference failed: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        let cpu_average_ms = elapsed_ms(cpu_start);
+
+        let expected_output = match reorder_tier1_summaries_for_records(
+            &records,
+            &original_records,
+            &expected_output,
+        ) {
+            Ok(expected) => expected,
+            Err(err) => {
+                eprintln!("tier1 gpu pipeline bench: summary reorder failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let bench = match vk_j2k_dec::vulkan::run_tier1_cleanup_pipeline_bench(
+            cleanup_shader_path,
+            &records,
+            &compressed_words,
+            iterations,
+            pipeline_depth,
+        ) {
+            Ok(bench) => bench,
+            Err(err) => {
+                eprintln!("tier1 gpu pipeline bench: Vulkan cleanup pipeline bench failed: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        if bench.last_frame_output != expected_output {
+            let mismatch = bench
+                .last_frame_output
+                .iter()
+                .zip(&expected_output)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or(bench.last_frame_output.len());
+            eprintln!(
+                "tier1 gpu pipeline bench: cleanup output mismatch at {mismatch}: got {:?}, expected {:?}",
+                bench.last_frame_output.get(mismatch),
+                expected_output.get(mismatch)
+            );
+            return ExitCode::FAILURE;
+        }
+        if bench.last_frame_coefficients != expected_coefficients {
+            let mismatch = bench
+                .last_frame_coefficients
+                .iter()
+                .zip(&expected_coefficients)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or(bench.last_frame_coefficients.len());
+            eprintln!(
+                "tier1 gpu pipeline bench: coefficient mismatch at {mismatch}: got {:?}, expected {:?}",
+                bench.last_frame_coefficients.get(mismatch),
+                expected_coefficients.get(mismatch)
+            );
+            return ExitCode::FAILURE;
+        }
+
+        let pipeline_fps = 1000.0 / bench.average_frame_ms;
+        println!(
+            "    vulkan tier1 pipeline bench: device {}, queue {}, setup {:.3} ms, pipeline {:.3} ms total / {:.3} ms avg, {:.2} fps",
+            bench.device_name,
+            bench.queue_family_index,
+            bench.setup_ms,
+            bench.total_pipeline_ms,
+            bench.average_frame_ms,
+            pipeline_fps
+        );
+        println!(
+            "    cpu single-frame tier1 reference: {:.3} ms; GPU per-frame speedup {:.2}x",
+            cpu_average_ms,
+            cpu_average_ms / bench.average_frame_ms
+        );
+    }
+    ExitCode::SUCCESS
+}
+
 fn tier1_mq_smoke_expected(
     plan: &GpuTier1Plan,
     codeblock_index: usize,
