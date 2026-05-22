@@ -342,38 +342,21 @@ uint significance_context(uint x, uint y) {
     return significance_context_from_neighbors(neighbor_counts(x, y));
 }
 
-int sign_contribution(uint x, uint y, int dx0, int dy0, int dx1, int dy1) {
-    bool has_positive = false;
-    bool has_negative = false;
-    int ix = int(x);
-    int iy = int(y);
-    int x0 = ix + dx0;
-    int y0 = iy + dy0;
-    if (uint(x0) < codeblock.width && uint(y0) < codeblock.height) {
-        uint state = state_at_index(index_at(uint(x0), uint(y0)));
-        bool sig = (state & STATE_SIGNIFICANT) != 0u;
-        bool neg = (state & STATE_NEGATIVE) != 0u;
-        has_negative = has_negative || (sig && neg);
-        has_positive = has_positive || (sig && !neg);
-    }
-    int x1 = ix + dx1;
-    int y1 = iy + dy1;
-    if (uint(x1) < codeblock.width && uint(y1) < codeblock.height) {
-        uint state = state_at_index(index_at(uint(x1), uint(y1)));
-        bool sig = (state & STATE_SIGNIFICANT) != 0u;
-        bool neg = (state & STATE_NEGATIVE) != 0u;
-        has_negative = has_negative || (sig && neg);
-        has_positive = has_positive || (sig && !neg);
-    }
-    if (has_positive && !has_negative) { return 1; }
-    if (!has_positive && has_negative) { return -1; }
-    return 0;
-}
-
 uvec2 sign_context(uint x, uint y) {
-    int horizontal = sign_contribution(x, y, -1, 0, 1, 0);
-    int vertical = sign_contribution(x, y, 0, -1, 0, 1);
-    uint index = uint((horizontal + 1) * 3 + (vertical + 1));
+    uint state_left   = (x > 0u) ? state_at_index(index_at(x - 1u, y)) : 0u;
+    uint state_right  = (x + 1u < codeblock.width) ? state_at_index(index_at(x + 1u, y)) : 0u;
+    uint state_top    = (y > 0u) ? state_at_index(index_at(x, y - 1u)) : 0u;
+    uint state_bottom = (y + 1u < codeblock.height) ? state_at_index(index_at(x, y + 1u)) : 0u;
+
+    uint has_pos_h = (((state_left & 3u) == 1u) || ((state_right & 3u) == 1u)) ? 1u : 0u;
+    uint has_neg_h = (((state_left & 3u) == 3u) || ((state_right & 3u) == 3u)) ? 1u : 0u;
+    int contrib_h = int(has_pos_h) - int(has_neg_h);
+
+    uint has_pos_v = (((state_top & 3u) == 1u) || ((state_bottom & 3u) == 1u)) ? 1u : 0u;
+    uint has_neg_v = (((state_top & 3u) == 3u) || ((state_bottom & 3u) == 3u)) ? 1u : 0u;
+    int contrib_v = int(has_pos_v) - int(has_neg_v);
+
+    uint index = uint((contrib_h + 1) * 3 + (contrib_v + 1));
     return SIGN_LUT[index];
 }
 
@@ -413,7 +396,8 @@ void decode_cleanup_sample(uint x, uint y, uint bitplane) {
     if (state_is_visited(state) || state_is_significant(state)) {
         return;
     }
-    uint is_significant = decode_bit(significance_context_from_neighbors(neighbors_from_state(state)));
+    uint context = (state & STATE_NEIGHBOR_MASK) == 0u ? 0u : significance_context_from_neighbors(neighbors_from_state(state));
+    uint is_significant = decode_bit(context);
     if (is_significant != 0u) {
         decode_significant_sample(x, y, bitplane, false);
     } else {
