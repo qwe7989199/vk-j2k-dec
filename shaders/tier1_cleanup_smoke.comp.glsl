@@ -396,7 +396,12 @@ void decode_cleanup_sample(uint x, uint y, uint bitplane) {
     if (state_is_visited(state) || state_is_significant(state)) {
         return;
     }
-    uint context = (state & STATE_NEIGHBOR_MASK) == 0u ? 0u : significance_context_from_neighbors(neighbors_from_state(state));
+    uint context;
+    if ((state & STATE_NEIGHBOR_MASK) == 0u) {
+        context = 0u;
+    } else {
+        context = significance_context_from_neighbors(neighbors_from_state(state));
+    }
     uint is_significant = decode_bit(context);
     if (is_significant != 0u) {
         decode_significant_sample(x, y, bitplane, false);
