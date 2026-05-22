@@ -75,11 +75,16 @@ const uvec2 SIGN_LUT[9] = uvec2[](
     uvec2(13u, 0u)  // h=1, v=1
 );
 
+layout(std430, set = 0, binding = 4) buffer CoefficientState {
+    uint state_data[];
+};
+
 shared uint s_context_packed[19];
 #define ctx_at(i) s_context_packed[i]
 
-shared uint coefficient_state[4096];
+shared uint s_reduction[32];
 Tier1Codeblock codeblock;
+uint state_base;
 uint byte_pos;
 uint c_reg;
 uint a_reg;
@@ -107,7 +112,7 @@ uint coeff_offset(uint index) {
 }
 
 uint state_at_index(uint index) {
-    return coefficient_state[index];
+    return state_data[state_base + index];
 }
 
 bool state_is_significant(uint state) {
@@ -147,7 +152,7 @@ bool is_visited_index(uint index) {
 }
 
 void mark_visited_index(uint index) {
-    coefficient_state[index] = (coefficient_state[index] & ~STATE_VISIT_MASK)
+    state_data[state_base + index] = (state_data[state_base + index] & ~STATE_VISIT_MASK)
         | visit_word;
 }
 
@@ -259,28 +264,29 @@ uint sign_at(int x, int y) {
 }
 
 uvec3 neighbor_counts(uint x, uint y) {
-    return neighbors_from_state(coefficient_state[index_at(x, y)]);
+    return neighbors_from_state(state_data[state_base + index_at(x, y)]);
 }
 
 void increment_neighbor(int x, int y, uint bit_shift) {
     if (x < 0 || y < 0 || x >= int(codeblock.width) || y >= int(codeblock.height)) {
         return;
     }
-    coefficient_state[index_at(uint(x), uint(y))] += 1u << (STATE_NEIGHBOR_SHIFT + bit_shift);
+    uint idx = state_base + index_at(uint(x), uint(y));
+    state_data[idx] += 1u << (STATE_NEIGHBOR_SHIFT + bit_shift);
 }
 
 void update_neighbors_for_significant(uint x, uint y) {
     if (x > 0u && y > 0u && x + 1u < codeblock.width && y + 1u < codeblock.height) {
-        uint index = index_at(x, y);
+        uint index = state_base + index_at(x, y);
         uint row_stride = codeblock.width;
-        coefficient_state[index - 1u] += 1u << STATE_NEIGHBOR_SHIFT;
-        coefficient_state[index + 1u] += 1u << STATE_NEIGHBOR_SHIFT;
-        coefficient_state[index - row_stride] += 1u << (STATE_NEIGHBOR_SHIFT + 4u);
-        coefficient_state[index + row_stride] += 1u << (STATE_NEIGHBOR_SHIFT + 4u);
-        coefficient_state[index - row_stride - 1u] += 1u << (STATE_NEIGHBOR_SHIFT + 8u);
-        coefficient_state[index - row_stride + 1u] += 1u << (STATE_NEIGHBOR_SHIFT + 8u);
-        coefficient_state[index + row_stride - 1u] += 1u << (STATE_NEIGHBOR_SHIFT + 8u);
-        coefficient_state[index + row_stride + 1u] += 1u << (STATE_NEIGHBOR_SHIFT + 8u);
+        state_data[index - 1u] += 1u << STATE_NEIGHBOR_SHIFT;
+        state_data[index + 1u] += 1u << STATE_NEIGHBOR_SHIFT;
+        state_data[index - row_stride] += 1u << (STATE_NEIGHBOR_SHIFT + 4u);
+        state_data[index + row_stride] += 1u << (STATE_NEIGHBOR_SHIFT + 4u);
+        state_data[index - row_stride - 1u] += 1u << (STATE_NEIGHBOR_SHIFT + 8u);
+        state_data[index - row_stride + 1u] += 1u << (STATE_NEIGHBOR_SHIFT + 8u);
+        state_data[index + row_stride - 1u] += 1u << (STATE_NEIGHBOR_SHIFT + 8u);
+        state_data[index + row_stride + 1u] += 1u << (STATE_NEIGHBOR_SHIFT + 8u);
         return;
     }
     int ix = int(x);
@@ -331,7 +337,7 @@ uint significance_context_from_neighbors(uint state) {
 }
 
 uint significance_context(uint x, uint y) {
-    return significance_context_from_neighbors(coefficient_state[index_at(x, y)]);
+    return significance_context_from_neighbors(state_data[state_base + index_at(x, y)]);
 }
 
 uvec2 sign_context(uint x, uint y) {
@@ -370,7 +376,7 @@ void decode_significant_sample(uint x, uint y, uint bitplane, bool mark_visit) {
     int magnitude = int(1u << bitplane);
     output_coefficients[coeff_offset(index)] = sign_bit != 0u ? -magnitude : magnitude;
     update_neighbors_for_significant(x, y);
-    coefficient_state[index] = (coefficient_state[index] & STATE_NEIGHBOR_MASK)
+    state_data[state_base + index] = (state_data[state_base + index] & STATE_NEIGHBOR_MASK)
         | STATE_SIGNIFICANT
         | (sign_bit != 0u ? STATE_NEGATIVE : 0u);
     if (mark_visit) {
@@ -514,7 +520,7 @@ void decode_refinement_pass(uint bitplane) {
                     int delta = bit != 0u ? int(1u << bitplane) : 0;
                     uint offset = coeff_offset(index);
                     output_coefficients[offset] += state_is_negative(state) ? -delta : delta;
-                    coefficient_state[index] = ((state | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
+                    state_data[state_base + index] = ((state | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
                     refinement_bits += 1u;
                     visited += 1u;
                 }
@@ -533,7 +539,7 @@ void decode_refinement_pass(uint bitplane) {
                     int delta = bit != 0u ? int(1u << bitplane) : 0;
                     uint offset = coeff_offset(index);
                     output_coefficients[offset] += state_is_negative(state) ? -delta : delta;
-                    coefficient_state[index] = ((state | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
+                    state_data[state_base + index] = ((state | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
                     refinement_bits += 1u;
                     visited += 1u;
                 }
@@ -551,10 +557,11 @@ void main() {
     }
 
     codeblock = codeblocks[codeblock_index];
-    
-    // Collaborative shared memory zero-initialization
+    state_base = codeblock.coefficient_offset;
+
+    // Collaborative zero-initialization of global state region
     for (uint i = gl_LocalInvocationID.x; i < codeblock.coefficient_count; i += 32u) {
-        coefficient_state[i] = 0u;
+        state_data[state_base + i] = 0u;
     }
     barrier();
 
@@ -638,25 +645,25 @@ void main() {
         }
     }
 
-    coefficient_state[gl_LocalInvocationID.x] = thread_nonzero;
+    s_reduction[gl_LocalInvocationID.x] = thread_nonzero;
     barrier();
 
     if (gl_LocalInvocationID.x == 0u) {
         uint nonzero = 0u;
         for (uint j = 0u; j < 32u; j++) {
-            nonzero += coefficient_state[j];
+            nonzero += s_reduction[j];
         }
         output_words[codeblock_index * 9u + 0u] = nonzero;
     }
 
     barrier();
-    coefficient_state[gl_LocalInvocationID.x] = thread_checksum;
+    s_reduction[gl_LocalInvocationID.x] = thread_checksum;
     barrier();
 
     if (gl_LocalInvocationID.x == 0u) {
         uint checksum = 0u;
         for (uint j = 0u; j < 32u; j++) {
-            checksum += coefficient_state[j];
+            checksum += s_reduction[j];
         }
         output_words[codeblock_index * 9u + 1u] = checksum;
         output_words[codeblock_index * 9u + 2u] = byte_pos;

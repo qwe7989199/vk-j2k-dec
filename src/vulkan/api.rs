@@ -632,7 +632,7 @@ pub fn run_tier1_cleanup_smoke(
         let program = StorageComputeProgram::new(
             device,
             &spirv,
-            4,
+            5,
             std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
         )?;
         let upload_start = std::time::Instant::now();
@@ -666,6 +666,10 @@ pub fn run_tier1_cleanup_smoke(
             coefficient_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         )?;
+        let state_buffer = device.create_device_local_buffer(
+            coefficient_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
         let push = Tier1CleanupSmokePushConstants {
             codeblock_count: records.len() as u32,
 
@@ -679,6 +683,7 @@ pub fn run_tier1_cleanup_smoke(
                 compressed_buffer.descriptor_info(),
                 output_buffer.descriptor_info(),
                 coefficient_buffer.descriptor_info(),
+                state_buffer.descriptor_info(),
             ],
             bytes_of(&push),
             tier1_cleanup_groups(records.len()),
@@ -739,7 +744,7 @@ pub fn run_tier1_cleanup_bench(
         let program = StorageComputeProgram::new(
             device,
             &spirv,
-            4,
+            5,
             std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
         )?;
         let setup_start = std::time::Instant::now();
@@ -771,6 +776,10 @@ pub fn run_tier1_cleanup_bench(
             coefficient_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         )?;
+        let state_buffer = device.create_device_local_buffer(
+            coefficient_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
         let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
 
         let push = Tier1CleanupSmokePushConstants {
@@ -782,6 +791,7 @@ pub fn run_tier1_cleanup_bench(
             compressed_buffer.descriptor_info(),
             output_buffer.descriptor_info(),
             coefficient_buffer.descriptor_info(),
+            state_buffer.descriptor_info(),
         ];
         let dispatch_start = std::time::Instant::now();
         program.dispatch_repeated(
@@ -869,7 +879,7 @@ pub fn run_tier1_cleanup_pipeline_bench(
         let program = StorageComputeProgram::new(
             device,
             &spirv,
-            4,
+            5,
             std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
         )?;
         let setup_start = std::time::Instant::now();
@@ -894,6 +904,7 @@ pub fn run_tier1_cleanup_pipeline_bench(
             output_device: HostBuffer,
             coefficient_staging: HostBuffer,
             coefficient_device: HostBuffer,
+            _state_device: HostBuffer,
             _descriptor_pool: DescriptorPoolHandle,
             descriptor_set: VkDescriptorSet,
             _command_pool: CommandPoolHandle,
@@ -915,7 +926,9 @@ pub fn run_tier1_cleanup_pipeline_bench(
             let coefficient_staging = device.create_host_cached_buffer(coefficient_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
             let coefficient_device = device.create_device_local_buffer(coefficient_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT)?;
 
-            let descriptor_pool = device.create_descriptor_pool(4, 1)?;
+            let state_device = device.create_device_local_buffer(coefficient_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)?;
+
+            let descriptor_pool = device.create_descriptor_pool(5, 1)?;
             let descriptor_set = device.allocate_descriptor_set(descriptor_pool.handle, program.descriptor_set_layout.handle)?;
 
             let descriptors = [
@@ -923,6 +936,7 @@ pub fn run_tier1_cleanup_pipeline_bench(
                 compressed_device.descriptor_info(),
                 output_device.descriptor_info(),
                 coefficient_device.descriptor_info(),
+                state_device.descriptor_info(),
             ];
             device.update_storage_descriptor_set(descriptor_set, &descriptors);
 
@@ -938,6 +952,7 @@ pub fn run_tier1_cleanup_pipeline_bench(
                 output_device,
                 coefficient_staging,
                 coefficient_device,
+                _state_device: state_device,
                 _descriptor_pool: descriptor_pool,
                 descriptor_set,
                 _command_pool: command_pool,
@@ -1389,7 +1404,7 @@ pub fn run_tier1_cleanup_scatter_smoke(
         let cleanup_program = StorageComputeProgram::new(
             device,
             &cleanup_spirv,
-            4,
+            5,
             std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
         )?;
         let scatter_program = StorageComputeProgram::new(
@@ -1431,6 +1446,10 @@ pub fn run_tier1_cleanup_scatter_smoke(
             flat_coefficient_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         )?;
+        let state_buffer = device.create_device_local_buffer(
+            flat_coefficient_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
         let plane_byte_len = bytes_len::<i32>(output_coefficients)?;
         let plane_buffer = device.create_device_local_buffer(
             plane_byte_len,
@@ -1450,6 +1469,7 @@ pub fn run_tier1_cleanup_scatter_smoke(
                 compressed_buffer.descriptor_info(),
                 output_buffer.descriptor_info(),
                 flat_coefficient_buffer.descriptor_info(),
+                state_buffer.descriptor_info(),
             ],
             bytes_of(&cleanup_push),
             tier1_cleanup_groups(cleanup_records.len()),
@@ -1541,7 +1561,7 @@ pub fn run_tier1_cleanup_scatter_bench(
         let cleanup_program = StorageComputeProgram::new(
             device,
             &cleanup_spirv,
-            4,
+            5,
             std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
         )?;
         let scatter_program = StorageComputeProgram::new(
@@ -1576,8 +1596,13 @@ pub fn run_tier1_cleanup_scatter_bench(
             output_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         )?;
+        let flat_coefficient_byte_len = bytes_len::<i32>(flat_coefficient_count)?;
         let flat_coefficient_buffer = device.create_device_local_buffer(
-            bytes_len::<i32>(flat_coefficient_count)?,
+            flat_coefficient_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let state_buffer = device.create_device_local_buffer(
+            flat_coefficient_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         )?;
         let plane_byte_len = bytes_len::<i32>(output_coefficients)?;
@@ -1591,13 +1616,14 @@ pub fn run_tier1_cleanup_scatter_bench(
             compressed_buffer.descriptor_info(),
             output_buffer.descriptor_info(),
             flat_coefficient_buffer.descriptor_info(),
+            state_buffer.descriptor_info(),
         ];
         let scatter_descriptors = [
             scatter_records_buffer.descriptor_info(),
             flat_coefficient_buffer.descriptor_info(),
             plane_buffer.descriptor_info(),
         ];
-        let cleanup_descriptor_pool = device.create_descriptor_pool(4, 1)?;
+        let cleanup_descriptor_pool = device.create_descriptor_pool(5, 1)?;
         let cleanup_descriptor_set = device.allocate_descriptor_set(
             cleanup_descriptor_pool.handle,
             cleanup_program.descriptor_set_layout.handle,
@@ -1708,7 +1734,7 @@ pub fn run_tier1_cleanup_scatter_idwt53_smoke(
         let cleanup_program = StorageComputeProgram::new(
             device,
             &cleanup_spirv,
-            4,
+            5,
             std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
         )?;
         let scatter_program = StorageComputeProgram::new(
@@ -1751,8 +1777,13 @@ pub fn run_tier1_cleanup_scatter_idwt53_smoke(
             output_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         )?;
+        let flat_coefficient_byte_len = bytes_len::<i32>(flat_coefficient_count)?;
         let flat_coefficient_buffer = device.create_device_local_buffer(
-            bytes_len::<i32>(flat_coefficient_count)?,
+            flat_coefficient_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let state_buffer = device.create_device_local_buffer(
+            flat_coefficient_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         )?;
         let plane_buffer = device.create_device_local_buffer(
@@ -1773,6 +1804,7 @@ pub fn run_tier1_cleanup_scatter_idwt53_smoke(
                 compressed_buffer.descriptor_info(),
                 output_buffer.descriptor_info(),
                 flat_coefficient_buffer.descriptor_info(),
+                state_buffer.descriptor_info(),
             ],
             bytes_of(&cleanup_push),
             tier1_cleanup_groups(cleanup_records.len()),
@@ -1901,7 +1933,7 @@ pub fn run_tier1_cleanup_scatter_rgb48_smoke(
         let cleanup_program = StorageComputeProgram::new(
             device,
             &cleanup_spirv,
-            4,
+            5,
             std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
         )?;
         let scatter_program = StorageComputeProgram::new(
@@ -1950,8 +1982,13 @@ pub fn run_tier1_cleanup_scatter_rgb48_smoke(
             output_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         )?;
+        let flat_coefficient_byte_len = bytes_len::<i32>(flat_coefficient_count)?;
         let flat_coefficient_buffer = device.create_device_local_buffer(
-            bytes_len::<i32>(flat_coefficient_count)?,
+            flat_coefficient_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let state_buffer = device.create_device_local_buffer(
+            flat_coefficient_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         )?;
         let plane_buffer = device.create_device_local_buffer(
@@ -1972,6 +2009,7 @@ pub fn run_tier1_cleanup_scatter_rgb48_smoke(
                 compressed_buffer.descriptor_info(),
                 output_buffer.descriptor_info(),
                 flat_coefficient_buffer.descriptor_info(),
+                state_buffer.descriptor_info(),
             ],
             bytes_of(&cleanup_push),
             tier1_cleanup_groups(cleanup_records.len()),
@@ -2421,6 +2459,7 @@ pub struct VulkanTier1Rgb48Pipeline {
     _scatter_records_buffer: HostBuffer,
     _output_buffer: HostBuffer,
     _flat_coefficient_buffer: HostBuffer,
+    _state_buffer: HostBuffer,
     _plane_buffer: HostBuffer,
     _cleanup_descriptor_pool: DescriptorPoolHandle,
     _scatter_descriptor_pool: DescriptorPoolHandle,
@@ -2473,7 +2512,7 @@ impl VulkanTier1Rgb48Pipeline {
         let cleanup_program = StorageComputeProgram::new(
             device,
             &cleanup_spirv,
-            4,
+            5,
             std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
         )?;
         let scatter_program = StorageComputeProgram::new(
@@ -2516,8 +2555,13 @@ impl VulkanTier1Rgb48Pipeline {
             bytes_len::<u32>(output_len)?,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         )?;
+        let flat_coefficient_byte_len = bytes_len::<i32>(flat_coefficient_count)?;
         let flat_coefficient_buffer = device.create_device_local_buffer(
-            bytes_len::<i32>(flat_coefficient_count)?,
+            flat_coefficient_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let state_buffer = device.create_device_local_buffer(
+            flat_coefficient_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         )?;
         let plane_buffer = device.create_device_local_buffer(
@@ -2564,8 +2608,9 @@ impl VulkanTier1Rgb48Pipeline {
             compressed_buffer.descriptor_info(),
             output_buffer.descriptor_info(),
             flat_coefficient_buffer.descriptor_info(),
+            state_buffer.descriptor_info(),
         ];
-        let cleanup_descriptor_pool = device.create_descriptor_pool(4, 1)?;
+        let cleanup_descriptor_pool = device.create_descriptor_pool(5, 1)?;
         let cleanup_descriptor_set = device.allocate_descriptor_set(
             cleanup_descriptor_pool.handle,
             cleanup_program.descriptor_set_layout.handle,
@@ -2628,6 +2673,7 @@ impl VulkanTier1Rgb48Pipeline {
             _scatter_records_buffer: scatter_records_buffer,
             _output_buffer: output_buffer,
             _flat_coefficient_buffer: flat_coefficient_buffer,
+            _state_buffer: state_buffer,
             _plane_buffer: plane_buffer,
             _cleanup_descriptor_pool: cleanup_descriptor_pool,
             _scatter_descriptor_pool: scatter_descriptor_pool,
@@ -2729,7 +2775,7 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
         let cleanup_program = StorageComputeProgram::new(
             device,
             &cleanup_spirv,
-            4,
+            5,
             std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
         )?;
         let scatter_program = StorageComputeProgram::new(
@@ -2775,8 +2821,13 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
             output_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         )?;
+        let flat_coefficient_byte_len = bytes_len::<i32>(flat_coefficient_count)?;
         let flat_coefficient_buffer = device.create_device_local_buffer(
-            bytes_len::<i32>(flat_coefficient_count)?,
+            flat_coefficient_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let state_buffer = device.create_device_local_buffer(
+            flat_coefficient_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         )?;
         let plane_buffer = device.create_device_local_buffer(
@@ -2821,8 +2872,9 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
             compressed_buffer.descriptor_info(),
             output_buffer.descriptor_info(),
             flat_coefficient_buffer.descriptor_info(),
+            state_buffer.descriptor_info(),
         ];
-        let cleanup_descriptor_pool = device.create_descriptor_pool(4, 1)?;
+        let cleanup_descriptor_pool = device.create_descriptor_pool(5, 1)?;
         let cleanup_descriptor_set = device.allocate_descriptor_set(
             cleanup_descriptor_pool.handle,
             cleanup_program.descriptor_set_layout.handle,
