@@ -114,6 +114,8 @@ impl GpuTier1Plan {
             for segment in &codeblock.segments {
                 compressed_bytes.extend_from_slice(segment.data);
             }
+            // Pad with 0xFF sentinels so the GPU shader can skip bounds checks
+            compressed_bytes.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
             let byte_len = checked_u32(execution.bytes, "Tier-1 byte length")?;
             let coefficient_offset = checked_u32(output_coefficients, "Tier-1 coefficient offset")?;
             let coefficient_count = codeblock

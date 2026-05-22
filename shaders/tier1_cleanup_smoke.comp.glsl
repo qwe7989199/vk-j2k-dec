@@ -160,9 +160,6 @@ uvec3 unpack_neighbors(uint packed) {
 }
 
 uint byte_at(uint index) {
-    if (index >= codeblock.byte_len) {
-        return 0xffu;
-    }
     uint absolute = codeblock.byte_offset + index;
     uint word_idx = absolute >> 2u;
     uint word;
