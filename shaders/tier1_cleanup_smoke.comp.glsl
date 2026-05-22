@@ -109,7 +109,7 @@ uint uniform_bits;
 uint became_significant;
 uint visited;
 uint decoded_passes;
-uint visit_generation;
+uint visit_word;
 
 uint index_at(uint x, uint y) {
     return y * codeblock.width + x;
@@ -136,12 +136,11 @@ bool state_is_refined(uint state) {
 }
 
 bool state_is_visited(uint state) {
-    return ((state & STATE_VISIT_MASK) >> STATE_VISIT_SHIFT) == visit_generation;
+    return (state & STATE_VISIT_MASK) == visit_word;
 }
 
 uvec3 neighbors_from_state(uint state) {
-    uint packed = (state & STATE_NEIGHBOR_MASK) >> STATE_NEIGHBOR_SHIFT;
-    return uvec3(packed & 0xfu, (packed >> 4u) & 0xfu, (packed >> 8u) & 0xfu);
+    return uvec3((state >> 16u) & 0xfu, (state >> 20u) & 0xfu, (state >> 24u) & 0xfu);
 }
 
 bool is_significant_index(uint index) {
@@ -162,7 +161,7 @@ bool is_visited_index(uint index) {
 
 void mark_visited_index(uint index) {
     coefficient_state[index] = (coefficient_state[index] & ~STATE_VISIT_MASK)
-        | (visit_generation << STATE_VISIT_SHIFT);
+        | visit_word;
 }
 
 uint pack_neighbors(uint horizontal, uint vertical, uint diagonal) {
@@ -424,7 +423,7 @@ void decode_cleanup_sample(uint x, uint y, uint bitplane) {
 }
 
 void clear_bitplane_visits() {
-    visit_generation += 1u;
+    visit_word += 0x100u;
 }
 
 void decode_cleanup_pass(uint bitplane) {
@@ -505,9 +504,7 @@ void decode_refinement_pass(uint bitplane) {
                 int delta = bit != 0u ? int(1u << bitplane) : 0;
                 uint offset = coeff_offset(index);
                 output_coefficients[offset] += state_is_negative(state) ? -delta : delta;
-                coefficient_state[index] = (state | STATE_REFINED)
-                    & ~STATE_VISIT_MASK;
-                coefficient_state[index] |= visit_generation << STATE_VISIT_SHIFT;
+                coefficient_state[index] = ((state | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
                 refinement_bits += 1u;
                 visited += 1u;
             }
@@ -556,7 +553,7 @@ void main() {
         became_significant = 0u;
         visited = 0u;
         decoded_passes = 0u;
-        visit_generation = 1u;
+        visit_word = 0x100u;
 
         if (codeblock.pass_count > 0u) {
             uint first_bitplane = codeblock.magnitude_bitplanes - codeblock.zero_bit_planes - 1u;
