@@ -93,8 +93,7 @@ const uvec2 SIGN_LUT[9] = uvec2[](
     uvec2(13u, 0u)  // h=1, v=1
 );
 
-uint context_state[19];
-uint context_mps[19];
+uint context_packed[19];
 shared uint coefficient_state[4096];
 Tier1Codeblock codeblock;
 uint byte_pos;
@@ -216,20 +215,21 @@ void renormalize() {
 }
 
 uint decode_bit(uint context_index) {
-    uint state = context_state[context_index];
-    uint mps = context_mps[context_index];
+    uint packed = context_packed[context_index];
+    uint state = packed & 0x7fu;
+    uint mps = packed >> 7u;
     uint qe = MQ_QE[state];
     a_reg -= qe;
     uint decoded;
     if ((c_reg >> 16u) < qe) {
         if (a_reg < qe) {
             a_reg = qe;
-            context_state[context_index] = MQ_NEXT_MPS[state];
+            context_packed[context_index] = MQ_NEXT_MPS[state] | (mps << 7u);
             decoded = mps;
         } else {
             a_reg = qe;
-            context_mps[context_index] = mps ^ MQ_SWITCH_MPS[state];
-            context_state[context_index] = MQ_NEXT_LPS[state];
+            uint next_mps = mps ^ MQ_SWITCH_MPS[state];
+            context_packed[context_index] = MQ_NEXT_LPS[state] | (next_mps << 7u);
             decoded = 1u - mps;
         }
         renormalize();
@@ -237,11 +237,11 @@ uint decode_bit(uint context_index) {
         c_reg -= qe << 16u;
         if ((a_reg & 0x8000u) == 0u) {
             if (a_reg < qe) {
-                context_mps[context_index] = mps ^ MQ_SWITCH_MPS[state];
-                context_state[context_index] = MQ_NEXT_LPS[state];
+                uint next_mps = mps ^ MQ_SWITCH_MPS[state];
+                context_packed[context_index] = MQ_NEXT_LPS[state] | (next_mps << 7u);
                 decoded = 1u - mps;
             } else {
-                context_state[context_index] = MQ_NEXT_MPS[state];
+                context_packed[context_index] = MQ_NEXT_MPS[state] | (mps << 7u);
                 decoded = mps;
             }
             renormalize();
@@ -415,24 +415,32 @@ void decode_cleanup_pass(uint bitplane) {
     uint stripe_y = 0u;
     while (stripe_y < codeblock.height) {
         uint stripe_height = min(4u, codeblock.height - stripe_y);
-        for (uint x = 0u; x < codeblock.width; x++) {
-            if (stripe_height == 4u && cleanup_run_length_candidate(x, stripe_y)) {
-                uint any_significant = decode_bit(17u);
-                run_length_bits += 1u;
-                if (any_significant == 0u) {
-                    significance_bits += 4u;
-                    visited += 4u;
-                    continue;
+        if (stripe_height == 4u) {
+            for (uint x = 0u; x < codeblock.width; x++) {
+                if (cleanup_run_length_candidate(x, stripe_y)) {
+                    uint any_significant = decode_bit(17u);
+                    run_length_bits += 1u;
+                    if (any_significant == 0u) {
+                        significance_bits += 4u;
+                        visited += 4u;
+                        continue;
+                    }
+                    uint run = (decode_bit(18u) << 1u) | decode_bit(18u);
+                    uniform_bits += 2u;
+                    significance_bits += run;
+                    visited += run;
+                    decode_significant_sample(x, stripe_y + run, bitplane, false);
+                    for (uint y_offset = run + 1u; y_offset < 4u; y_offset++) {
+                        decode_cleanup_sample(x, stripe_y + y_offset, bitplane);
+                    }
+                } else {
+                    for (uint y_offset = 0u; y_offset < 4u; y_offset++) {
+                        decode_cleanup_sample(x, stripe_y + y_offset, bitplane);
+                    }
                 }
-                uint run = (decode_bit(18u) << 1u) | decode_bit(18u);
-                uniform_bits += 2u;
-                significance_bits += run;
-                visited += run;
-                decode_significant_sample(x, stripe_y + run, bitplane, false);
-                for (uint y_offset = run + 1u; y_offset < stripe_height; y_offset++) {
-                    decode_cleanup_sample(x, stripe_y + y_offset, bitplane);
-                }
-            } else {
+            }
+        } else {
+            for (uint x = 0u; x < codeblock.width; x++) {
                 for (uint y_offset = 0u; y_offset < stripe_height; y_offset++) {
                     decode_cleanup_sample(x, stripe_y + y_offset, bitplane);
                 }
@@ -447,22 +455,44 @@ void decode_significance_pass(uint bitplane) {
     uint stripe_y = 0u;
     while (stripe_y < codeblock.height) {
         uint stripe_height = min(4u, codeblock.height - stripe_y);
-        for (uint x = 0u; x < codeblock.width; x++) {
-            for (uint y_offset = 0u; y_offset < stripe_height; y_offset++) {
-                uint y = stripe_y + y_offset;
-                uint index = index_at(x, y);
-                uint state = state_at_index(index);
-                if (state_is_visited(state) || state_is_significant(state) || (state & STATE_NEIGHBOR_MASK) == 0u) {
-                    continue;
+        if (stripe_height == 4u) {
+            for (uint x = 0u; x < codeblock.width; x++) {
+                for (uint y_offset = 0u; y_offset < 4u; y_offset++) {
+                    uint y = stripe_y + y_offset;
+                    uint index = index_at(x, y);
+                    uint state = state_at_index(index);
+                    if (state_is_visited(state) || state_is_significant(state) || (state & STATE_NEIGHBOR_MASK) == 0u) {
+                        continue;
+                    }
+                    uvec3 n = neighbors_from_state(state);
+                    uint is_significant = decode_bit(significance_context_from_neighbors(n));
+                    if (is_significant != 0u) {
+                        decode_significant_sample(x, y, bitplane, true);
+                    } else {
+                        mark_visited_index(index);
+                        significance_bits += 1u;
+                        visited += 1u;
+                    }
                 }
-                uvec3 n = neighbors_from_state(state);
-                uint is_significant = decode_bit(significance_context_from_neighbors(n));
-                if (is_significant != 0u) {
-                    decode_significant_sample(x, y, bitplane, true);
-                } else {
-                    mark_visited_index(index);
-                    significance_bits += 1u;
-                    visited += 1u;
+            }
+        } else {
+            for (uint x = 0u; x < codeblock.width; x++) {
+                for (uint y_offset = 0u; y_offset < stripe_height; y_offset++) {
+                    uint y = stripe_y + y_offset;
+                    uint index = index_at(x, y);
+                    uint state = state_at_index(index);
+                    if (state_is_visited(state) || state_is_significant(state) || (state & STATE_NEIGHBOR_MASK) == 0u) {
+                        continue;
+                    }
+                    uvec3 n = neighbors_from_state(state);
+                    uint is_significant = decode_bit(significance_context_from_neighbors(n));
+                    if (is_significant != 0u) {
+                        decode_significant_sample(x, y, bitplane, true);
+                    } else {
+                        mark_visited_index(index);
+                        significance_bits += 1u;
+                        visited += 1u;
+                    }
                 }
             }
         }
@@ -475,22 +505,43 @@ void decode_refinement_pass(uint bitplane) {
     uint stripe_y = 0u;
     while (stripe_y < codeblock.height) {
         uint stripe_height = min(4u, codeblock.height - stripe_y);
-        for (uint x = 0u; x < codeblock.width; x++) {
-            for (uint y_offset = 0u; y_offset < stripe_height; y_offset++) {
-                uint y = stripe_y + y_offset;
-                uint index = index_at(x, y);
-                uint state = state_at_index(index);
-                if (state_is_visited(state) || !state_is_significant(state)) {
-                    continue;
+        if (stripe_height == 4u) {
+            for (uint x = 0u; x < codeblock.width; x++) {
+                for (uint y_offset = 0u; y_offset < 4u; y_offset++) {
+                    uint y = stripe_y + y_offset;
+                    uint index = index_at(x, y);
+                    uint state = state_at_index(index);
+                    if (state_is_visited(state) || !state_is_significant(state)) {
+                        continue;
+                    }
+                    uint context = state_is_refined(state) ? 16u : (((state & STATE_NEIGHBOR_MASK) != 0u) ? 15u : 14u);
+                    uint bit = decode_bit(context);
+                    int delta = bit != 0u ? int(1u << bitplane) : 0;
+                    uint offset = coeff_offset(index);
+                    output_coefficients[offset] += state_is_negative(state) ? -delta : delta;
+                    coefficient_state[index] = ((state | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
+                    refinement_bits += 1u;
+                    visited += 1u;
                 }
-                uint context = state_is_refined(state) ? 16u : (((state & STATE_NEIGHBOR_MASK) != 0u) ? 15u : 14u);
-                uint bit = decode_bit(context);
-                int delta = bit != 0u ? int(1u << bitplane) : 0;
-                uint offset = coeff_offset(index);
-                output_coefficients[offset] += state_is_negative(state) ? -delta : delta;
-                coefficient_state[index] = ((state | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
-                refinement_bits += 1u;
-                visited += 1u;
+            }
+        } else {
+            for (uint x = 0u; x < codeblock.width; x++) {
+                for (uint y_offset = 0u; y_offset < stripe_height; y_offset++) {
+                    uint y = stripe_y + y_offset;
+                    uint index = index_at(x, y);
+                    uint state = state_at_index(index);
+                    if (state_is_visited(state) || !state_is_significant(state)) {
+                        continue;
+                    }
+                    uint context = state_is_refined(state) ? 16u : (((state & STATE_NEIGHBOR_MASK) != 0u) ? 15u : 14u);
+                    uint bit = decode_bit(context);
+                    int delta = bit != 0u ? int(1u << bitplane) : 0;
+                    uint offset = coeff_offset(index);
+                    output_coefficients[offset] += state_is_negative(state) ? -delta : delta;
+                    coefficient_state[index] = ((state | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
+                    refinement_bits += 1u;
+                    visited += 1u;
+                }
             }
         }
         stripe_y += 4u;
@@ -515,12 +566,11 @@ void main() {
     // Only thread 0 performs MQ arithmetic decoding
     if (gl_LocalInvocationID.x == 0u) {
         for (uint i = 0u; i < MQ_CONTEXT_COUNT; i++) {
-            context_state[i] = 0u;
-            context_mps[i] = 0u;
+            context_packed[i] = 0u;
         }
-        context_state[0] = 4u;
-        context_state[17] = 3u;
-        context_state[18] = 46u;
+        context_packed[0] = 4u;
+        context_packed[17] = 3u;
+        context_packed[18] = 46u;
 
         byte_pos = 0u;
         c_reg = byte_at(0u) << 16u;
