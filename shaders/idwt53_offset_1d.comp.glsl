@@ -29,13 +29,6 @@ layout(push_constant) uniform PushConstants {
     uint output_offset;
 } pc;
 
-int floor_div(int value, int divisor) {
-    if (value >= 0) {
-        return value / divisor;
-    }
-    return -((-value + divisor - 1) / divisor);
-}
-
 int high_at(uint line, uint index) {
     if (pc.high_count == 0u) {
         return 0;
@@ -48,7 +41,7 @@ int updated_low_at(uint line, uint index) {
     int low = low_band[pc.low_offset + line * pc.low_line_stride + index * pc.low_sample_stride];
     int left = index == 0u ? high_at(line, 0u) : high_at(line, index - 1u);
     int right = high_at(line, index);
-    return low - floor_div(left + right + 2, 4);
+    return low - ((left + right + 2) >> 2);
 }
 
 void main() {
@@ -67,7 +60,7 @@ void main() {
         int high = high_band[pc.high_offset + line * pc.high_line_stride + high_index * pc.high_sample_stride];
         int left = updated_low_at(line, high_index);
         int right = updated_low_at(line, min(high_index + 1u, pc.low_count - 1u));
-        value = high + floor_div(left + right, 2);
+        value = high + ((left + right) >> 1);
     }
 
     output_band[pc.output_offset + line * pc.output_line_stride + x * pc.output_sample_stride] = value;
