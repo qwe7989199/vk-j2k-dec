@@ -255,6 +255,7 @@ impl StorageComputeProgram {
                 descriptor_set,
                 push_constants,
                 groups: [groups_x, groups_y, 1],
+                no_barrier_before: false,
             })
             .collect::<Vec<_>>();
         device.record_storage_dispatches(command_buffer, &storage_dispatches)?;
@@ -309,6 +310,7 @@ impl StorageComputeProgram {
                 descriptor_set: *descriptor_set,
                 push_constants: dispatch.push_constants,
                 groups: dispatch.groups,
+                no_barrier_before: false,
             })
             .collect::<Vec<_>>();
         device.record_storage_dispatches(command_buffer, &storage_dispatches)?;
@@ -1654,6 +1656,7 @@ pub fn run_tier1_cleanup_scatter_bench(
                 descriptor_set: cleanup_descriptor_set,
                 push_constants: bytes_of(&cleanup_push),
                 groups: [tier1_cleanup_groups(cleanup_records.len()), 1, 1],
+                no_barrier_before: false,
             });
             dispatches.push(StorageDispatch {
                 pipeline: scatter_program.pipeline.handle,
@@ -1661,6 +1664,7 @@ pub fn run_tier1_cleanup_scatter_bench(
                 descriptor_set: scatter_descriptor_set,
                 push_constants: bytes_of(&scatter_push),
                 groups: [max_scatter_coefficients.div_ceil(256), scatter_records.len() as u32, 1],
+                no_barrier_before: false,
             });
         }
 
@@ -2289,11 +2293,12 @@ impl ReusableScatteredIdwt53Component {
         program: &StorageComputeProgram,
         dispatches: &mut Vec<StorageDispatch<'a>>,
     ) {
-        for ((push, descriptor_set), groups) in self
+        for (index, ((push, descriptor_set), groups)) in self
             .pushes
             .iter()
             .zip(&self.descriptor_sets)
             .zip(&self.groups)
+            .enumerate()
         {
             dispatches.push(StorageDispatch {
                 pipeline: program.pipeline.handle,
@@ -2301,6 +2306,7 @@ impl ReusableScatteredIdwt53Component {
                 descriptor_set: *descriptor_set,
                 push_constants: bytes_of(push),
                 groups: *groups,
+                no_barrier_before: index % 3 == 1,
             });
         }
     }
@@ -2408,6 +2414,7 @@ impl ReusableRgb48Packer {
             descriptor_set: self.descriptor_set,
             push_constants: bytes_of(&self.push),
             groups: self.groups,
+            no_barrier_before: false,
         });
     }
 
@@ -2620,7 +2627,8 @@ impl VulkanTier1Rgb48Pipeline {
             descriptor_set: cleanup_descriptor_set,
             push_constants: bytes_of(&cleanup_push),
             groups: [tier1_cleanup_groups(codeblock_count), 1, 1],
-        });
+                no_barrier_before: false,
+            });
         fused_dispatches.push(StorageDispatch {
             pipeline: scatter_program.pipeline.handle,
             pipeline_layout: scatter_program.pipeline_layout.handle,
@@ -2631,7 +2639,8 @@ impl VulkanTier1Rgb48Pipeline {
                 scatter_records.len() as u32,
                 1,
             ],
-        });
+                no_barrier_before: false,
+            });
         for component in &idwt_components {
             component.extend_storage_dispatches(&idwt53_program, &mut fused_dispatches);
         }
@@ -2883,7 +2892,8 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
             descriptor_set: cleanup_descriptor_set,
             push_constants: bytes_of(&cleanup_push),
             groups: [tier1_cleanup_groups(cleanup_records.len()), 1, 1],
-        });
+                no_barrier_before: false,
+            });
         fused_dispatches.push(StorageDispatch {
             pipeline: scatter_program.pipeline.handle,
             pipeline_layout: scatter_program.pipeline_layout.handle,
@@ -2894,7 +2904,8 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
                 scatter_records.len() as u32,
                 1,
             ],
-        });
+                no_barrier_before: false,
+            });
         for component in &idwt_components {
             component.extend_storage_dispatches(&idwt53_program, &mut fused_dispatches);
         }

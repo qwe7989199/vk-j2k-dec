@@ -55,6 +55,7 @@ struct StorageDispatch<'a> {
     descriptor_set: VkDescriptorSet,
     push_constants: &'a [u8],
     groups: [u32; 3],
+    no_barrier_before: bool,
 }
 
 struct BufferCopy<'a> {
@@ -540,7 +541,7 @@ impl VulkanDevice {
                     dispatch.groups[2],
                 );
             }
-            if index + 1 < dispatches.len() {
+            if index + 1 < dispatches.len() && !dispatches[index + 1].no_barrier_before {
                 let barrier = VkMemoryBarrier {
                     s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                     p_next: ptr::null(),
