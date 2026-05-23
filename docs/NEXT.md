@@ -212,6 +212,7 @@ optimization broke bit-exactness and must be rolled back.
 | Larger workgroups (64-lane) | failed | Shared memory pressure (GOAL.md) |
 | Refinement pass column-skip | -0.8% | All refined samples are in active columns |
 | Precomputed sig_context in bits[31:28] | -3% | 8 LUT recomps per sig sample > savings at lookup |
+| Embedded sign bits in state[31:28] | ±0% | 4 extra OR stores offset the 4 saved loads in sign_context |
 
 ### Remaining opportunities (untried)
 | Optimization | Expected gain | Effort | Risk |
