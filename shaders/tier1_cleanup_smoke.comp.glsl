@@ -110,6 +110,24 @@ uint became_significant;
 uint visited;
 uint decoded_passes;
 uint visit_word;
+uint col_active_lo;
+uint col_active_hi;
+
+void mark_col_active(uint x) {
+    if (x < 32u) col_active_lo |= 1u << x;
+    else col_active_hi |= 1u << (x - 32u);
+}
+
+void mark_col_active_neighbors(uint x) {
+    mark_col_active(x);
+    if (x > 0u) mark_col_active(x - 1u);
+    if (x + 1u < codeblock.width) mark_col_active(x + 1u);
+}
+
+bool is_col_active(uint x) {
+    if (x < 32u) return (col_active_lo & (1u << x)) != 0u;
+    return (col_active_hi & (1u << (x - 32u))) != 0u;
+}
 
 uint index_at(uint x, uint y) {
     return y * codeblock.width + x;
@@ -384,6 +402,7 @@ void decode_significant_sample(uint x, uint y, uint bitplane, bool mark_visit) {
     int magnitude = int(1u << bitplane);
     output_coefficients[coeff_offset(index)] = sign_bit != 0u ? -magnitude : magnitude;
     update_neighbors_for_significant(x, y);
+    mark_col_active_neighbors(x);
     state_data[state_base + index] = (state_data[state_base + index] & STATE_NEIGHBOR_MASK)
         | STATE_SIGNIFICANT
         | (sign_bit != 0u ? STATE_NEGATIVE : 0u);
@@ -468,6 +487,7 @@ void decode_significance_pass(uint bitplane) {
         uint stripe_height = min(4u, codeblock.height - stripe_y);
         if (stripe_height == 4u) {
             for (uint x = 0u; x < codeblock.width; x++) {
+                if (!is_col_active(x)) continue;
                 for (uint y_offset = 0u; y_offset < 4u; y_offset++) {
                     uint y = stripe_y + y_offset;
                     uint index = index_at(x, y);
@@ -487,6 +507,7 @@ void decode_significance_pass(uint bitplane) {
             }
         } else {
             for (uint x = 0u; x < codeblock.width; x++) {
+                if (!is_col_active(x)) continue;
                 for (uint y_offset = 0u; y_offset < stripe_height; y_offset++) {
                     uint y = stripe_y + y_offset;
                     uint index = index_at(x, y);
@@ -607,6 +628,8 @@ void main() {
         visited = 0u;
         decoded_passes = 0u;
         visit_word = 0x100u;
+        col_active_lo = 0u;
+        col_active_hi = 0u;
 
         if (codeblock.pass_count > 0u) {
             uint first_bitplane = codeblock.magnitude_bitplanes - codeblock.zero_bit_planes - 1u;
