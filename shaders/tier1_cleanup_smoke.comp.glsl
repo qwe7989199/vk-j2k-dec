@@ -1,6 +1,6 @@
 #version 450
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 struct Tier1Codeblock {
     uint component;
@@ -79,10 +79,17 @@ layout(std430, set = 0, binding = 4) buffer CoefficientState {
     uint state_data[];
 };
 
-shared uint s_context_packed[19];
-#define ctx_at(i) s_context_packed[i]
+const uint CODEBLOCKS_PER_WORKGROUP = 4u;
 
-shared uint s_reduction[32];
+shared uint s_context_packed[4 * 19];
+shared uint s_reduction[128];
+
+uint warp_id;
+uint lane_id;
+uint ctx_base;
+
+#define ctx_at(i) s_context_packed[ctx_base + (i)]
+
 Tier1Codeblock codeblock;
 uint state_base;
 uint byte_pos;
@@ -551,7 +558,11 @@ void decode_refinement_pass(uint bitplane) {
 }
 
 void main() {
-    uint codeblock_index = gl_WorkGroupID.x;
+    warp_id = gl_LocalInvocationID.x >> 5u;
+    lane_id = gl_LocalInvocationID.x & 31u;
+    ctx_base = warp_id * 19u;
+
+    uint codeblock_index = gl_WorkGroupID.x * CODEBLOCKS_PER_WORKGROUP + warp_id;
     if (codeblock_index >= pc.codeblock_count) {
         return;
     }
@@ -559,14 +570,14 @@ void main() {
     codeblock = codeblocks[codeblock_index];
     state_base = codeblock.coefficient_offset;
 
-    // Collaborative zero-initialization of global state region
-    for (uint i = gl_LocalInvocationID.x; i < codeblock.coefficient_count; i += 32u) {
+    // Collaborative zero-initialization of global state region (32 threads per warp)
+    for (uint i = lane_id; i < codeblock.coefficient_count; i += 32u) {
         state_data[state_base + i] = 0u;
     }
     barrier();
 
-    // Only thread 0 performs MQ arithmetic decoding
-    if (gl_LocalInvocationID.x == 0u) {
+    // Only lane 0 of each warp performs MQ arithmetic decoding
+    if (lane_id == 0u) {
         for (uint i = 0u; i < MQ_CONTEXT_COUNT; i++) {
             ctx_at(i) = 0u;
         }
@@ -624,17 +635,17 @@ void main() {
             }
         }
 
-    } // End of thread 0 MQ arithmetic decoding block
+    } // End of lane 0 MQ arithmetic decoding block
 
     barrier();
 
-    // Collaborative parallel write-back and local counting
+    // Collaborative parallel write-back and local counting (per-warp)
     uint thread_nonzero = 0u;
     uint thread_checksum = 0u;
     uint coeff_count = codeblock.coefficient_count;
     uint coeff_offset_base = codeblock.coefficient_offset;
 
-    for (uint i = gl_LocalInvocationID.x; i < coeff_count; i += 32u) {
+    for (uint i = lane_id; i < coeff_count; i += 32u) {
         uint offset = coeff_offset_base + i;
         if (is_significant_index(i)) {
             int coefficient = output_coefficients[offset];
@@ -645,25 +656,26 @@ void main() {
         }
     }
 
-    s_reduction[gl_LocalInvocationID.x] = thread_nonzero;
+    uint red_base = warp_id * 32u;
+    s_reduction[red_base + lane_id] = thread_nonzero;
     barrier();
 
-    if (gl_LocalInvocationID.x == 0u) {
+    if (lane_id == 0u) {
         uint nonzero = 0u;
         for (uint j = 0u; j < 32u; j++) {
-            nonzero += s_reduction[j];
+            nonzero += s_reduction[red_base + j];
         }
         output_words[codeblock_index * 9u + 0u] = nonzero;
     }
 
     barrier();
-    s_reduction[gl_LocalInvocationID.x] = thread_checksum;
+    s_reduction[red_base + lane_id] = thread_checksum;
     barrier();
 
-    if (gl_LocalInvocationID.x == 0u) {
+    if (lane_id == 0u) {
         uint checksum = 0u;
         for (uint j = 0u; j < 32u; j++) {
-            checksum += s_reduction[j];
+            checksum += s_reduction[red_base + j];
         }
         output_words[codeblock_index * 9u + 1u] = checksum;
         output_words[codeblock_index * 9u + 2u] = byte_pos;

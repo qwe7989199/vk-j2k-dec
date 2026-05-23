@@ -157,7 +157,7 @@ struct StorageDispatchBatch<'a> {
     groups: [u32; 3],
 }
 
-const TIER1_CLEANUP_CODEBLOCKS_PER_WORKGROUP: u32 = 1;
+const TIER1_CLEANUP_CODEBLOCKS_PER_WORKGROUP: u32 = 4;
 
 fn tier1_cleanup_groups(codeblock_count: usize) -> u32 {
     (codeblock_count as u32).div_ceil(TIER1_CLEANUP_CODEBLOCKS_PER_WORKGROUP)
