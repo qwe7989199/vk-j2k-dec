@@ -184,3 +184,39 @@ optimization broke bit-exactness and must be rolled back.
 - >2% improvement on the sync full RGB48 bench (20 iterations, 3 runs median)
 - Bit-exact checksum
 - If within noise (±2%), roll back
+
+## Optimization Attempt Log (May 2025)
+
+### Confirmed working
+| Optimization | Tier-1 gain | Notes |
+|---|---|---|
+| Global coefficient_state (from shared) | +31% | Occupancy 8→32+ workgroups/SM |
+| 4 codeblocks/workgroup (128 threads) | +14% | 4 independent warps hide latency |
+| Per-codeblock 0xFF padding + bounds removal | +2.7% | Eliminates branch in byte_at |
+| Column activity bitmap (significance pass) | +10.9% | 64-bit register bitmap, skip inactive columns |
+| Subgroup barriers | ~0% alone | Enables pipeline depth >4 correctness |
+| Fused D2H copy in command buffer | ~0.2% | Eliminates one submit+wait round-trip |
+
+### Confirmed NOT working (do not retry)
+| Optimization | Result | Why |
+|---|---|---|
+| Private context registers (19 uints) | -74% (21.7ms) | Register spill to local memory |
+| Restructured decode_bit (early return) | -70% (16 fps) | NVIDIA compiler hates divergent branches |
+| Table-driven MQ (eliminate ternaries) | ±0% | Compiler already generates optimal selp |
+| 8 codeblocks/workgroup (256 threads) | ±0% | No benefit over 4 |
+| 2-word byte cache | ±0% | Noise |
+| Shared memory byte preload | -40% | Occupancy loss |
+| Removing byte cache | -2% | Slight regression |
+| Stride-based indexing | ±0% | Neutral |
+| Multi-lane cooperative MQ decode | failed | MQ serial state too strong (GOAL.md) |
+| Larger workgroups (64-lane) | failed | Shared memory pressure (GOAL.md) |
+| Refinement pass column-skip | -0.8% | All refined samples are in active columns |
+
+### Remaining opportunities (untried)
+| Optimization | Expected gain | Effort | Risk |
+|---|---|---|---|
+| Packed column state (nvjpeg2000 style) | 5-15% | 3-5 days | High (full shader rewrite) |
+| Sign context inline (encode in state bits) | <1% | 1 day | Low |
+| Fused scatter+IDWT | 0.5-1ms | 2 days | Medium |
+| Async transfer queue for readback | 1-2ms | 1 day | Low |
+| IDWT shared memory tiling | 0.5-1ms | 2 days | Medium |
