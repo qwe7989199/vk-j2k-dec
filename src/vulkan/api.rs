@@ -2411,31 +2411,6 @@ impl ReusableRgb48Packer {
         });
     }
 
-    fn readback(
-        &self,
-        device: &VulkanDevice,
-        queue_family_index: u32,
-    ) -> Result<GpuPackedRgb48Result, VulkanError> {
-        let copy_start = std::time::Instant::now();
-        device.copy_buffer(
-            queue_family_index,
-            &self.output_buffer,
-            &self.staging_buffer,
-            self.output_byte_len,
-        )?;
-        let copy_ms = copy_start.elapsed().as_secs_f64() * 1000.0;
-
-        let readback_start = std::time::Instant::now();
-        let samples = self.staging_buffer.read_vec::<u16>(self.output_count)?;
-        let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
-        Ok(GpuPackedRgb48Result {
-            samples,
-            shader_ms: 0.0,
-            copy_ms,
-            readback_ms,
-        })
-    }
-
     fn read_staging(&self) -> Result<GpuPackedRgb48Result, VulkanError> {
         let readback_start = std::time::Instant::now();
         let samples = self.staging_buffer.read_vec::<u16>(self.output_count)?;
@@ -2446,6 +2421,14 @@ impl ReusableRgb48Packer {
             copy_ms: 0.0,
             readback_ms,
         })
+    }
+
+    fn trailing_copy(&self) -> BufferCopy<'_> {
+        BufferCopy {
+            source: &self.output_buffer,
+            destination: &self.staging_buffer,
+            byte_len: self.output_byte_len,
+        }
     }
 }
 
@@ -2916,30 +2899,27 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
             component.extend_storage_dispatches(&idwt53_program, &mut fused_dispatches);
         }
         rgb48_packer.extend_storage_dispatches(&color_program, &mut fused_dispatches);
-        device.record_storage_dispatches(fused_command_buffer, &fused_dispatches)?;
+        let trailing_copies = [rgb48_packer.trailing_copy()];
+        device.record_storage_dispatches_with_copies(fused_command_buffer, &fused_dispatches, &trailing_copies)?;
         let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
 
         let cleanup_dispatch_ms = 0.0;
         let scatter_dispatch_ms = 0.0;
         let idwt_dispatch_ms = 0.0;
         let idwt_alloc_ms = 0.0;
-        let mut color_shader_ms = 0.0;
-        let mut color_copy_ms = 0.0;
-        let mut color_readback_ms = 0.0;
+        let color_shader_ms = 0.0;
+        let color_copy_ms = 0.0;
+        let color_readback_ms = 0.0;
         let mut fused_dispatch_ms = 0.0;
-        let mut samples = Vec::new();
         let decode_start = std::time::Instant::now();
         for _ in 0..iterations {
             let fused_dispatch_start = std::time::Instant::now();
             device.submit_and_wait(fused_command_buffer)?;
             fused_dispatch_ms += fused_dispatch_start.elapsed().as_secs_f64() * 1000.0;
-            let packed = rgb48_packer.readback(device, queue_family_index)?;
-            color_shader_ms += packed.shader_ms;
-            color_copy_ms += packed.copy_ms;
-            color_readback_ms += packed.readback_ms;
-            samples = packed.samples;
         }
         let decode_total_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+        let samples = rgb48_packer.read_staging()?.samples;
 
         let summary_readback_start = std::time::Instant::now();
         let output_staging =

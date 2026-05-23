@@ -32,7 +32,11 @@ $shaders = @(
 
 foreach ($shader in $shaders) {
     $output = Join-Path $OutputDir $shader.Output
-    & $glslc -fshader-stage=compute $shader.Source -o $output
+    $extraArgs = @()
+    if ($shader.Source -match "tier1_cleanup_smoke") {
+        $extraArgs = @("--target-env=vulkan1.1")
+    }
+    & $glslc -fshader-stage=compute @extraArgs $shader.Source -o $output
     & $spirvVal $output
     Write-Host "compiled $($shader.Source) -> $output"
 }

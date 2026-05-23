@@ -1,4 +1,5 @@
 #version 450
+#extension GL_KHR_shader_subgroup_basic : require
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -574,7 +575,7 @@ void main() {
     for (uint i = lane_id; i < codeblock.coefficient_count; i += 32u) {
         state_data[state_base + i] = 0u;
     }
-    barrier();
+    subgroupBarrier();
 
     // Only lane 0 of each warp performs MQ arithmetic decoding
     if (lane_id == 0u) {
@@ -637,7 +638,7 @@ void main() {
 
     } // End of lane 0 MQ arithmetic decoding block
 
-    barrier();
+    subgroupBarrier();
 
     // Collaborative parallel write-back and local counting (per-warp)
     uint thread_nonzero = 0u;
@@ -658,7 +659,7 @@ void main() {
 
     uint red_base = warp_id * 32u;
     s_reduction[red_base + lane_id] = thread_nonzero;
-    barrier();
+    subgroupBarrier();
 
     if (lane_id == 0u) {
         uint nonzero = 0u;
@@ -668,9 +669,9 @@ void main() {
         output_words[codeblock_index * 9u + 0u] = nonzero;
     }
 
-    barrier();
+    subgroupBarrier();
     s_reduction[red_base + lane_id] = thread_checksum;
-    barrier();
+    subgroupBarrier();
 
     if (lane_id == 0u) {
         uint checksum = 0u;
