@@ -19,7 +19,7 @@ struct Tier1Codeblock {
     uint coefficient_count;
     uint pass_offset;
     uint pass_count;
-    uint padding;
+    uint reconstruction_mode;
 };
 
 layout(std430, set = 0, binding = 0) readonly buffer Codeblocks {
@@ -40,6 +40,7 @@ layout(std430, set = 0, binding = 3) buffer CoefficientsOut {
 
 layout(push_constant) uniform PushConstants {
     uint codeblock_count;
+    uint reconstruction_mode;
 } pc;
 
 const uint MAX_COEFFS = 4096u;
@@ -110,24 +111,6 @@ uint became_significant;
 uint visited;
 uint decoded_passes;
 uint visit_word;
-uint col_active_lo;
-uint col_active_hi;
-
-void mark_col_active(uint x) {
-    if (x < 32u) col_active_lo |= 1u << x;
-    else col_active_hi |= 1u << (x - 32u);
-}
-
-void mark_col_active_neighbors(uint x) {
-    mark_col_active(x);
-    if (x > 0u) mark_col_active(x - 1u);
-    if (x + 1u < codeblock.width) mark_col_active(x + 1u);
-}
-
-bool is_col_active(uint x) {
-    if (x < 32u) return (col_active_lo & (1u << x)) != 0u;
-    return (col_active_hi & (1u << (x - 32u))) != 0u;
-}
 
 uint index_at(uint x, uint y) {
     return y * codeblock.width + x;
@@ -399,10 +382,17 @@ void decode_significant_sample(uint x, uint y, uint bitplane, bool mark_visit) {
     uint index = index_at(x, y);
     uvec2 sc = sign_context(x, y);
     uint sign_bit = decode_bit(sc.x) ^ sc.y;
-    int magnitude = int(1u << bitplane);
+    int magnitude;
+    if (codeblocks[0].reconstruction_mode == 1u) {
+        magnitude = int((1u << bitplane) | ((1u << bitplane) >> 1u));
+        if (codeblock.resolution == 0u && codeblock.subband == 0u) {
+            magnitude -= 1;
+        }
+    } else {
+        magnitude = int(1u << bitplane);
+    }
     output_coefficients[coeff_offset(index)] = sign_bit != 0u ? -magnitude : magnitude;
     update_neighbors_for_significant(x, y);
-    mark_col_active_neighbors(x);
     state_data[state_base + index] = (state_data[state_base + index] & STATE_NEIGHBOR_MASK)
         | STATE_SIGNIFICANT
         | (sign_bit != 0u ? STATE_NEGATIVE : 0u);
@@ -487,7 +477,6 @@ void decode_significance_pass(uint bitplane) {
         uint stripe_height = min(4u, codeblock.height - stripe_y);
         if (stripe_height == 4u) {
             for (uint x = 0u; x < codeblock.width; x++) {
-                if (!is_col_active(x)) continue;
                 for (uint y_offset = 0u; y_offset < 4u; y_offset++) {
                     uint y = stripe_y + y_offset;
                     uint index = index_at(x, y);
@@ -507,7 +496,6 @@ void decode_significance_pass(uint bitplane) {
             }
         } else {
             for (uint x = 0u; x < codeblock.width; x++) {
-                if (!is_col_active(x)) continue;
                 for (uint y_offset = 0u; y_offset < stripe_height; y_offset++) {
                     uint y = stripe_y + y_offset;
                     uint index = index_at(x, y);
@@ -546,7 +534,13 @@ void decode_refinement_pass(uint bitplane) {
                     }
                     uint context = state_is_refined(state) ? 16u : (((state & STATE_NEIGHBOR_MASK) != 0u) ? 15u : 14u);
                     uint bit = decode_bit(context);
-                    int delta = bit != 0u ? int(1u << bitplane) : 0;
+                    int delta;
+                    if (codeblocks[0].reconstruction_mode == 1u) {
+                        int half_step = int((1u << bitplane) >> 1u);
+                        delta = bit != 0u ? half_step : -half_step;
+                    } else {
+                        delta = bit != 0u ? int(1u << bitplane) : 0;
+                    }
                     uint offset = coeff_offset(index);
                     output_coefficients[offset] += state_is_negative(state) ? -delta : delta;
                     state_data[state_base + index] = ((state | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
@@ -565,7 +559,13 @@ void decode_refinement_pass(uint bitplane) {
                     }
                     uint context = state_is_refined(state) ? 16u : (((state & STATE_NEIGHBOR_MASK) != 0u) ? 15u : 14u);
                     uint bit = decode_bit(context);
-                    int delta = bit != 0u ? int(1u << bitplane) : 0;
+                    int delta;
+                    if (codeblocks[0].reconstruction_mode == 1u) {
+                        int half_step = int((1u << bitplane) >> 1u);
+                        delta = bit != 0u ? half_step : -half_step;
+                    } else {
+                        delta = bit != 0u ? int(1u << bitplane) : 0;
+                    }
                     uint offset = coeff_offset(index);
                     output_coefficients[offset] += state_is_negative(state) ? -delta : delta;
                     state_data[state_base + index] = ((state | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
@@ -628,8 +628,6 @@ void main() {
         visited = 0u;
         decoded_passes = 0u;
         visit_word = 0x100u;
-        col_active_lo = 0u;
-        col_active_hi = 0u;
 
         if (codeblock.pass_count > 0u) {
             uint first_bitplane = codeblock.magnitude_bitplanes - codeblock.zero_bit_planes - 1u;

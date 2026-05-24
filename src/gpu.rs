@@ -51,7 +51,7 @@ pub struct GpuTier1CodeblockRecord {
     pub coefficient_count: u32,
     pub pass_offset: u32,
     pub pass_count: u32,
-    pub _padding: u32,
+    pub reconstruction_mode: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +171,17 @@ impl GpuTier1Plan {
         self.codeblocks
             .iter()
             .map(GpuTier1CodeblockRecord::from)
+            .collect()
+    }
+
+    pub fn codeblock_records_with_reconstruction(&self, reconstruction_mode: u32) -> Vec<GpuTier1CodeblockRecord> {
+        self.codeblocks
+            .iter()
+            .map(|cb| {
+                let mut record = GpuTier1CodeblockRecord::from(cb);
+                record.reconstruction_mode = reconstruction_mode;
+                record
+            })
             .collect()
     }
 
@@ -359,7 +370,7 @@ impl From<&GpuTier1Codeblock> for GpuTier1CodeblockRecord {
             coefficient_count: codeblock.coefficient_count,
             pass_offset: codeblock.pass_offset,
             pass_count: codeblock.pass_count,
-            _padding: 0,
+            reconstruction_mode: 0,
         }
     }
 }

@@ -479,6 +479,7 @@ struct Tier1MqSmokePushConstants {
 #[derive(Debug, Clone, Copy)]
 struct Tier1CleanupSmokePushConstants {
     codeblock_count: u32,
+    reconstruction_mode: u32,
 }
 
 #[repr(C)]
@@ -627,6 +628,7 @@ pub fn run_tier1_cleanup_smoke(
     shader_path: &str,
     records: &[crate::gpu::GpuTier1CodeblockRecord],
     compressed_words: &[u32],
+    reconstruction_mode: u32,
 ) -> Result<Tier1CleanupSmokeResult, VulkanError> {
     validate_tier1_cleanup_inputs(records, compressed_words)?;
     let spirv = read_spirv(shader_path)?;
@@ -674,6 +676,7 @@ pub fn run_tier1_cleanup_smoke(
         )?;
         let push = Tier1CleanupSmokePushConstants {
             codeblock_count: records.len() as u32,
+            reconstruction_mode,
 
         };
         let dispatch_start = std::time::Instant::now();
@@ -734,6 +737,7 @@ pub fn run_tier1_cleanup_bench(
     records: &[crate::gpu::GpuTier1CodeblockRecord],
     compressed_words: &[u32],
     iterations: usize,
+    reconstruction_mode: u32,
 ) -> Result<Tier1CleanupBenchResult, VulkanError> {
     validate_tier1_cleanup_inputs(records, compressed_words)?;
     if iterations == 0 {
@@ -786,6 +790,7 @@ pub fn run_tier1_cleanup_bench(
 
         let push = Tier1CleanupSmokePushConstants {
             codeblock_count: records.len() as u32,
+            reconstruction_mode,
 
         };
         let descriptors = [
@@ -864,6 +869,7 @@ pub fn run_tier1_cleanup_pipeline_bench(
     compressed_words: &[u32],
     iterations: usize,
     pipeline_depth: usize,
+    reconstruction_mode: u32,
 ) -> Result<Tier1CleanupPipelineBenchResult, VulkanError> {
     validate_tier1_cleanup_inputs(records, compressed_words)?;
     if iterations == 0 {
@@ -967,6 +973,7 @@ pub fn run_tier1_cleanup_pipeline_bench(
 
         let push = Tier1CleanupSmokePushConstants {
             codeblock_count: records.len() as u32,
+            reconstruction_mode,
         };
         let push_bytes = bytes_of(&push);
         let groups = [tier1_cleanup_groups(records.len()), 1, 1];
@@ -1460,7 +1467,7 @@ pub fn run_tier1_cleanup_scatter_smoke(
 
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
-
+            reconstruction_mode: 0,
         };
         let cleanup_dispatch_start = std::time::Instant::now();
         cleanup_program.dispatch(
@@ -1643,7 +1650,7 @@ pub fn run_tier1_cleanup_scatter_bench(
 
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
-
+            reconstruction_mode: 0,
         };
         let scatter_push = Tier1ScatterSmokePushConstants {
             codeblock_count: scatter_records.len() as u32,
@@ -1797,7 +1804,7 @@ pub fn run_tier1_cleanup_scatter_idwt53_smoke(
 
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
-
+            reconstruction_mode: 0,
         };
         let cleanup_dispatch_start = std::time::Instant::now();
         cleanup_program.dispatch(
@@ -2002,7 +2009,7 @@ pub fn run_tier1_cleanup_scatter_rgb48_smoke(
 
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
-
+            reconstruction_mode: 0,
         };
         let cleanup_dispatch_start = std::time::Instant::now();
         cleanup_program.dispatch(
@@ -2588,7 +2595,7 @@ impl VulkanTier1Rgb48Pipeline {
 
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: codeblock_count as u32,
-
+            reconstruction_mode: 0,
         };
         let scatter_push = Tier1ScatterSmokePushConstants {
             codeblock_count: scatter_records.len() as u32,
@@ -2854,7 +2861,7 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
         )?;
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
-
+            reconstruction_mode: 0,
         };
         let scatter_push = Tier1ScatterSmokePushConstants {
             codeblock_count: scatter_records.len() as u32,

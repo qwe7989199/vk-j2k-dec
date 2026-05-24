@@ -145,7 +145,7 @@ pub fn tier1_gpu_plan(path: &str) -> ExitCode {
         }
         let shader_path = "target\\shaders\\tier1_plan_smoke.comp.spv";
         if std::path::Path::new(shader_path).exists() {
-            let records = plan.codeblock_records();
+            let records = plan.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
             let compressed_words = plan.compressed_u32_words();
             let smoke = match vk_j2k_dec::vulkan::run_tier1_plan_smoke(
                 shader_path,
@@ -222,6 +222,7 @@ pub fn tier1_gpu_plan(path: &str) -> ExitCode {
                         cleanup_shader_path,
                         &records,
                         &compressed_words,
+                        gpu_reconstruction_mode(cod.transform),
                     ) {
                         Ok(smoke) => smoke,
                         Err(err) => {
@@ -725,6 +726,7 @@ fn build_batched_tier1_cleanup_inputs(
     expected_output: &[u32],
     expected_coefficients: &[i32],
     batch_frames: usize,
+    reconstruction_mode: u32,
 ) -> Result<BatchedTier1CleanupInputs, String> {
     if batch_frames == 0 {
         return Err("batch frames must be at least 1".to_string());
@@ -734,7 +736,7 @@ fn build_batched_tier1_cleanup_inputs(
     let frame_coefficient_count = u32::try_from(plan.output_coefficients)
         .map_err(|_| "coefficient count exceeds u32".to_string())?;
     let frame_pass_count = plan.total_passes;
-    let base_records = plan.codeblock_records();
+    let base_records = plan.codeblock_records_with_reconstruction(reconstruction_mode);
 
     let mut compressed_bytes =
         Vec::with_capacity(plan.compressed_bytes.len().saturating_mul(batch_frames));
@@ -895,7 +897,7 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
         );
         print_codeblock_parallelism_stats(&plan, "    ");
 
-        let original_records = plan.codeblock_records();
+        let original_records = plan.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
         let mut records = original_records.clone();
         sort_codeblock_records_by_descending_work(&mut records);
         let compressed_words = plan.compressed_u32_words();
@@ -904,6 +906,7 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
             &records,
             &compressed_words,
             iterations,
+            gpu_reconstruction_mode(cod.transform),
         ) {
             Ok(bench) => bench,
             Err(err) => {
@@ -1296,6 +1299,7 @@ pub fn tier1_gpu_batch_bench(path: &str, iterations: usize, batch_frames: usize)
             &expected_output,
             &expected_coefficients,
             batch_frames,
+            gpu_reconstruction_mode(cod.transform),
         ) {
             Ok(batched) => batched,
             Err(err) => {
@@ -1315,6 +1319,7 @@ pub fn tier1_gpu_batch_bench(path: &str, iterations: usize, batch_frames: usize)
             &batched.records,
             &batched.compressed_words,
             iterations,
+            gpu_reconstruction_mode(cod.transform),
         ) {
             Ok(bench) => bench,
             Err(err) => {
@@ -1490,7 +1495,7 @@ pub fn tier1_gpu_pipeline_bench(path: &str, iterations: usize, pipeline_depth: u
         );
         print_codeblock_parallelism_stats(&plan, "    ");
 
-        let original_records = plan.codeblock_records();
+        let original_records = plan.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
         let mut records = original_records.clone();
         sort_codeblock_records_by_descending_work(&mut records);
         let compressed_words = plan.compressed_u32_words();
@@ -1525,6 +1530,7 @@ pub fn tier1_gpu_pipeline_bench(path: &str, iterations: usize, pipeline_depth: u
             &compressed_words,
             iterations,
             pipeline_depth,
+            gpu_reconstruction_mode(cod.transform),
         ) {
             Ok(bench) => bench,
             Err(err) => {
@@ -1795,5 +1801,12 @@ fn expand_rgb48_samples_to_16bit(samples: &mut [u16], precision: u8) {
     let shift = u32::from(16 - precision);
     for sample in samples {
         *sample = sample.wrapping_shl(shift);
+    }
+}
+
+fn gpu_reconstruction_mode(transform: WaveletTransform) -> u32 {
+    match transform {
+        WaveletTransform::Reversible53 => 0,
+        _ => 1,
     }
 }
