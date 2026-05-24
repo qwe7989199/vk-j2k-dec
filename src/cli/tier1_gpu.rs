@@ -1210,15 +1210,16 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
         );
     }
 
-    // Bench with fast shader (no counters) if available
+    // Bench with thread-per-codeblock shader if available
     let fast_shader = "target\\shaders\\tier1_cleanup_smoke_16.comp.spv";
     if std::path::Path::new(fast_shader).exists() {
+        // Thread-per-codeblock: dispatch ceil(codeblocks/128) workgroups of 128 threads
         if let Ok(bench) = vk_j2k_dec::vulkan::run_tier1_cleanup_bench(
             fast_shader, &records, &compressed_words, iterations,
             gpu_reconstruction_mode(cod.transform),
         ) {
             println!(
-                "    fast shader Tier-1: {:.3} ms avg ({:.1} fps)",
+                "    thread-per-cblk Tier-1: {:.3} ms avg ({:.1} fps)",
                 bench.dispatch_average_ms, 1000.0 / bench.dispatch_average_ms
             );
         }
