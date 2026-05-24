@@ -1163,6 +1163,81 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
             cpu_total_ms, cpu_average_ms, hot_speedup, bench.output[0], bench.output[1]
         );
     }
+
+    // Merged all-tiles single-dispatch benchmark
+    let mut all_plans = Vec::new();
+    let mut all_plans_discard1 = Vec::new();
+    for tile_part in &codestream.tile_parts {
+        let layout = layouts.iter().find(|l| l.tile_index == tile_part.tile_index).unwrap();
+        let tile_data = &data[tile_part.data_start..tile_part.data_end];
+        let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers).unwrap();
+        let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
+            &packet_summary, codestream.qcd.as_ref(), &codestream.qccs,
+        ).unwrap();
+        let bound = work_plan.bind_segment_data(tile_data).unwrap();
+        let plan = GpuTier1Plan::from_bound_work_plan(&bound, cod.codeblock_style_flags()).unwrap();
+        all_plans.push(plan);
+
+        // Also build discard-1 plan
+        let mut work_plan_d1 = Tier1WorkPlan::from_packet_summary_with_quantization(
+            &packet_summary, codestream.qcd.as_ref(), &codestream.qccs,
+        ).unwrap();
+        work_plan_d1.retain_max_resolution(cod.decomposition_levels.saturating_sub(1));
+        let bound_d1 = work_plan_d1.bind_segment_data(tile_data).unwrap();
+        if let Ok(plan_d1) = GpuTier1Plan::from_bound_work_plan(&bound_d1, cod.codeblock_style_flags()) {
+            all_plans_discard1.push(plan_d1);
+        }
+    }
+    let merged = GpuTier1Plan::merge(&all_plans);
+    let merged_d1 = GpuTier1Plan::merge(&all_plans_discard1);
+    println!(
+        "  merged full-res: {} cblk, {} bytes | discard-1: {} cblk, {} bytes",
+        merged.codeblocks.len(), merged.compressed_bytes.len(),
+        merged_d1.codeblocks.len(), merged_d1.compressed_bytes.len(),
+    );
+
+    // Bench full resolution
+    let mut records = merged.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
+    sort_codeblock_records_by_descending_work(&mut records);
+    let compressed_words = merged.compressed_u32_words();
+    if let Ok(bench) = vk_j2k_dec::vulkan::run_tier1_cleanup_bench(
+        cleanup_shader_path, &records, &compressed_words, iterations,
+        gpu_reconstruction_mode(cod.transform),
+    ) {
+        println!(
+            "    full-res Tier-1: {:.3} ms avg ({:.1} fps)",
+            bench.dispatch_average_ms, 1000.0 / bench.dispatch_average_ms
+        );
+    }
+
+    // Bench with fast shader (no counters) if available
+    let fast_shader = "target\\shaders\\tier1_cleanup_smoke_16.comp.spv";
+    if std::path::Path::new(fast_shader).exists() {
+        if let Ok(bench) = vk_j2k_dec::vulkan::run_tier1_cleanup_bench(
+            fast_shader, &records, &compressed_words, iterations,
+            gpu_reconstruction_mode(cod.transform),
+        ) {
+            println!(
+                "    fast shader Tier-1: {:.3} ms avg ({:.1} fps)",
+                bench.dispatch_average_ms, 1000.0 / bench.dispatch_average_ms
+            );
+        }
+    }
+
+    // Bench discard-1
+    let mut records_d1 = merged_d1.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
+    sort_codeblock_records_by_descending_work(&mut records_d1);
+    let compressed_words_d1 = merged_d1.compressed_u32_words();
+    if let Ok(bench) = vk_j2k_dec::vulkan::run_tier1_cleanup_bench(
+        cleanup_shader_path, &records_d1, &compressed_words_d1, iterations,
+        gpu_reconstruction_mode(cod.transform),
+    ) {
+        println!(
+            "    discard-1 Tier-1: {:.3} ms avg ({:.1} fps)",
+            bench.dispatch_average_ms, 1000.0 / bench.dispatch_average_ms
+        );
+    }
+
     ExitCode::SUCCESS
 }
 

@@ -167,6 +167,44 @@ impl GpuTier1Plan {
         })
     }
 
+    pub fn merge(plans: &[Self]) -> Self {
+        let total_codeblocks: usize = plans.iter().map(|p| p.codeblocks.len()).sum();
+        let total_bytes: usize = plans.iter().map(|p| p.compressed_bytes.len()).sum();
+        let mut codeblocks = Vec::with_capacity(total_codeblocks);
+        let mut compressed_bytes = Vec::with_capacity(total_bytes);
+        let mut total_passes = 0u32;
+        let mut arithmetic_passes = 0u32;
+        let mut raw_bypass_passes = 0u32;
+        let mut output_coefficients = 0usize;
+
+        for plan in plans {
+            let byte_offset_base = compressed_bytes.len() as u32;
+            let coeff_offset_base = output_coefficients as u32;
+            for cb in &plan.codeblocks {
+                codeblocks.push(GpuTier1Codeblock {
+                    byte_offset: cb.byte_offset + byte_offset_base,
+                    coefficient_offset: cb.coefficient_offset + coeff_offset_base,
+                    pass_offset: cb.pass_offset + total_passes,
+                    ..*cb
+                });
+            }
+            compressed_bytes.extend_from_slice(&plan.compressed_bytes);
+            total_passes += plan.total_passes;
+            arithmetic_passes += plan.arithmetic_passes;
+            raw_bypass_passes += plan.raw_bypass_passes;
+            output_coefficients += plan.output_coefficients;
+        }
+
+        Self {
+            codeblocks,
+            compressed_bytes,
+            total_passes,
+            arithmetic_passes,
+            raw_bypass_passes,
+            output_coefficients,
+        }
+    }
+
     pub fn codeblock_records(&self) -> Vec<GpuTier1CodeblockRecord> {
         self.codeblocks
             .iter()

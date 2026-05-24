@@ -411,9 +411,11 @@ fn decode_rgb48_with_backends_profiled(
             cod.decomposition_levels
         )));
     }
-    if codestream.tile_parts.len() != 1 {
+    if codestream.tile_parts.len() == 1 {
+        // Fast path: single tile (no stitching needed)
+    } else if !matches!(dwt_backend, DwtBackend::Cpu) {
         return Err(DecodeError::new(format!(
-            "rgb48 output only supports a single tile-part for now, found {}",
+            "multi-tile GPU decode is not supported yet ({} tile-parts), use CPU backend",
             codestream.tile_parts.len()
         )));
     }
@@ -423,67 +425,196 @@ fn decode_rgb48_with_backends_profiled(
         .tile_layouts()
         .map_err(|err| DecodeError::new(err.to_string()))?;
     profile.timings.layout_ms = elapsed_ms(stage_start);
-    let tile_part = &codestream.tile_parts[0];
-    let layout = layouts
-        .iter()
-        .find(|layout| layout.tile_index == tile_part.tile_index)
-        .ok_or_else(|| {
-            DecodeError::new(format!("missing layout for tile {}", tile_part.tile_index))
-        })?;
-    let tile_data = data
-        .get(tile_part.data_start..tile_part.data_end)
-        .ok_or_else(|| DecodeError::new("tile payload is outside codestream data"))?;
-    profile.tile_bytes = tile_data.len();
     let target_resolution = cod.decomposition_levels - discard_levels;
     let expected_width = discard_extent(siz.width, discard_levels);
     let expected_height = discard_extent(siz.height, discard_levels);
 
     let stage_start = Instant::now();
-    let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers)
+    let coefficient_planes_storage;
+    let component_planes_storage: Vec<PlaneI32>;
+
+    if codestream.tile_parts.len() == 1 {
+        // Single-tile fast path (supports all backends)
+        let tile_part = &codestream.tile_parts[0];
+        let layout = layouts
+            .iter()
+            .find(|l| l.tile_index == tile_part.tile_index)
+            .ok_or_else(|| {
+                DecodeError::new(format!("missing layout for tile {}", tile_part.tile_index))
+            })?;
+        let tile_data = data
+            .get(tile_part.data_start..tile_part.data_end)
+            .ok_or_else(|| DecodeError::new("tile payload is outside codestream data"))?;
+        profile.tile_bytes = tile_data.len();
+
+        let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers)
+            .map_err(|err| DecodeError::new(err.to_string()))?;
+        let mut work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
+            &packet_summary,
+            codestream.qcd.as_ref(),
+            &codestream.qccs,
+        )
         .map_err(|err| DecodeError::new(err.to_string()))?;
-    profile.timings.packet_ms = elapsed_ms(stage_start);
+        profile.total_codeblocks = work_plan.codeblock_count();
+        work_plan.retain_max_resolution(target_resolution);
+        profile.decoded_codeblocks = work_plan.codeblock_count();
+        let bound = work_plan
+            .bind_segment_data(tile_data)
+            .map_err(|err| DecodeError::new(err.to_string()))?;
+        coefficient_planes_storage =
+            TileCoefficientPlanes::decode_arithmetic_with_reconstruction(
+                &layout.components,
+                &bound,
+                cod.codeblock_style_flags(),
+                coefficient_reconstruction_for_transform(cod.transform),
+            )
+            .map_err(|err| DecodeError::new(err.to_string()))?;
+        profile.decoded_passes = coefficient_planes_storage.decoded_passes;
+        profile.nonzero_coefficients = coefficient_planes_storage.nonzero_coefficients;
+        component_planes_storage = Vec::new();
+    } else {
+        // Multi-tile path (CPU only): decode each tile, reconstruct, stitch
+        let mut full_planes: Vec<Vec<i32>> = (0..3)
+            .map(|_| vec![0i32; (expected_width as usize) * (expected_height as usize)])
+            .collect();
+        let mut full_float_planes: Vec<Vec<f32>> = if matches!(cod.transform, WaveletTransform::Irreversible97) {
+            (0..3).map(|_| vec![0f32; (expected_width as usize) * (expected_height as usize)]).collect()
+        } else {
+            Vec::new()
+        };
 
-    let stage_start = Instant::now();
-    let mut work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
-        &packet_summary,
-        codestream.qcd.as_ref(),
-        &codestream.qccs,
-    )
-    .map_err(|err| DecodeError::new(err.to_string()))?;
-    profile.total_codeblocks = work_plan.codeblock_count();
-    work_plan.retain_max_resolution(target_resolution);
-    profile.decoded_codeblocks = work_plan.codeblock_count();
-    profile.skipped_codeblocks = profile
-        .total_codeblocks
-        .saturating_sub(profile.decoded_codeblocks);
-    profile.timings.work_plan_ms = elapsed_ms(stage_start);
+        for tile_part in &codestream.tile_parts {
+            let layout = layouts
+                .iter()
+                .find(|l| l.tile_index == tile_part.tile_index)
+                .ok_or_else(|| {
+                    DecodeError::new(format!("missing layout for tile {}", tile_part.tile_index))
+                })?;
+            let tile_data = data
+                .get(tile_part.data_start..tile_part.data_end)
+                .ok_or_else(|| DecodeError::new("tile payload is outside codestream data"))?;
+            profile.tile_bytes += tile_data.len();
 
-    let stage_start = Instant::now();
-    let bound = work_plan
-        .bind_segment_data(tile_data)
-        .map_err(|err| DecodeError::new(err.to_string()))?;
-    profile.timings.bind_ms = elapsed_ms(stage_start);
+            let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers)
+                .map_err(|err| DecodeError::new(err.to_string()))?;
+            let mut work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
+                &packet_summary,
+                codestream.qcd.as_ref(),
+                &codestream.qccs,
+            )
+            .map_err(|err| DecodeError::new(err.to_string()))?;
+            profile.total_codeblocks += work_plan.codeblock_count();
+            work_plan.retain_max_resolution(target_resolution);
+            profile.decoded_codeblocks += work_plan.codeblock_count();
+            let bound = work_plan
+                .bind_segment_data(tile_data)
+                .map_err(|err| DecodeError::new(err.to_string()))?;
+            let tile_coefficients =
+                TileCoefficientPlanes::decode_arithmetic_with_reconstruction(
+                    &layout.components,
+                    &bound,
+                    cod.codeblock_style_flags(),
+                    coefficient_reconstruction_for_transform(cod.transform),
+                )
+                .map_err(|err| DecodeError::new(err.to_string()))?;
+            profile.decoded_passes += tile_coefficients.decoded_passes;
+            profile.nonzero_coefficients += tile_coefficients.nonzero_coefficients;
 
-    let stage_start = Instant::now();
-    let coefficient_planes = TileCoefficientPlanes::decode_arithmetic_with_reconstruction(
-        &layout.components,
-        &bound,
-        cod.codeblock_style_flags(),
-        coefficient_reconstruction_for_transform(cod.transform),
-    )
-    .map_err(|err| DecodeError::new(err.to_string()))?;
+            let tile_x0 = discard_extent(layout.x0, discard_levels);
+            let tile_y0 = discard_extent(layout.y0, discard_levels);
+            if tile_part.tile_index < 3 {
+                eprintln!("  tile {}: layout ({},{})..({},{}) -> pixel ({},{})",
+                    tile_part.tile_index, layout.x0, layout.y0, layout.x1, layout.y1, tile_x0, tile_y0);
+            }
+
+            for comp_idx in 0..3u16 {
+                let comp = tile_coefficients
+                    .component(comp_idx)
+                    .ok_or_else(|| DecodeError::new(format!("missing component {comp_idx}")))?;
+
+                match cod.transform {
+                    WaveletTransform::Reversible53 => {
+                        let tile_plane = comp
+                            .inverse_5_3_until(target_resolution)
+                            .map_err(|err| DecodeError::new(err.to_string()))?;
+                        let dst = &mut full_planes[comp_idx as usize];
+                        for y in 0..tile_plane.height {
+                            let dst_y = tile_y0 + y;
+                            if dst_y >= expected_height { break; }
+                            let src_start = (y * tile_plane.width) as usize;
+                            let dst_start = (dst_y * expected_width + tile_x0) as usize;
+                            let w = tile_plane.width.min(expected_width - tile_x0) as usize;
+                            dst[dst_start..dst_start + w]
+                                .copy_from_slice(&tile_plane.samples[src_start..src_start + w]);
+                        }
+                    }
+                    WaveletTransform::Irreversible97 => {
+                        let qcd = codestream
+                            .quantization_for_component(comp_idx)
+                            .ok_or_else(|| DecodeError::new(format!(
+                                "missing QCD/QCC for component {comp_idx}"
+                            )))?;
+                        let float_comp = ComponentFloatSubbandPlanes::from_component_with_qcd(
+                            comp, qcd, siz.components[0].precision, cod.decomposition_levels,
+                        ).map_err(|err| DecodeError::new(err.to_string()))?;
+                        let tile_plane = float_comp
+                            .inverse_9_7_until(target_resolution)
+                            .map_err(|err| DecodeError::new(err.to_string()))?;
+                        if tile_part.tile_index == 0 && comp_idx == 0 {
+                            let min = tile_plane.samples.iter().cloned().fold(f32::INFINITY, f32::min);
+                            let max = tile_plane.samples.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            eprintln!("  tile 0 comp 0 float range: [{min}, {max}], size {}x{}", tile_plane.width, tile_plane.height);
+                        }
+                        let dst = &mut full_float_planes[comp_idx as usize];
+                        for y in 0..tile_plane.height {
+                            let dst_y = tile_y0 + y;
+                            if dst_y >= expected_height { break; }
+                            let src_start = (y * tile_plane.width) as usize;
+                            let dst_start = (dst_y * expected_width + tile_x0) as usize;
+                            let w = tile_plane.width.min(expected_width - tile_x0) as usize;
+                            dst[dst_start..dst_start + w]
+                                .copy_from_slice(&tile_plane.samples[src_start..src_start + w]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if matches!(cod.transform, WaveletTransform::Irreversible97) {
+            component_planes_storage = Vec::new();
+            // Use float planes path
+            let float_planes: Vec<PlaneF32> = full_float_planes
+                .into_iter()
+                .map(|samples| PlaneF32 { width: expected_width, height: expected_height, samples })
+                .collect();
+            profile.timings.tier1_decode_ms = elapsed_ms(stage_start);
+            let precision = siz.components[0].precision;
+            let stage_start = Instant::now();
+            let samples = pack_rgb48_float_samples(
+                &float_planes, precision, cod.multiple_component_transform, cod.transform, color_backend,
+            )?;
+            profile.timings.pack_ms = elapsed_ms(stage_start);
+            return finish_profiled_rgb48(expected_width, expected_height, precision, samples, profile, total_start);
+        }
+
+        component_planes_storage = full_planes
+            .into_iter()
+            .map(|samples| PlaneI32 {
+                width: expected_width,
+                height: expected_height,
+                samples,
+            })
+            .collect();
+        coefficient_planes_storage = TileCoefficientPlanes {
+            components: Vec::new(),
+            decoded_codeblocks: 0,
+            decoded_passes: 0,
+            nonzero_coefficients: 0,
+        };
+    }
     profile.timings.tier1_decode_ms = elapsed_ms(stage_start);
-    profile.decoded_codeblocks = coefficient_planes.decoded_codeblocks;
-    profile.decoded_passes = coefficient_planes.decoded_passes;
-    profile.nonzero_coefficients = coefficient_planes.nonzero_coefficients;
 
-    let components = (0..3)
-        .map(|component| {
-            coefficient_planes
-                .component(component)
-                .ok_or_else(|| DecodeError::new(format!("missing component {component}")))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let precision = siz.components[0].precision;
     if siz
         .components
@@ -494,6 +625,36 @@ fn decode_rgb48_with_backends_profiled(
             "rgb48 output does not support mixed component precision yet",
         ));
     }
+
+    // For multi-tile, we already have reconstructed planes; skip DWT and go straight to packing
+    if !component_planes_storage.is_empty() {
+        let stage_start = Instant::now();
+        let samples = pack_rgb48_samples(
+            &component_planes_storage,
+            precision,
+            cod.multiple_component_transform,
+            cod.transform,
+            color_backend,
+        )?;
+        profile.timings.pack_ms = elapsed_ms(stage_start);
+        return finish_profiled_rgb48(
+            expected_width,
+            expected_height,
+            precision,
+            samples,
+            profile,
+            total_start,
+        );
+    }
+
+    // Single-tile path continues: extract component references for DWT
+    let components = (0..3)
+        .map(|c| {
+            coefficient_planes_storage
+                .component(c)
+                .ok_or_else(|| DecodeError::new(format!("missing component {c}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let (width, height, samples) = match cod.transform {
         WaveletTransform::Reversible53 => {
