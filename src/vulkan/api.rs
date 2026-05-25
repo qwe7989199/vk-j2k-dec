@@ -480,6 +480,7 @@ struct Tier1MqSmokePushConstants {
 struct Tier1CleanupSmokePushConstants {
     codeblock_count: u32,
     reconstruction_mode: u32,
+    codeblock_offset: u32,
 }
 
 #[repr(C)]
@@ -677,7 +678,7 @@ pub fn run_tier1_cleanup_smoke(
         let push = Tier1CleanupSmokePushConstants {
             codeblock_count: records.len() as u32,
             reconstruction_mode,
-
+            codeblock_offset: 0,
         };
         let dispatch_start = std::time::Instant::now();
         program.dispatch(
@@ -791,7 +792,7 @@ pub fn run_tier1_cleanup_bench(
         let push = Tier1CleanupSmokePushConstants {
             codeblock_count: records.len() as u32,
             reconstruction_mode,
-
+            codeblock_offset: 0,
         };
         let descriptors = [
             records_buffer.descriptor_info(),
@@ -810,6 +811,180 @@ pub fn run_tier1_cleanup_bench(
             1,
             iterations,
         )?;
+        let dispatch_total_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
+
+        let readback_start = std::time::Instant::now();
+        let output_staging =
+            device.create_host_cached_buffer(output_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+        let coefficient_staging = device
+            .create_host_cached_buffer(coefficient_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+        device.copy_buffers(
+            queue_family_index,
+            &[
+                BufferCopy {
+                    source: &output_buffer,
+                    destination: &output_staging,
+                    byte_len: output_byte_len,
+                },
+                BufferCopy {
+                    source: &coefficient_buffer,
+                    destination: &coefficient_staging,
+                    byte_len: coefficient_byte_len,
+                },
+            ],
+        )?;
+        let output = output_staging.read_vec::<u32>(output_len)?;
+        let coefficients = coefficient_staging.read_vec::<i32>(coefficient_count)?;
+        let readback_ms = readback_start.elapsed().as_secs_f64() * 1000.0;
+        device.wait_idle()?;
+        Ok(Tier1CleanupBenchResult {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            iterations,
+            output,
+            coefficients,
+            setup_ms,
+            dispatch_total_ms,
+            dispatch_average_ms: dispatch_total_ms / iterations as f64,
+            readback_ms,
+        })
+    })
+}
+
+pub fn run_tier1_adaptive_bench(
+    warp_shader_path: &str,
+    thread_shader_path: &str,
+    records: &[crate::gpu::GpuTier1CodeblockRecord],
+    compressed_words: &[u32],
+    thread_per_cblk_count: usize,
+    iterations: usize,
+    reconstruction_mode: u32,
+) -> Result<Tier1CleanupBenchResult, VulkanError> {
+    if thread_per_cblk_count == records.len() {
+        return run_tier1_cleanup_bench(
+            thread_shader_path, records, compressed_words, iterations, reconstruction_mode,
+        );
+    }
+    if thread_per_cblk_count == 0 {
+        return run_tier1_cleanup_bench(
+            warp_shader_path, records, compressed_words, iterations, reconstruction_mode,
+        );
+    }
+    validate_tier1_cleanup_inputs(records, compressed_words)?;
+    if iterations == 0 {
+        return Err(VulkanError::new(
+            "Tier-1 adaptive bench requires at least one iteration",
+        ));
+    }
+    let warp_count = records.len() - thread_per_cblk_count;
+    let thread_spirv = read_spirv(thread_shader_path)?;
+    let warp_spirv = read_spirv(warp_shader_path)?;
+    with_compute_device(|device, summary, queue_family_index| {
+        let thread_program = StorageComputeProgram::new(
+            device,
+            &thread_spirv,
+            5,
+            std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
+        )?;
+        let warp_program = StorageComputeProgram::new(
+            device,
+            &warp_spirv,
+            5,
+            std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
+        )?;
+        let setup_start = std::time::Instant::now();
+        let records_buffer = create_device_buffer_from_slice(
+            device,
+            queue_family_index,
+            records,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let compressed_buffer = create_device_buffer_from_slice(
+            device,
+            queue_family_index,
+            compressed_words,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let output_len = records.len() * 9;
+        let output_byte_len = bytes_len::<u32>(output_len)?;
+        let output_buffer = device.create_device_local_buffer(
+            output_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        )?;
+        let coefficient_count = records
+            .iter()
+            .map(|record| record.coefficient_offset + record.coefficient_count)
+            .max()
+            .unwrap_or(0) as usize;
+        let coefficient_byte_len = bytes_len::<i32>(coefficient_count)?;
+        let coefficient_buffer = device.create_device_local_buffer(
+            coefficient_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        )?;
+        let state_buffer = device.create_device_local_buffer(
+            coefficient_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let descriptors = [
+            records_buffer.descriptor_info(),
+            compressed_buffer.descriptor_info(),
+            output_buffer.descriptor_info(),
+            coefficient_buffer.descriptor_info(),
+            state_buffer.descriptor_info(),
+        ];
+        let thread_descriptor_pool = device.create_descriptor_pool(5, 1)?;
+        let thread_descriptor_set = device.allocate_descriptor_set(
+            thread_descriptor_pool.handle,
+            thread_program.descriptor_set_layout.handle,
+        )?;
+        device.update_storage_descriptor_set(thread_descriptor_set, &descriptors);
+        let warp_descriptor_pool = device.create_descriptor_pool(5, 1)?;
+        let warp_descriptor_set = device.allocate_descriptor_set(
+            warp_descriptor_pool.handle,
+            warp_program.descriptor_set_layout.handle,
+        )?;
+        device.update_storage_descriptor_set(warp_descriptor_set, &descriptors);
+        let command_pool = device.create_command_pool(queue_family_index)?;
+        let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
+        let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
+
+        let thread_push = Tier1CleanupSmokePushConstants {
+            codeblock_count: thread_per_cblk_count as u32,
+            reconstruction_mode,
+            codeblock_offset: 0,
+        };
+        let warp_push = Tier1CleanupSmokePushConstants {
+            codeblock_count: warp_count as u32,
+            reconstruction_mode,
+            codeblock_offset: thread_per_cblk_count as u32,
+        };
+        let mut dispatches = Vec::with_capacity(iterations * 2);
+        for _ in 0..iterations {
+            if thread_per_cblk_count > 0 {
+                dispatches.push(StorageDispatch {
+                    pipeline: thread_program.pipeline.handle,
+                    pipeline_layout: thread_program.pipeline_layout.handle,
+                    descriptor_set: thread_descriptor_set,
+                    push_constants: bytes_of(&thread_push),
+                    groups: [tier1_cleanup_groups(thread_per_cblk_count), 1, 1],
+                    no_barrier_before: false,
+                });
+            }
+            if warp_count > 0 {
+                dispatches.push(StorageDispatch {
+                    pipeline: warp_program.pipeline.handle,
+                    pipeline_layout: warp_program.pipeline_layout.handle,
+                    descriptor_set: warp_descriptor_set,
+                    push_constants: bytes_of(&warp_push),
+                    groups: [tier1_cleanup_groups(warp_count), 1, 1],
+                    no_barrier_before: thread_per_cblk_count == 0,
+                });
+            }
+        }
+
+        let dispatch_start = std::time::Instant::now();
+        device.record_storage_dispatches(command_buffer, &dispatches)?;
+        device.submit_and_wait(command_buffer)?;
         let dispatch_total_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
 
         let readback_start = std::time::Instant::now();
@@ -974,6 +1149,7 @@ pub fn run_tier1_cleanup_pipeline_bench(
         let push = Tier1CleanupSmokePushConstants {
             codeblock_count: records.len() as u32,
             reconstruction_mode,
+            codeblock_offset: 0,
         };
         let push_bytes = bytes_of(&push);
         let groups = [tier1_cleanup_groups(records.len()), 1, 1];
@@ -1468,6 +1644,7 @@ pub fn run_tier1_cleanup_scatter_smoke(
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
             reconstruction_mode: 0,
+            codeblock_offset: 0,
         };
         let cleanup_dispatch_start = std::time::Instant::now();
         cleanup_program.dispatch(
@@ -1651,6 +1828,7 @@ pub fn run_tier1_cleanup_scatter_bench(
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
             reconstruction_mode: 0,
+            codeblock_offset: 0,
         };
         let scatter_push = Tier1ScatterSmokePushConstants {
             codeblock_count: scatter_records.len() as u32,
@@ -1805,6 +1983,7 @@ pub fn run_tier1_cleanup_scatter_idwt53_smoke(
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
             reconstruction_mode: 0,
+            codeblock_offset: 0,
         };
         let cleanup_dispatch_start = std::time::Instant::now();
         cleanup_program.dispatch(
@@ -2010,6 +2189,7 @@ pub fn run_tier1_cleanup_scatter_rgb48_smoke(
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
             reconstruction_mode: 0,
+            codeblock_offset: 0,
         };
         let cleanup_dispatch_start = std::time::Instant::now();
         cleanup_program.dispatch(
@@ -2451,9 +2631,18 @@ pub struct VulkanTier1Rgb48Pipeline {
     codeblock_count: usize,
     compressed_word_capacity: usize,
     setup_ms: f64,
+    slots: [PipelineSlot; 2],
+    _scatter_records_buffer: HostBuffer,
+    _cleanup_program: StorageComputeProgram,
+    _scatter_program: StorageComputeProgram,
+    _idwt53_program: StorageComputeProgram,
+    _color_program: StorageComputeProgram,
+    _context: VulkanComputeContext,
+}
+
+struct PipelineSlot {
     cleanup_records_buffer: HostBuffer,
     compressed_buffer: HostBuffer,
-    _scatter_records_buffer: HostBuffer,
     _output_buffer: HostBuffer,
     _flat_coefficient_buffer: HostBuffer,
     _state_buffer: HostBuffer,
@@ -2462,13 +2651,9 @@ pub struct VulkanTier1Rgb48Pipeline {
     _scatter_descriptor_pool: DescriptorPoolHandle,
     _fused_command_pool: CommandPoolHandle,
     fused_command_buffer: VkCommandBuffer,
+    fence: FenceHandle,
     rgb48_packer: ReusableRgb48Packer,
     _idwt_components: Vec<ReusableScatteredIdwt53Component>,
-    _cleanup_program: StorageComputeProgram,
-    _scatter_program: StorageComputeProgram,
-    _idwt53_program: StorageComputeProgram,
-    _color_program: StorageComputeProgram,
-    _context: VulkanComputeContext,
 }
 
 impl VulkanTier1Rgb48Pipeline {
@@ -2533,153 +2718,146 @@ impl VulkanTier1Rgb48Pipeline {
 
         let records_byte_len = bytes_len::<crate::gpu::GpuTier1CodeblockRecord>(codeblock_count)?;
         let compressed_byte_len = bytes_len::<u32>(compressed_word_capacity)?;
-        let cleanup_records_buffer = device.create_host_cached_buffer(
-            records_byte_len,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        )?;
-        let compressed_buffer = device.create_host_cached_buffer(
-            compressed_byte_len,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        )?;
         let scatter_records_buffer = create_device_buffer_from_slice(
-            device,
-            queue_family_index,
-            scatter_records,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            device, queue_family_index, scatter_records, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         )?;
         let output_len = codeblock_count * 9;
-        let output_buffer = device.create_device_local_buffer(
-            bytes_len::<u32>(output_len)?,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        )?;
         let flat_coefficient_byte_len = bytes_len::<i32>(flat_coefficient_count)?;
-        let flat_coefficient_buffer = device.create_device_local_buffer(
-            flat_coefficient_byte_len,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        )?;
-        let state_buffer = device.create_device_local_buffer(
-            flat_coefficient_byte_len,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        )?;
-        let plane_buffer = device.create_device_local_buffer(
-            bytes_len::<i32>(output_coefficients)?,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        )?;
-
-        let mut component_ids = scatter_planes
-            .iter()
-            .map(|plane| plane.component)
-            .collect::<Vec<_>>();
-        component_ids.sort_unstable();
-        component_ids.dedup();
-        let idwt_components = component_ids
-            .iter()
-            .map(|component| {
-                ReusableScatteredIdwt53Component::new(
-                    device,
-                    &idwt53_program,
-                    &plane_buffer,
-                    scatter_planes,
-                    *component,
-                    target_resolution,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let rgb48_packer = ReusableRgb48Packer::new(
-            device,
-            &color_program,
-            &idwt_components,
-            color_transform,
-            precision,
-        )?;
+        let plane_byte_len = bytes_len::<i32>(output_coefficients)?;
 
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: codeblock_count as u32,
             reconstruction_mode: 0,
+            codeblock_offset: 0,
         };
         let scatter_push = Tier1ScatterSmokePushConstants {
             codeblock_count: scatter_records.len() as u32,
         };
-        let cleanup_descriptors = [
-            cleanup_records_buffer.descriptor_info(),
-            compressed_buffer.descriptor_info(),
-            output_buffer.descriptor_info(),
-            flat_coefficient_buffer.descriptor_info(),
-            state_buffer.descriptor_info(),
-        ];
-        let cleanup_descriptor_pool = device.create_descriptor_pool(5, 1)?;
-        let cleanup_descriptor_set = device.allocate_descriptor_set(
-            cleanup_descriptor_pool.handle,
-            cleanup_program.descriptor_set_layout.handle,
-        )?;
-        device.update_storage_descriptor_set(cleanup_descriptor_set, &cleanup_descriptors);
-        let scatter_descriptors = [
-            scatter_records_buffer.descriptor_info(),
-            flat_coefficient_buffer.descriptor_info(),
-            plane_buffer.descriptor_info(),
-        ];
-        let scatter_descriptor_pool = device.create_descriptor_pool(3, 1)?;
-        let scatter_descriptor_set = device.allocate_descriptor_set(
-            scatter_descriptor_pool.handle,
-            scatter_program.descriptor_set_layout.handle,
-        )?;
-        device.update_storage_descriptor_set(scatter_descriptor_set, &scatter_descriptors);
 
-        let fused_command_pool = device.create_command_pool(queue_family_index)?;
-        let fused_command_buffer = device.allocate_command_buffer(fused_command_pool.handle)?;
-        let mut fused_dispatches = Vec::new();
-        fused_dispatches.push(StorageDispatch {
-            pipeline: cleanup_program.pipeline.handle,
-            pipeline_layout: cleanup_program.pipeline_layout.handle,
-            descriptor_set: cleanup_descriptor_set,
-            push_constants: bytes_of(&cleanup_push),
-            groups: [tier1_cleanup_groups(codeblock_count), 1, 1],
+        let mut slots_vec = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let cleanup_records_buffer = device.create_host_cached_buffer(
+                records_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            )?;
+            let compressed_buffer = device.create_host_cached_buffer(
+                compressed_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            )?;
+            let output_buffer = device.create_device_local_buffer(
+                bytes_len::<u32>(output_len)?,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            )?;
+            let flat_coefficient_buffer = device.create_device_local_buffer(
+                flat_coefficient_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            )?;
+            let state_buffer = device.create_device_local_buffer(
+                flat_coefficient_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            )?;
+            let plane_buffer = device.create_device_local_buffer(
+                plane_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            )?;
+
+            let mut component_ids = scatter_planes.iter().map(|p| p.component).collect::<Vec<_>>();
+            component_ids.sort_unstable();
+            component_ids.dedup();
+            let idwt_components = component_ids
+                .iter()
+                .map(|component| {
+                    ReusableScatteredIdwt53Component::new(
+                        device, &idwt53_program, &plane_buffer,
+                        scatter_planes, *component, target_resolution,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let rgb48_packer = ReusableRgb48Packer::new(
+                device, &color_program, &idwt_components, color_transform, precision,
+            )?;
+
+            let cleanup_descriptors = [
+                cleanup_records_buffer.descriptor_info(),
+                compressed_buffer.descriptor_info(),
+                output_buffer.descriptor_info(),
+                flat_coefficient_buffer.descriptor_info(),
+                state_buffer.descriptor_info(),
+            ];
+            let cleanup_descriptor_pool = device.create_descriptor_pool(5, 1)?;
+            let cleanup_descriptor_set = device.allocate_descriptor_set(
+                cleanup_descriptor_pool.handle, cleanup_program.descriptor_set_layout.handle,
+            )?;
+            device.update_storage_descriptor_set(cleanup_descriptor_set, &cleanup_descriptors);
+
+            let scatter_descriptors = [
+                scatter_records_buffer.descriptor_info(),
+                flat_coefficient_buffer.descriptor_info(),
+                plane_buffer.descriptor_info(),
+            ];
+            let scatter_descriptor_pool = device.create_descriptor_pool(3, 1)?;
+            let scatter_descriptor_set = device.allocate_descriptor_set(
+                scatter_descriptor_pool.handle, scatter_program.descriptor_set_layout.handle,
+            )?;
+            device.update_storage_descriptor_set(scatter_descriptor_set, &scatter_descriptors);
+
+            let fused_command_pool = device.create_command_pool(queue_family_index)?;
+            let fused_command_buffer = device.allocate_command_buffer(fused_command_pool.handle)?;
+            let mut fused_dispatches = Vec::new();
+            fused_dispatches.push(StorageDispatch {
+                pipeline: cleanup_program.pipeline.handle,
+                pipeline_layout: cleanup_program.pipeline_layout.handle,
+                descriptor_set: cleanup_descriptor_set,
+                push_constants: bytes_of(&cleanup_push),
+                groups: [tier1_cleanup_groups(codeblock_count), 1, 1],
                 no_barrier_before: false,
             });
-        fused_dispatches.push(StorageDispatch {
-            pipeline: scatter_program.pipeline.handle,
-            pipeline_layout: scatter_program.pipeline_layout.handle,
-            descriptor_set: scatter_descriptor_set,
-            push_constants: bytes_of(&scatter_push),
-            groups: [
-                max_scatter_coefficients.div_ceil(256),
-                scatter_records.len() as u32,
-                1,
-            ],
+            fused_dispatches.push(StorageDispatch {
+                pipeline: scatter_program.pipeline.handle,
+                pipeline_layout: scatter_program.pipeline_layout.handle,
+                descriptor_set: scatter_descriptor_set,
+                push_constants: bytes_of(&scatter_push),
+                groups: [max_scatter_coefficients.div_ceil(256), scatter_records.len() as u32, 1],
                 no_barrier_before: false,
             });
-        for component in &idwt_components {
-            component.extend_storage_dispatches(&idwt53_program, &mut fused_dispatches);
+            for component in &idwt_components {
+                component.extend_storage_dispatches(&idwt53_program, &mut fused_dispatches);
+            }
+            rgb48_packer.extend_storage_dispatches(&color_program, &mut fused_dispatches);
+            device.record_storage_dispatches_with_copies(
+                fused_command_buffer, &fused_dispatches,
+                &[BufferCopy {
+                    source: &rgb48_packer.output_buffer,
+                    destination: &rgb48_packer.staging_buffer,
+                    byte_len: rgb48_packer.output_byte_len,
+                }],
+            )?;
+
+            let fence = device.create_fence()?;
+            slots_vec.push(PipelineSlot {
+                cleanup_records_buffer,
+                compressed_buffer,
+                _output_buffer: output_buffer,
+                _flat_coefficient_buffer: flat_coefficient_buffer,
+                _state_buffer: state_buffer,
+                _plane_buffer: plane_buffer,
+                _cleanup_descriptor_pool: cleanup_descriptor_pool,
+                _scatter_descriptor_pool: scatter_descriptor_pool,
+                _fused_command_pool: fused_command_pool,
+                fused_command_buffer,
+                fence,
+                rgb48_packer,
+                _idwt_components: idwt_components,
+            });
         }
-        rgb48_packer.extend_storage_dispatches(&color_program, &mut fused_dispatches);
-        device.record_storage_dispatches_with_copies(
-            fused_command_buffer,
-            &fused_dispatches,
-            &[BufferCopy {
-                source: &rgb48_packer.output_buffer,
-                destination: &rgb48_packer.staging_buffer,
-                byte_len: rgb48_packer.output_byte_len,
-            }],
-        )?;
+
+        let [slot0, slot1] = match slots_vec.try_into() {
+            Ok(arr) => arr,
+            Err(_) => return Err(VulkanError::new("failed to create pipeline slots")),
+        };
 
         Ok(Self {
             device_name: summary.name.clone(),
             codeblock_count,
             compressed_word_capacity,
             setup_ms: setup_start.elapsed().as_secs_f64() * 1000.0,
-            cleanup_records_buffer,
-            compressed_buffer,
+            slots: [slot0, slot1],
             _scatter_records_buffer: scatter_records_buffer,
-            _output_buffer: output_buffer,
-            _flat_coefficient_buffer: flat_coefficient_buffer,
-            _state_buffer: state_buffer,
-            _plane_buffer: plane_buffer,
-            _cleanup_descriptor_pool: cleanup_descriptor_pool,
-            _scatter_descriptor_pool: scatter_descriptor_pool,
-            _fused_command_pool: fused_command_pool,
-            fused_command_buffer,
-            rgb48_packer,
-            _idwt_components: idwt_components,
             _cleanup_program: cleanup_program,
             _scatter_program: scatter_program,
             _idwt53_program: idwt53_program,
@@ -2701,38 +2879,50 @@ impl VulkanTier1Rgb48Pipeline {
         records: &[crate::gpu::GpuTier1CodeblockRecord],
         compressed_words: &[u32],
     ) -> Result<VulkanTier1Rgb48FrameResult, VulkanError> {
+        self.submit_frame(0, records, compressed_words)?;
+        self.wait_and_read_frame(0)
+    }
+
+    pub fn submit_frame(
+        &self,
+        slot: usize,
+        records: &[crate::gpu::GpuTier1CodeblockRecord],
+        compressed_words: &[u32],
+    ) -> Result<(), VulkanError> {
         if records.len() != self.codeblock_count {
             return Err(VulkanError::new(format!(
                 "persistent GPU Tier-1 RGB48 pipeline expected {} records, got {}",
-                self.codeblock_count,
-                records.len()
+                self.codeblock_count, records.len()
             )));
         }
         if compressed_words.len() > self.compressed_word_capacity {
             return Err(VulkanError::new(format!(
                 "persistent GPU Tier-1 RGB48 compressed words {} exceed capacity {}",
-                compressed_words.len(),
-                self.compressed_word_capacity
+                compressed_words.len(), self.compressed_word_capacity
             )));
         }
         let device = &self._context.device;
-        let total_start = std::time::Instant::now();
-        let upload_start = std::time::Instant::now();
-        self.cleanup_records_buffer.write_slice(records)?;
-        self.compressed_buffer.write_slice(compressed_words)?;
-        let upload_ms = upload_start.elapsed().as_secs_f64() * 1000.0;
+        let s = &self.slots[slot];
+        s.cleanup_records_buffer.write_slice(records)?;
+        s.compressed_buffer.write_slice(compressed_words)?;
+        device.reset_fence(s.fence.handle)?;
+        device.submit_with_fence(s.fused_command_buffer, s.fence.handle)
+    }
 
-        let dispatch_start = std::time::Instant::now();
-        device.submit_and_wait(self.fused_command_buffer)?;
-        let fused_dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
-        let packed = self.rgb48_packer.read_staging()?;
+    pub fn wait_and_read_frame(&self, slot: usize) -> Result<VulkanTier1Rgb48FrameResult, VulkanError> {
+        let device = &self._context.device;
+        let s = &self.slots[slot];
+        let wait_start = std::time::Instant::now();
+        device.wait_fence(s.fence.handle)?;
+        let fused_dispatch_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
+        let packed = s.rgb48_packer.read_staging()?;
         Ok(VulkanTier1Rgb48FrameResult {
             samples: packed.samples,
-            upload_ms,
+            upload_ms: 0.0,
             fused_dispatch_ms,
             color_copy_ms: packed.copy_ms,
             color_readback_ms: packed.readback_ms,
-            total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+            total_ms: 0.0,
         })
     }
 }
@@ -2862,6 +3052,7 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
             reconstruction_mode: 0,
+            codeblock_offset: 0,
         };
         let scatter_push = Tier1ScatterSmokePushConstants {
             codeblock_count: scatter_records.len() as u32,
@@ -2970,6 +3161,263 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
             color_shader_average_ms: color_shader_ms / iterations_f64,
             color_copy_average_ms: color_copy_ms / iterations_f64,
             color_readback_average_ms: color_readback_ms / iterations_f64,
+            summary_readback_ms,
+        })
+    })
+}
+
+pub fn run_tier1_cleanup_scatter_rgb48_bench_97(
+    cleanup_shader_path: &str,
+    scatter_shader_path: &str,
+    dequant_shader_path: &str,
+    idwt97_shader_path: &str,
+    color_shader_path: &str,
+    cleanup_records: &[crate::gpu::GpuTier1CodeblockRecord],
+    compressed_words: &[u32],
+    scatter_records: &[crate::gpu::GpuTier1ScatterRecord],
+    scatter_planes: &[crate::gpu::GpuTier1ScatterPlane],
+    output_coefficients: usize,
+    step_indices: &[u32],
+    steps: &[f32],
+    target_resolution: u8,
+    color_transform: u32,
+    precision: u8,
+    iterations: usize,
+) -> Result<Tier1CleanupScatterRgb48BenchResult, VulkanError> {
+    validate_tier1_cleanup_inputs(cleanup_records, compressed_words)?;
+    if iterations == 0 {
+        return Err(VulkanError::new(
+            "Tier-1 cleanup+scatter+RGB48 9/7 bench requires at least one iteration",
+        ));
+    }
+    let flat_coefficient_count = cleanup_records
+        .iter()
+        .map(|record| record.coefficient_offset + record.coefficient_count)
+        .max()
+        .unwrap_or(0) as usize;
+    let max_scatter_coefficients =
+        validate_tier1_scatter_inputs(scatter_records, flat_coefficient_count, output_coefficients)?;
+    let cleanup_spirv = read_spirv(cleanup_shader_path)?;
+    let scatter_spirv = read_spirv(scatter_shader_path)?;
+    let dequant_spirv = read_spirv(dequant_shader_path)?;
+    let idwt97_spirv = read_spirv(idwt97_shader_path)?;
+    let color_spirv = read_spirv(color_shader_path)?;
+    with_compute_device(|device, summary, queue_family_index| {
+        let setup_start = std::time::Instant::now();
+        let cleanup_program = StorageComputeProgram::new(
+            device, &cleanup_spirv, 5,
+            std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
+        )?;
+        let scatter_program = StorageComputeProgram::new(
+            device, &scatter_spirv, 3,
+            std::mem::size_of::<Tier1ScatterSmokePushConstants>() as u32,
+        )?;
+        let dequant_program = StorageComputeProgram::new(
+            device, &dequant_spirv, 4,
+            std::mem::size_of::<DequantPushConstants>() as u32,
+        )?;
+        let idwt97_program = StorageComputeProgram::new(
+            device, &idwt97_spirv, 3,
+            std::mem::size_of::<Idwt53OffsetPushConstants>() as u32,
+        )?;
+        let color_program = StorageComputeProgram::new(
+            device, &color_spirv, 4,
+            std::mem::size_of::<ColorPushConstants>() as u32,
+        )?;
+
+        // Buffers
+        let cleanup_records_buffer = create_device_buffer_from_slice(
+            device, queue_family_index, cleanup_records, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let compressed_buffer = create_device_buffer_from_slice(
+            device, queue_family_index, compressed_words, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let scatter_records_buffer = create_device_buffer_from_slice(
+            device, queue_family_index, scatter_records, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let output_len = cleanup_records.len() * 9;
+        let output_byte_len = bytes_len::<u32>(output_len)?;
+        let output_buffer = device.create_device_local_buffer(
+            output_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        )?;
+        let flat_coefficient_byte_len = bytes_len::<i32>(flat_coefficient_count)?;
+        let flat_coefficient_buffer = device.create_device_local_buffer(
+            flat_coefficient_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let state_buffer = device.create_device_local_buffer(
+            flat_coefficient_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        // i32 plane buffer (scatter output)
+        let plane_byte_len = bytes_len::<i32>(output_coefficients)?;
+        let plane_buffer = device.create_device_local_buffer(
+            plane_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        // Dequant buffers
+        let step_indices_buffer = create_device_buffer_from_slice(
+            device, queue_family_index, step_indices, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        let steps_buffer = create_device_buffer_from_slice(
+            device, queue_family_index, steps, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+        // f32 plane buffer (dequant output, iDWT input)
+        let float_plane_byte_len = bytes_len::<f32>(output_coefficients)?;
+        let float_plane_buffer = device.create_device_local_buffer(
+            float_plane_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+
+        // iDWT97 components
+        let mut component_ids = scatter_planes.iter().map(|p| p.component).collect::<Vec<_>>();
+        component_ids.sort_unstable();
+        component_ids.dedup();
+        let idwt_components = component_ids
+            .iter()
+            .map(|component| {
+                ReusableScatteredIdwt53Component::new(
+                    device, &idwt97_program, &float_plane_buffer,
+                    scatter_planes, *component, target_resolution,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Color packer (float version)
+        let rgb48_packer = ReusableRgb48Packer::new(
+            device, &color_program, &idwt_components, color_transform, precision,
+        )?;
+
+        // Descriptor sets for cleanup, scatter, dequant
+        let cleanup_push = Tier1CleanupSmokePushConstants {
+            codeblock_count: cleanup_records.len() as u32,
+            reconstruction_mode: 0,
+            codeblock_offset: 0,
+        };
+        let scatter_push = Tier1ScatterSmokePushConstants {
+            codeblock_count: scatter_records.len() as u32,
+        };
+        let dequant_push = DequantPushConstants {
+            sample_count: output_coefficients as u32,
+        };
+        let cleanup_descriptors = [
+            cleanup_records_buffer.descriptor_info(),
+            compressed_buffer.descriptor_info(),
+            output_buffer.descriptor_info(),
+            flat_coefficient_buffer.descriptor_info(),
+            state_buffer.descriptor_info(),
+        ];
+        let cleanup_descriptor_pool = device.create_descriptor_pool(5, 1)?;
+        let cleanup_descriptor_set = device.allocate_descriptor_set(
+            cleanup_descriptor_pool.handle, cleanup_program.descriptor_set_layout.handle,
+        )?;
+        device.update_storage_descriptor_set(cleanup_descriptor_set, &cleanup_descriptors);
+
+        let scatter_descriptors = [
+            scatter_records_buffer.descriptor_info(),
+            flat_coefficient_buffer.descriptor_info(),
+            plane_buffer.descriptor_info(),
+        ];
+        let scatter_descriptor_pool = device.create_descriptor_pool(3, 1)?;
+        let scatter_descriptor_set = device.allocate_descriptor_set(
+            scatter_descriptor_pool.handle, scatter_program.descriptor_set_layout.handle,
+        )?;
+        device.update_storage_descriptor_set(scatter_descriptor_set, &scatter_descriptors);
+
+        let dequant_descriptors = [
+            plane_buffer.descriptor_info(),
+            step_indices_buffer.descriptor_info(),
+            steps_buffer.descriptor_info(),
+            float_plane_buffer.descriptor_info(),
+        ];
+        let dequant_descriptor_pool = device.create_descriptor_pool(4, 1)?;
+        let dequant_descriptor_set = device.allocate_descriptor_set(
+            dequant_descriptor_pool.handle, dequant_program.descriptor_set_layout.handle,
+        )?;
+        device.update_storage_descriptor_set(dequant_descriptor_set, &dequant_descriptors);
+
+        // Build fused command buffer
+        let fused_command_pool = device.create_command_pool(queue_family_index)?;
+        let fused_command_buffer = device.allocate_command_buffer(fused_command_pool.handle)?;
+        let mut fused_dispatches = Vec::new();
+        fused_dispatches.push(StorageDispatch {
+            pipeline: cleanup_program.pipeline.handle,
+            pipeline_layout: cleanup_program.pipeline_layout.handle,
+            descriptor_set: cleanup_descriptor_set,
+            push_constants: bytes_of(&cleanup_push),
+            groups: [tier1_cleanup_groups(cleanup_records.len()), 1, 1],
+            no_barrier_before: false,
+        });
+        fused_dispatches.push(StorageDispatch {
+            pipeline: scatter_program.pipeline.handle,
+            pipeline_layout: scatter_program.pipeline_layout.handle,
+            descriptor_set: scatter_descriptor_set,
+            push_constants: bytes_of(&scatter_push),
+            groups: [max_scatter_coefficients.div_ceil(256), scatter_records.len() as u32, 1],
+            no_barrier_before: false,
+        });
+        fused_dispatches.push(StorageDispatch {
+            pipeline: dequant_program.pipeline.handle,
+            pipeline_layout: dequant_program.pipeline_layout.handle,
+            descriptor_set: dequant_descriptor_set,
+            push_constants: bytes_of(&dequant_push),
+            groups: [(output_coefficients as u32).div_ceil(256), 1, 1],
+            no_barrier_before: false,
+        });
+        for component in &idwt_components {
+            component.extend_storage_dispatches(&idwt97_program, &mut fused_dispatches);
+        }
+        rgb48_packer.extend_storage_dispatches(&color_program, &mut fused_dispatches);
+        let trailing_copies = [rgb48_packer.trailing_copy()];
+        device.record_storage_dispatches_with_copies(fused_command_buffer, &fused_dispatches, &trailing_copies)?;
+        let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Benchmark loop — record all iterations into one command buffer
+        let bench_command_pool = device.create_command_pool(queue_family_index)?;
+        let bench_command_buffer = device.allocate_command_buffer(bench_command_pool.handle)?;
+        let mut all_dispatches = Vec::with_capacity(fused_dispatches.len() * iterations);
+        for _ in 0..iterations {
+            for d in &fused_dispatches {
+                all_dispatches.push(StorageDispatch {
+                    pipeline: d.pipeline,
+                    pipeline_layout: d.pipeline_layout,
+                    descriptor_set: d.descriptor_set,
+                    push_constants: d.push_constants,
+                    groups: d.groups,
+                    no_barrier_before: d.no_barrier_before,
+                });
+            }
+        }
+        device.record_storage_dispatches_with_copies(bench_command_buffer, &all_dispatches, &trailing_copies)?;
+        let decode_start = std::time::Instant::now();
+        device.submit_and_wait(bench_command_buffer)?;
+        let decode_total_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+        let fused_dispatch_ms = decode_total_ms;
+
+        let samples = rgb48_packer.read_staging()?.samples;
+
+        let summary_readback_start = std::time::Instant::now();
+        let output_staging =
+            device.create_host_cached_buffer(output_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+        device.copy_buffer(queue_family_index, &output_buffer, &output_staging, output_byte_len)?;
+        let output = output_staging.read_vec::<u32>(output_len)?;
+        let summary_readback_ms = summary_readback_start.elapsed().as_secs_f64() * 1000.0;
+        device.wait_idle()?;
+
+        let iterations_f64 = iterations as f64;
+        Ok(Tier1CleanupScatterRgb48BenchResult {
+            device_name: summary.name.clone(),
+            queue_family_index,
+            iterations,
+            output,
+            samples,
+            setup_ms,
+            decode_total_ms,
+            decode_average_ms: decode_total_ms / iterations_f64,
+            fused_dispatch_average_ms: fused_dispatch_ms / iterations_f64,
+            cleanup_dispatch_average_ms: 0.0,
+            scatter_dispatch_average_ms: 0.0,
+            idwt_dispatch_average_ms: 0.0,
+            idwt_alloc_average_ms: 0.0,
+            color_shader_average_ms: 0.0,
+            color_copy_average_ms: 0.0,
+            color_readback_average_ms: 0.0,
             summary_readback_ms,
         })
     })
@@ -4104,4 +4552,10 @@ struct ColorPushConstants {
     output_max: u32,
     level_shift: f32,
     output_shift: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DequantPushConstants {
+    sample_count: u32,
 }

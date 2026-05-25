@@ -207,6 +207,7 @@ type VkDestroyFence = unsafe extern "system" fn(VkDevice, VkFence, *const c_void
 type VkQueueSubmit = unsafe extern "system" fn(VkQueue, u32, *const VkSubmitInfo, VkFence) -> i32;
 type VkWaitForFences =
     unsafe extern "system" fn(VkDevice, u32, *const VkFence, VkBool32, u64) -> i32;
+type VkResetFences = unsafe extern "system" fn(VkDevice, u32, *const VkFence) -> i32;
 type VkDeviceWaitIdle = unsafe extern "system" fn(VkDevice) -> i32;
 
 #[link(name = "kernel32")]

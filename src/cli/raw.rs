@@ -532,7 +532,6 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         eprintln!("profile-mxf-ffmpeg gpu-tier1 currently supports discard 0 only");
         return ExitCode::FAILURE;
     }
-    let cleanup_shader_path = r"target\shaders\tier1_cleanup_smoke.comp.spv";
     let scatter_shader_path = r"target\shaders\tier1_scatter_smoke.comp.spv";
     let mut read_total_ms = 0.0;
     let mut frame_plans = Vec::with_capacity(frame_count);
@@ -567,6 +566,19 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
     if frame_plans.is_empty() {
         eprintln!("profile-mxf-ffmpeg gpu-tier1 failed: no frames decoded");
         return ExitCode::FAILURE;
+    };
+    let cleanup_shader_path = {
+        let thread_shader = r"target\shaders\tier1_cleanup_smoke_16.comp.spv";
+        let warp_shader = r"target\shaders\tier1_cleanup_smoke.comp.spv";
+        if std::path::Path::new(thread_shader).exists()
+            && frame_plans.iter().all(|frame| {
+                frame.records.iter().all(|r| r.coefficient_count <= 1024)
+            })
+        {
+            thread_shader
+        } else {
+            warp_shader
+        }
     };
     let (template_records, template_scatter_records, flat_coefficient_count) =
         match build_tier1_union_template(&frame_plans) {
@@ -656,31 +668,75 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
     let mut readback_ms = Vec::with_capacity(frame_count);
     let mut last_samples = None;
     let decode_loop_start = Instant::now();
+    // Double-buffered: submit to alternating slots, read previous slot's result
+    let mut pending_slot: Option<usize> = None;
     for (frame_index, frame) in frame_plans.iter().enumerate() {
-        let decoded = match pipeline.decode_frame(&frame.records, &frame.compressed_words) {
-            Ok(decoded) => decoded,
+        let slot = frame_index % 2;
+        let frame_start = Instant::now();
+
+        // If this slot has a pending result, wait and read it first
+        if let Some(prev_slot) = pending_slot {
+            if prev_slot == slot {
+                let decoded = match pipeline.wait_and_read_frame(prev_slot) {
+                    Ok(d) => d,
+                    Err(err) => {
+                        eprintln!("profile-mxf-ffmpeg gpu-tier1 failed reading frame: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                last_samples = Some(decoded.samples);
+            }
+        }
+
+        if let Err(err) = pipeline.submit_frame(slot, &frame.records, &frame.compressed_words) {
+            eprintln!(
+                "profile-mxf-ffmpeg gpu-tier1 failed on frame {}: {err}",
+                frame_index + 1
+            );
+            return ExitCode::FAILURE;
+        }
+
+        // Read the OTHER slot if it has a pending result (true overlap)
+        let other_slot = 1 - slot;
+        if let Some(prev_slot) = pending_slot {
+            if prev_slot == other_slot {
+                let decoded = match pipeline.wait_and_read_frame(other_slot) {
+                    Ok(d) => d,
+                    Err(err) => {
+                        eprintln!("profile-mxf-ffmpeg gpu-tier1 failed reading frame: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let total_ms = elapsed_ms(frame_start);
+                dispatch_ms.push(decoded.fused_dispatch_ms);
+                copy_ms.push(decoded.color_copy_ms);
+                readback_ms.push(decoded.color_readback_ms);
+                frame_total_ms.push(total_ms);
+                upload_ms.push(0.0);
+                last_samples = Some(decoded.samples);
+            }
+        }
+
+        pending_slot = Some(slot);
+
+        if frame_index % 100 == 0 || frame_index + 1 == frame_count {
+            println!("  frame {:>4}: submitted to slot {}", frame_index + 1, slot);
+        }
+    }
+    // Drain the last pending slot
+    if let Some(slot) = pending_slot {
+        let decoded = match pipeline.wait_and_read_frame(slot) {
+            Ok(d) => d,
             Err(err) => {
-                eprintln!(
-                    "profile-mxf-ffmpeg gpu-tier1 failed on frame {}: {err}",
-                    frame_index + 1
-                );
+                eprintln!("profile-mxf-ffmpeg gpu-tier1 failed reading final frame: {err}");
                 return ExitCode::FAILURE;
             }
         };
-        println!(
-            "  frame {:>4}: gpu_tier1_total_ms {:.3} upload_ms {:.3} fused_dispatch_ms {:.3} color_copy_ms {:.3} color_readback_ms {:.3}",
-            frame_index + 1,
-            decoded.total_ms,
-            decoded.upload_ms,
-            decoded.fused_dispatch_ms,
-            decoded.color_copy_ms,
-            decoded.color_readback_ms
-        );
-        frame_total_ms.push(decoded.total_ms);
-        upload_ms.push(decoded.upload_ms);
         dispatch_ms.push(decoded.fused_dispatch_ms);
         copy_ms.push(decoded.color_copy_ms);
         readback_ms.push(decoded.color_readback_ms);
+        frame_total_ms.push(0.0);
+        upload_ms.push(0.0);
         last_samples = Some(decoded.samples);
     }
     let decode_loop_ms = elapsed_ms(decode_loop_start);

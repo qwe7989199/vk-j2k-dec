@@ -44,6 +44,7 @@ layout(std430, set = 0, binding = 3) buffer CoefficientsOut {
 layout(push_constant) uniform PushConstants {
     uint codeblock_count;
     uint reconstruction_mode;
+    uint codeblock_offset;
 } pc;
 
 layout(std430, set = 0, binding = 4) buffer CoefficientState {
@@ -67,6 +68,9 @@ uint next_byte;
 Tier1Codeblock cb;
 uint state_base;
 uint visit_word;
+
+// Thread-private state array (avoids global memory random access)
+uint local_state[256];
 
 // Constants
 const uint STATE_SIGNIFICANT = 1u;
@@ -113,7 +117,7 @@ const uint HH_LUT_FAST[37] = uint[](
 
 uint index_at(uint x, uint y) { return y * cb.width + x; }
 uint coeff_offset(uint index) { return cb.coefficient_offset + index; }
-uint state_at_index(uint index) { return state_data[state_base + index]; }
+uint state_at_index(uint index) { return local_state[index]; }
 bool state_is_significant(uint state) { return (state & STATE_SIGNIFICANT) != 0u; }
 bool state_is_negative(uint state) { return (state & STATE_NEGATIVE) != 0u; }
 bool state_is_refined(uint state) { return (state & STATE_REFINED) != 0u; }
@@ -196,7 +200,7 @@ uvec2 sign_context(uint x, uint y) {
 
 void increment_neighbor(int x, int y, uint bit_shift) {
     if (x < 0 || y < 0 || x >= int(cb.width) || y >= int(cb.height)) return;
-    state_data[state_base + uint(y) * cb.width + uint(x)] += 1u << (STATE_NEIGHBOR_SHIFT + bit_shift);
+    local_state[uint(y) * cb.width + uint(x)] += 1u << (STATE_NEIGHBOR_SHIFT + bit_shift);
 }
 
 void update_neighbors(uint x, uint y) {
@@ -220,7 +224,7 @@ void decode_significant_sample(uint x, uint y, uint bitplane) {
     }
     output_coefficients[coeff_offset(index)] = sign_bit != 0u ? -magnitude : magnitude;
     update_neighbors(x, y);
-    state_data[state_base + index] = (state_data[state_base + index] & STATE_NEIGHBOR_MASK)
+    local_state[index] = (local_state[index] & STATE_NEIGHBOR_MASK)
         | STATE_SIGNIFICANT | (sign_bit != 0u ? STATE_NEGATIVE : 0u);
 }
 
@@ -228,6 +232,7 @@ void decode_significant_sample(uint x, uint y, uint bitplane) {
 void main() {
     uint codeblock_index = gl_GlobalInvocationID.x;
     if (codeblock_index >= pc.codeblock_count) return;
+    codeblock_index += pc.codeblock_offset;
 
     cb = codeblocks[codeblock_index];
     state_base = cb.coefficient_offset;
@@ -235,7 +240,7 @@ void main() {
 
     // Zero-init state
     for (uint i = 0u; i < cb.coefficient_count; i++) {
-        state_data[state_base + i] = 0u;
+        local_state[i] = 0u;
     }
 
     // Init MQ contexts
@@ -327,9 +332,9 @@ void main() {
                     uint is_sig = decode_bit(ctx_idx);
                     if (is_sig != 0u) {
                         decode_significant_sample(x, y, bitplane);
-                        state_data[state_base + idx] = (state_data[state_base + idx] & ~STATE_VISIT_MASK) | visit_word;
+                        local_state[idx] = (local_state[idx] & ~STATE_VISIT_MASK) | visit_word;
                     } else {
-                        state_data[state_base + idx] = (state_data[state_base + idx] & ~STATE_VISIT_MASK) | visit_word;
+                        local_state[idx] = (local_state[idx] & ~STATE_VISIT_MASK) | visit_word;
                     }
                 }
             }
@@ -359,7 +364,7 @@ void main() {
                     }
                     uint offset = coeff_offset(idx);
                     output_coefficients[offset] += state_is_negative(st) ? -delta : delta;
-                    state_data[state_base + idx] = ((st | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
+                    local_state[idx] = ((st | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
                 }
             }
             stripe_y += 4u;
@@ -415,7 +420,7 @@ void main() {
     uint nonzero = 0u;
     uint checksum = 0u;
     for (uint i = 0u; i < cb.coefficient_count; i++) {
-        if ((state_data[state_base + i] & STATE_SIGNIFICANT) != 0u) {
+        if ((local_state[i] & STATE_SIGNIFICANT) != 0u) {
             nonzero += 1u;
             checksum += uint(output_coefficients[cb.coefficient_offset + i]);
         } else {

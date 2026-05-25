@@ -1,8 +1,94 @@
-use crate::codestream::{Codestream, QuantizationStep, SubbandKind, WaveletTransform};
+use crate::codestream::{Codestream, QuantizationStep, QuantizationStyle, SubbandKind, WaveletTransform};
 use crate::tier1::{Tier1BoundWorkPlan, Tier1CodingMode, Tier1DecodeError};
 
 const DWT_LOCAL_SIZE_X: u32 = 16;
 const DWT_LOCAL_SIZE_Y: u32 = 16;
+
+pub struct GpuDequantPlan {
+    pub step_indices: Vec<u32>,
+    pub steps: Vec<f32>,
+}
+
+pub fn build_dequant_plan(
+    scatter_planes: &[GpuTier1ScatterPlane],
+    output_coefficients: usize,
+    qcd: &crate::codestream::QcdSegment,
+    precision: u8,
+    decomposition_levels: u8,
+) -> Result<GpuDequantPlan, Tier1DecodeError> {
+    let qcd_steps = qcd
+        .steps()
+        .map_err(|err| Tier1DecodeError::new(format!("QCD step parse: {err}")))?;
+    let mut scales = Vec::new();
+    let mut step_indices = vec![0u32; output_coefficients];
+    for plane in scatter_planes {
+        let scale = compute_subband_scale(
+            &qcd_steps, qcd.style, precision, decomposition_levels,
+            plane.resolution, plane.subband,
+        )?;
+        let step_index = scales.len() as u32;
+        scales.push(scale);
+        let offset = plane.plane_offset as usize;
+        let count = (plane.width as usize) * (plane.height as usize);
+        for i in 0..count {
+            if offset + i < step_indices.len() {
+                step_indices[offset + i] = step_index;
+            }
+        }
+    }
+    Ok(GpuDequantPlan { step_indices, steps: scales })
+}
+
+fn compute_subband_scale(
+    steps: &[QuantizationStep],
+    style: crate::codestream::QuantizationStyle,
+    precision: u8,
+    decomposition_levels: u8,
+    resolution: u8,
+    subband: SubbandKind,
+) -> Result<f32, Tier1DecodeError> {
+    match style {
+        QuantizationStyle::NoQuantization => Ok(1.0),
+        QuantizationStyle::ScalarExpounded => {
+            let index = qcd_step_index(resolution, subband).ok_or_else(|| {
+                Tier1DecodeError::new(format!("no QCD index for R{resolution} {subband}"))
+            })?;
+            let step = steps.get(index).copied().ok_or_else(|| {
+                Tier1DecodeError::new(format!("QCD missing index {index}"))
+            })?;
+            Ok(quantization_step_scale(step, precision, subband))
+        }
+        QuantizationStyle::ScalarDerived => {
+            let base = steps.first().copied().ok_or_else(|| {
+                Tier1DecodeError::new("scalar derived QCD has no LL step")
+            })?;
+            let level_shift = match (resolution, subband) {
+                (0, SubbandKind::Ll) => decomposition_levels,
+                (r, _) => decomposition_levels - r,
+            };
+            let step = QuantizationStep {
+                exponent: base.exponent.saturating_sub(level_shift),
+                mantissa: base.mantissa,
+                raw: 0,
+            };
+            Ok(quantization_step_scale(step, precision, subband))
+        }
+        QuantizationStyle::Unknown(v) => Err(Tier1DecodeError::new(format!(
+            "unsupported quantization style {v}"
+        ))),
+    }
+}
+
+fn quantization_step_scale(step: QuantizationStep, precision: u8, subband: SubbandKind) -> f32 {
+    let gain_bits = match subband {
+        SubbandKind::Ll => 0,
+        SubbandKind::Hl | SubbandKind::Lh => 1,
+        SubbandKind::Hh => 2,
+    };
+    let nominal_range_bits = i32::from(precision) + gain_bits;
+    2.0f32.powi(nominal_range_bits - i32::from(step.exponent))
+        * (1.0 + f32::from(step.mantissa) / 2048.0)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuTier1Plan {
@@ -94,6 +180,43 @@ pub fn sort_codeblock_records_by_descending_work(records: &mut [GpuTier1Codebloc
             .then_with(|| b.pass_count.cmp(&a.pass_count))
             .then_with(|| tier1_record_key(a).cmp(&tier1_record_key(b)))
     });
+}
+
+const THREAD_PER_CBLK_MAX_COEFFICIENTS: u32 = 1024;
+
+pub fn partition_records_by_shader_affinity(records: &mut [GpuTier1CodeblockRecord]) -> usize {
+    let small_count = records
+        .iter()
+        .filter(|r| r.coefficient_count <= THREAD_PER_CBLK_MAX_COEFFICIENTS)
+        .count();
+    if small_count == 0 {
+        sort_codeblock_records_by_descending_work(records);
+        return 0;
+    }
+    if small_count == records.len() {
+        sort_codeblock_records_by_descending_work(records);
+        return records.len();
+    }
+    // Mixed case: only split if small codeblocks are a significant fraction
+    // (at least 25% of codeblocks). Otherwise assign all to warp-per-cblk.
+    if small_count * 4 < records.len() {
+        sort_codeblock_records_by_descending_work(records);
+        return 0;
+    }
+    records.sort_by(|a, b| {
+        let a_small = a.coefficient_count <= THREAD_PER_CBLK_MAX_COEFFICIENTS;
+        let b_small = b.coefficient_count <= THREAD_PER_CBLK_MAX_COEFFICIENTS;
+        b_small.cmp(&a_small).then_with(|| {
+            let a_work = u64::from(a.byte_len) * u64::from(a.pass_count);
+            let b_work = u64::from(b.byte_len) * u64::from(b.pass_count);
+            b_work
+                .cmp(&a_work)
+                .then_with(|| b.byte_len.cmp(&a.byte_len))
+                .then_with(|| b.pass_count.cmp(&a.pass_count))
+                .then_with(|| tier1_record_key(a).cmp(&tier1_record_key(b)))
+        })
+    });
+    small_count
 }
 
 impl GpuTier1Plan {
@@ -370,6 +493,147 @@ impl GpuTier1Plan {
             output_coefficients,
         })
     }
+
+    pub fn scatter_plan_multi_tile(
+        merged: &Self,
+        per_tile_plans: &[Self],
+        layouts: &[crate::codestream::TileLayout],
+        full_image_components: &[crate::codestream::TileComponentLayout],
+    ) -> Result<GpuTier1ScatterPlan, Tier1DecodeError> {
+        let mut plane_offsets = Vec::new();
+        let mut output_coefficients = 0usize;
+        for (component, component_layout) in full_image_components.iter().enumerate() {
+            let component = u16::try_from(component)
+                .map_err(|_| Tier1DecodeError::new("scatter component index exceeds u16"))?;
+            for resolution in &component_layout.resolutions {
+                for subband in &resolution.subbands {
+                    let plane_offset = checked_u32(output_coefficients, "scatter plane offset")?;
+                    let plane_samples = (subband.width as usize)
+                        .checked_mul(subband.height as usize)
+                        .ok_or_else(|| Tier1DecodeError::new("scatter plane size overflow"))?;
+                    output_coefficients = output_coefficients.checked_add(plane_samples)
+                        .ok_or_else(|| Tier1DecodeError::new("scatter output size overflow"))?;
+                    plane_offsets.push(GpuTier1PlaneOffset {
+                        component,
+                        resolution: resolution.level,
+                        subband: subband.kind,
+                        plane_offset,
+                        layout: subband,
+                    });
+                }
+            }
+        }
+
+        let mut records = Vec::with_capacity(merged.codeblocks.len());
+        let mut codeblock_cursor = 0usize;
+        for (tile_idx, tile_plan) in per_tile_plans.iter().enumerate() {
+            let tile_layout = layouts.iter()
+                .find(|l| l.tile_index as usize == tile_idx)
+                .ok_or_else(|| Tier1DecodeError::new(format!("missing layout for tile {tile_idx}")))?;
+
+            for local_cb_idx in 0..tile_plan.codeblocks.len() {
+                let codeblock = &merged.codeblocks[codeblock_cursor + local_cb_idx];
+                let comp_idx = codeblock.component as usize;
+                let tile_comp = tile_layout.components.get(comp_idx)
+                    .ok_or_else(|| Tier1DecodeError::new("tile component out of range"))?;
+                let full_comp = full_image_components.get(comp_idx)
+                    .ok_or_else(|| Tier1DecodeError::new("full image component out of range"))?;
+
+                let plane = plane_offsets.iter()
+                    .find(|p| p.component == codeblock.component && p.resolution == codeblock.resolution && p.subband == codeblock.subband)
+                    .ok_or_else(|| Tier1DecodeError::new(format!(
+                        "missing plane C{} R{} {}", codeblock.component, codeblock.resolution, codeblock.subband
+                    )))?;
+
+                let tile_subband = tile_comp.resolutions.iter()
+                    .find(|r| r.level == codeblock.resolution)
+                    .and_then(|r| r.subbands.iter().find(|s| s.kind == codeblock.subband))
+                    .ok_or_else(|| Tier1DecodeError::new("tile subband not found"))?;
+
+                let local_rect = tile_subband.codeblock_rect(codeblock.codeblock_x, codeblock.codeblock_y)
+                    .ok_or_else(|| Tier1DecodeError::new("codeblock rect out of range"))?;
+
+                let tile_subband_x0 = compute_tile_subband_offset_x(
+                    tile_layout, full_comp, codeblock.resolution, codeblock.subband,
+                );
+                let tile_subband_y0 = compute_tile_subband_offset_y(
+                    tile_layout, full_comp, codeblock.resolution, codeblock.subband,
+                );
+
+                records.push(GpuTier1ScatterRecord {
+                    coefficient_offset: codeblock.coefficient_offset,
+                    coefficient_count: codeblock.coefficient_count,
+                    width: codeblock.width,
+                    height: codeblock.height,
+                    plane_offset: plane.plane_offset,
+                    plane_width: plane.layout.width,
+                    plane_x0: tile_subband_x0 + local_rect.x0,
+                    plane_y0: tile_subband_y0 + local_rect.y0,
+                });
+            }
+            codeblock_cursor += tile_plan.codeblocks.len();
+        }
+
+        Ok(GpuTier1ScatterPlan {
+            records,
+            planes: plane_offsets.iter().map(|p| GpuTier1ScatterPlane {
+                component: p.component,
+                resolution: p.resolution,
+                subband: p.subband,
+                plane_offset: p.plane_offset,
+                width: p.layout.width,
+                height: p.layout.height,
+            }).collect(),
+            output_coefficients,
+        })
+    }
+}
+
+fn compute_tile_subband_offset_x(
+    tile: &crate::codestream::TileLayout,
+    full_comp: &crate::codestream::TileComponentLayout,
+    resolution: u8,
+    subband: SubbandKind,
+) -> u32 {
+    let decomp_levels = full_comp.resolutions.len().saturating_sub(1) as u32;
+    let discard = decomp_levels.saturating_sub(resolution as u32);
+    let scale = 1u32 << discard;
+    let tile_res_x0 = gpu_ceil_div(tile.x0, scale);
+    if resolution == 0 {
+        return tile_res_x0;
+    }
+    let prev_scale = scale * 2;
+    let tile_prev_x0 = gpu_ceil_div(tile.x0, prev_scale);
+    match subband {
+        SubbandKind::Ll | SubbandKind::Lh => tile_prev_x0,
+        SubbandKind::Hl | SubbandKind::Hh => tile_res_x0 - tile_prev_x0,
+    }
+}
+
+fn compute_tile_subband_offset_y(
+    tile: &crate::codestream::TileLayout,
+    full_comp: &crate::codestream::TileComponentLayout,
+    resolution: u8,
+    subband: SubbandKind,
+) -> u32 {
+    let decomp_levels = full_comp.resolutions.len().saturating_sub(1) as u32;
+    let discard = decomp_levels.saturating_sub(resolution as u32);
+    let scale = 1u32 << discard;
+    let tile_res_y0 = gpu_ceil_div(tile.y0, scale);
+    if resolution == 0 {
+        return tile_res_y0;
+    }
+    let prev_scale = scale * 2;
+    let tile_prev_y0 = gpu_ceil_div(tile.y0, prev_scale);
+    match subband {
+        SubbandKind::Ll | SubbandKind::Hl => tile_prev_y0,
+        SubbandKind::Lh | SubbandKind::Hh => tile_res_y0 - tile_prev_y0,
+    }
+}
+
+fn gpu_ceil_div(a: u32, b: u32) -> u32 {
+    if b == 0 { return 0; }
+    (a + b - 1) / b
 }
 
 fn tier1_record_key(record: &GpuTier1CodeblockRecord) -> (u32, u32, u32, u32, u32) {

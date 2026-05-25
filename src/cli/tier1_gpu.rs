@@ -6,7 +6,8 @@ use std::time::Instant;
 use vk_j2k_dec::codestream::{Codestream, WaveletTransform};
 use vk_j2k_dec::decode::decode_rgb48_with_discard;
 use vk_j2k_dec::gpu::{
-    GpuTier1CodeblockRecord, GpuTier1Plan, sort_codeblock_records_by_descending_work,
+    GpuTier1CodeblockRecord, GpuTier1Plan, partition_records_by_shader_affinity,
+    sort_codeblock_records_by_descending_work,
 };
 use vk_j2k_dec::packet::parse_lrcp_tile_packets;
 use vk_j2k_dec::reconstruct::TileCoefficientPlanes;
@@ -917,23 +918,15 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
 
         let reconstruction = coefficient_reconstruction_for_transform(cod.transform);
         let cpu_start = Instant::now();
-        let mut expected_output = Vec::new();
-        let mut expected_coefficients = Vec::new();
-        for iteration in 0..iterations {
-            let (output, coefficients) =
-                match tier1_cleanup_smoke_expected_all(&bound.codeblocks, reconstruction) {
-                    Ok(expected) => expected,
-                    Err(err) => {
-                        eprintln!("tier1 gpu bench: CPU cleanup reference failed: {err}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-            if iteration == 0 {
-                expected_output = output;
-                expected_coefficients = coefficients;
-            }
-        }
-        let cpu_total_ms = elapsed_ms(cpu_start);
+        let (expected_output, expected_coefficients) =
+            match tier1_cleanup_smoke_expected_all(&bound.codeblocks, reconstruction) {
+                Ok(expected) => expected,
+                Err(err) => {
+                    eprintln!("tier1 gpu bench: CPU cleanup reference failed: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        let cpu_total_ms = elapsed_ms(cpu_start) * iterations as f64;
         let expected_output = match reorder_tier1_summaries_for_records(
             &records,
             &original_records,
@@ -1075,24 +1068,15 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
                 }
 
                 let cpu_rgb_start = Instant::now();
-                let mut expected_rgb = None;
-                for iteration in 0..iterations {
-                    let image = match decode_rgb48_with_discard(&data, 0) {
-                        Ok(image) => image,
-                        Err(err) => {
-                            eprintln!("tier1 gpu bench: CPU RGB48 reference failed: {err}");
-                            return ExitCode::FAILURE;
-                        }
-                    };
-                    if iteration == 0 {
-                        expected_rgb = Some(image);
+                let expected_rgb = match decode_rgb48_with_discard(&data, 0) {
+                    Ok(image) => image,
+                    Err(err) => {
+                        eprintln!("tier1 gpu bench: CPU RGB48 reference failed: {err}");
+                        return ExitCode::FAILURE;
                     }
-                }
-                let cpu_rgb_total_ms = elapsed_ms(cpu_rgb_start);
-                let Some(mut expected_rgb) = expected_rgb else {
-                    eprintln!("tier1 gpu bench: CPU RGB48 reference produced no image");
-                    return ExitCode::FAILURE;
                 };
+                let cpu_rgb_total_ms = elapsed_ms(cpu_rgb_start) * iterations as f64;
+                let mut expected_rgb = expected_rgb;
                 expand_rgb48_samples_to_16bit(&mut expected_rgb.samples, precision);
                 if rgb_bench.samples != expected_rgb.samples {
                     let mismatch = rgb_bench
@@ -1138,6 +1122,75 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
                     cpu_rgb_average_ms,
                     cpu_fps,
                     cpu_rgb_average_ms / rgb_bench.decode_average_ms
+                );
+            }
+            let idwt97_offset_shader_path = "target\\shaders\\idwt97_offset_1d.comp.spv";
+            let dequant_shader_path = "target\\shaders\\dequant.comp.spv";
+            let color_float_shader_path = "target\\shaders\\color_convert.comp.spv";
+            if cod.transform == WaveletTransform::Irreversible97
+                && std::path::Path::new(idwt97_offset_shader_path).exists()
+                && std::path::Path::new(dequant_shader_path).exists()
+                && std::path::Path::new(color_float_shader_path).exists()
+            {
+                let precision = codestream
+                    .siz
+                    .as_ref()
+                    .and_then(|siz| siz.components.first())
+                    .map(|component| component.precision)
+                    .unwrap_or(0);
+                let qcd = match codestream.qcd.as_ref() {
+                    Some(qcd) => qcd,
+                    None => {
+                        eprintln!("tier1 gpu bench: missing QCD for 9/7 dequant");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let dequant_plan = match vk_j2k_dec::gpu::build_dequant_plan(
+                    &scatter_plan.planes,
+                    scatter_plan.output_coefficients,
+                    qcd,
+                    precision,
+                    cod.decomposition_levels,
+                ) {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        eprintln!("tier1 gpu bench: dequant plan failed: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let rgb_bench = match vk_j2k_dec::vulkan::run_tier1_cleanup_scatter_rgb48_bench_97(
+                    cleanup_shader_path,
+                    scatter_shader_path,
+                    dequant_shader_path,
+                    idwt97_offset_shader_path,
+                    color_float_shader_path,
+                    &records,
+                    &compressed_words,
+                    &scatter_plan.records,
+                    &scatter_plan.planes,
+                    scatter_plan.output_coefficients,
+                    &dequant_plan.step_indices,
+                    &dequant_plan.steps,
+                    cod.decomposition_levels,
+                    if cod.multiple_component_transform != 0 { 2u32 } else { 0u32 },
+                    precision,
+                    iterations,
+                ) {
+                    Ok(bench) => bench,
+                    Err(err) => {
+                        eprintln!("tier1 gpu bench: Vulkan full RGB48 9/7 bench failed: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let gpu_fps = 1000.0 / rgb_bench.decode_average_ms;
+                println!(
+                    "    vulkan full RGB48 9/7 hot bench: device {}, queue {}, setup_once {:.3} ms, {:.3} ms total / {:.3} ms avg, {:.2} fps",
+                    rgb_bench.device_name,
+                    rgb_bench.queue_family_index,
+                    rgb_bench.setup_ms,
+                    rgb_bench.decode_total_ms,
+                    rgb_bench.decode_average_ms,
+                    gpu_fps
                 );
             }
         }
@@ -1223,6 +1276,22 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
                 bench.dispatch_average_ms, 1000.0 / bench.dispatch_average_ms
             );
         }
+
+        // Adaptive: partition by codeblock size, use best shader for each
+        let mut adaptive_records = merged.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
+        let thread_count = partition_records_by_shader_affinity(&mut adaptive_records);
+        if let Ok(bench) = vk_j2k_dec::vulkan::run_tier1_adaptive_bench(
+            cleanup_shader_path, fast_shader,
+            &adaptive_records, &compressed_words,
+            thread_count, iterations,
+            gpu_reconstruction_mode(cod.transform),
+        ) {
+            println!(
+                "    adaptive Tier-1: {:.3} ms avg ({:.1} fps) [thread-per-cblk: {}, warp-per-cblk: {}]",
+                bench.dispatch_average_ms, 1000.0 / bench.dispatch_average_ms,
+                thread_count, adaptive_records.len() - thread_count
+            );
+        }
     }
 
     // Bench discard-1
@@ -1237,6 +1306,73 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
             "    discard-1 Tier-1: {:.3} ms avg ({:.1} fps)",
             bench.dispatch_average_ms, 1000.0 / bench.dispatch_average_ms
         );
+    }
+
+    // Merged full-pipeline bench for 9/7
+    let idwt97_offset_shader_path = "target\\shaders\\idwt97_offset_1d.comp.spv";
+    let dequant_shader_path = "target\\shaders\\dequant.comp.spv";
+    let color_float_shader_path = "target\\shaders\\color_convert.comp.spv";
+    if cod.transform == WaveletTransform::Irreversible97
+        && std::path::Path::new(idwt97_offset_shader_path).exists()
+        && std::path::Path::new(dequant_shader_path).exists()
+        && std::path::Path::new(color_float_shader_path).exists()
+    {
+        let scatter_shader_path = "target\\shaders\\tier1_scatter_smoke.comp.spv";
+        if std::path::Path::new(scatter_shader_path).exists() {
+            let mut adaptive_records = merged.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
+            let thread_count = partition_records_by_shader_affinity(&mut adaptive_records);
+            let actual_cleanup_shader = if thread_count == adaptive_records.len() {
+                "target\\shaders\\tier1_cleanup_smoke_16.comp.spv"
+            } else {
+                cleanup_shader_path
+            };
+            let full_image_layouts = if let Some(siz) = codestream.siz.as_ref() {
+                Some(siz.components.iter().map(|comp| {
+                    vk_j2k_dec::codestream::component_layout(
+                        comp, cod, siz.x_origin, siz.y_origin, siz.width, siz.height,
+                    )
+                }).collect::<Vec<_>>())
+            } else {
+                None
+            };
+            let scatter_plan_result = if layouts.len() == 1 {
+                merged.scatter_plan(&layouts[0].components)
+            } else if let Some(ref full_layouts) = full_image_layouts {
+                vk_j2k_dec::gpu::GpuTier1Plan::scatter_plan_multi_tile(
+                    &merged, &all_plans, &layouts, full_layouts,
+                )
+            } else {
+                Err(vk_j2k_dec::tier1::Tier1DecodeError::new("no SIZ for multi-tile scatter"))
+            };
+            if let Ok(scatter_plan) = scatter_plan_result {
+                let precision = codestream.siz.as_ref()
+                    .and_then(|siz| siz.components.first())
+                    .map(|c| c.precision).unwrap_or(0);
+                if let Some(qcd) = codestream.qcd.as_ref() {
+                    if let Ok(dequant_plan) = vk_j2k_dec::gpu::build_dequant_plan(
+                        &scatter_plan.planes, scatter_plan.output_coefficients,
+                        qcd, precision, cod.decomposition_levels,
+                    ) {
+                        let color_transform = if cod.multiple_component_transform != 0 { 2u32 } else { 0u32 };
+                        let compressed_words = merged.compressed_u32_words();
+                        if let Ok(bench) = vk_j2k_dec::vulkan::run_tier1_cleanup_scatter_rgb48_bench_97(
+                            actual_cleanup_shader, scatter_shader_path,
+                            dequant_shader_path, idwt97_offset_shader_path, color_float_shader_path,
+                            &adaptive_records, &compressed_words,
+                            &scatter_plan.records, &scatter_plan.planes,
+                            scatter_plan.output_coefficients,
+                            &dequant_plan.step_indices, &dequant_plan.steps,
+                            cod.decomposition_levels, color_transform, precision, iterations,
+                        ) {
+                            println!(
+                                "    full pipeline 9/7: {:.3} ms avg ({:.1} fps)",
+                                bench.decode_average_ms, 1000.0 / bench.decode_average_ms
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     ExitCode::SUCCESS

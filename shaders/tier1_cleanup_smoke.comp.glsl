@@ -41,6 +41,7 @@ layout(std430, set = 0, binding = 3) buffer CoefficientsOut {
 layout(push_constant) uniform PushConstants {
     uint codeblock_count;
     uint reconstruction_mode;
+    uint codeblock_offset;
 } pc;
 
 const uint MAX_COEFFS = 4096u;
@@ -588,6 +589,7 @@ void main() {
     if (codeblock_index >= pc.codeblock_count) {
         return;
     }
+    codeblock_index += pc.codeblock_offset;
 
     codeblock = codeblocks[codeblock_index];
     state_base = codeblock.coefficient_offset;

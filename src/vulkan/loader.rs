@@ -312,6 +312,7 @@ impl VulkanInstance {
             destroy_fence: self.load_device(device, "vkDestroyFence")?,
             queue_submit: self.load_device(device, "vkQueueSubmit")?,
             wait_for_fences: self.load_device(device, "vkWaitForFences")?,
+            reset_fences: self.load_device(device, "vkResetFences")?,
             device_wait_idle: self.load_device(device, "vkDeviceWaitIdle")?,
         };
 

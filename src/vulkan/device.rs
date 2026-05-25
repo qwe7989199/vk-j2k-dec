@@ -39,6 +39,7 @@ struct VulkanDeviceFunctions {
     destroy_fence: VkDestroyFence,
     queue_submit: VkQueueSubmit,
     wait_for_fences: VkWaitForFences,
+    reset_fences: VkResetFences,
     device_wait_idle: VkDeviceWaitIdle,
 }
 
@@ -690,23 +691,30 @@ impl VulkanDevice {
     }
 
     fn submit_and_wait(&self, command_buffer: VkCommandBuffer) -> Result<(), VulkanError> {
+        let fence = self.create_fence()?;
+        self.submit_with_fence(command_buffer, fence.handle)?;
+        self.wait_fence(fence.handle)
+    }
+
+    fn create_fence(&self) -> Result<FenceHandle, VulkanError> {
         let fence_info = VkFenceCreateInfo {
             s_type: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
             p_next: ptr::null(),
             flags: 0,
         };
-        let mut fence = 0usize;
+        let mut handle = 0usize;
         vk_check(
-            unsafe {
-                (self.functions.create_fence)(self.device, &fence_info, ptr::null(), &mut fence)
-            },
+            unsafe { (self.functions.create_fence)(self.device, &fence_info, ptr::null(), &mut handle) },
             "vkCreateFence",
         )?;
-        let _fence = FenceHandle {
+        Ok(FenceHandle {
             device: self.device,
             functions: self.functions,
-            handle: fence,
-        };
+            handle,
+        })
+    }
+
+    fn submit_with_fence(&self, command_buffer: VkCommandBuffer, fence: VkFence) -> Result<(), VulkanError> {
         let submit_info = VkSubmitInfo {
             s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
             p_next: ptr::null(),
@@ -721,10 +729,20 @@ impl VulkanDevice {
         vk_check(
             unsafe { (self.functions.queue_submit)(self.queue, 1, &submit_info, fence) },
             "vkQueueSubmit",
-        )?;
+        )
+    }
+
+    fn wait_fence(&self, fence: VkFence) -> Result<(), VulkanError> {
         vk_check(
             unsafe { (self.functions.wait_for_fences)(self.device, 1, &fence, 1, u64::MAX) },
             "vkWaitForFences",
+        )
+    }
+
+    fn reset_fence(&self, fence: VkFence) -> Result<(), VulkanError> {
+        vk_check(
+            unsafe { (self.functions.reset_fences)(self.device, 1, &fence) },
+            "vkResetFences",
         )
     }
 
@@ -958,10 +976,10 @@ impl Drop for CommandPoolHandle {
     }
 }
 
-struct FenceHandle {
+pub(crate) struct FenceHandle {
     device: VkDevice,
     functions: VulkanDeviceFunctions,
-    handle: VkFence,
+    pub(crate) handle: VkFence,
 }
 
 impl Drop for FenceHandle {

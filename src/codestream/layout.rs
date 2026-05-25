@@ -156,7 +156,7 @@ fn parse_com(marker_offset: usize, segment: &[u8]) -> Result<CommentSegment, Par
     })
 }
 
-fn component_layout(
+pub fn component_layout(
     component: &ComponentSpec,
     cod: &CodSegment,
     tile_x0: u32,
