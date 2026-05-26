@@ -462,19 +462,12 @@ pub fn parse_cprl_tile_packets(
         .unwrap_or(0);
 
     for (component_index, component) in tile_layout.components.iter().enumerate() {
-        let max_precincts_x: u32 = component.resolutions.iter().map(|r| r.precincts_x).max().unwrap_or(1);
-        let max_precincts_y: u32 = component.resolutions.iter().map(|r| r.precincts_y).max().unwrap_or(1);
-
-        for precinct_y in 0..max_precincts_y {
-            for precinct_x in 0..max_precincts_x {
-                for resolution_index in 0..max_resolutions {
-                    let Some(resolution) = component.resolutions.get(resolution_index) else {
-                        continue;
-                    };
-                    if precinct_x >= resolution.precincts_x || precinct_y >= resolution.precincts_y {
-                        continue;
-                    }
-
+        // Build precinct grid for each resolution
+        // Iterate positions by resolution order: for each precinct at each resolution
+        for resolution_index in 0..component.resolutions.len() {
+            let resolution = &component.resolutions[resolution_index];
+            for precinct_y in 0..resolution.precincts_y {
+                for precinct_x in 0..resolution.precincts_x {
                     for layer in 0..layers {
                         let packet_start = offset;
                         let mut reader = PacketHeaderBitReader::new(&tile_data[offset..]);
