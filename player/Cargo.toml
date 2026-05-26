@@ -6,4 +6,6 @@ edition = "2024"
 [dependencies]
 vk-j2k-dec = { path = "..", features = ["surface"] }
 winit = "0.30"
-softbuffer = "0.4"
+ash = { version = "0.38", features = ["linked"] }
+ash-window = "0.13"
+raw-window-handle = "0.6"

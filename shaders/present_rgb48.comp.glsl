@@ -2,19 +2,19 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(std430, set = 0, binding = 0) readonly buffer Rgb48Input {
-    uint rgb48_packed[];
-};
+    uint data[];
+} rgb48_buf;
 
 layout(rgba8, set = 0, binding = 1) writeonly uniform image2D output_image;
 
 layout(push_constant) uniform PushConstants {
     uint width;
     uint height;
-    uint transfer_func; // 0=linear, 1=sRGB gamma, 2=PQ (ST 2084)
+    uint transfer_func;
     uint _pad;
-    mat3 color_matrix;  // row-major 3x3
-    vec3 offset;        // pre-matrix offset (level shift)
-    float input_scale;  // normalization (e.g. 1.0/4095.0 or 1.0/65535.0)
+    float m0, m1, m2, m3, m4, m5, m6, m7, m8;
+    float off0, off1, off2;
+    float input_scale;
 } pc;
 
 float linear_to_srgb(float c) {
@@ -24,12 +24,10 @@ float linear_to_srgb(float c) {
         return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
 }
 
-float linear_to_pq(float c) {
-    float y = clamp(c, 0.0, 1.0);
-    float ym = pow(y, 0.1593017578125);
-    float num = 0.8359375 + 18.8515625 * ym;
-    float den = 1.0 + 18.6875 * ym;
-    return pow(num / den, 78.84375);
+uint read_u16(uint sample_index) {
+    uint word_index = sample_index >> 1;
+    uint word = rgb48_buf.data[word_index];
+    return ((sample_index & 1u) == 0u) ? (word & 0xFFFFu) : (word >> 16);
 }
 
 void main() {
@@ -38,35 +36,24 @@ void main() {
     if (x >= pc.width || y >= pc.height) return;
 
     uint pixel_index = y * pc.width + x;
-    // RGB48 packed as 2 pixels per 3 u32s (6 u16 samples = 3 u32 words)
-    uint pair_index = pixel_index / 2;
-    uint pair_offset = pair_index * 3;
-    uint word0 = rgb48_packed[pair_offset + 0];
-    uint word1 = rgb48_packed[pair_offset + 1];
-    uint word2 = rgb48_packed[pair_offset + 2];
+    uint sample_base = pixel_index * 3u;
 
-    float r, g, b;
-    if ((pixel_index & 1u) == 0u) {
-        r = float(word0 & 0xFFFFu);
-        g = float(word0 >> 16);
-        b = float(word1 & 0xFFFFu);
-    } else {
-        r = float(word1 >> 16);
-        g = float(word2 & 0xFFFFu);
-        b = float(word2 >> 16);
-    }
+    float r = float(read_u16(sample_base));
+    float g = float(read_u16(sample_base + 1u));
+    float b = float(read_u16(sample_base + 2u));
 
-    vec3 linear = (vec3(r, g, b) + pc.offset) * pc.input_scale;
-    linear = pc.color_matrix * linear;
-    linear = clamp(linear, 0.0, 1.0);
+    vec3 linear = (vec3(r, g, b) + vec3(pc.off0, pc.off1, pc.off2)) * pc.input_scale;
+    vec3 col;
+    col.r = pc.m0 * linear.r + pc.m1 * linear.g + pc.m2 * linear.b;
+    col.g = pc.m3 * linear.r + pc.m4 * linear.g + pc.m5 * linear.b;
+    col.b = pc.m6 * linear.r + pc.m7 * linear.g + pc.m8 * linear.b;
+    col = clamp(col, 0.0, 1.0);
 
     vec3 out_color;
     if (pc.transfer_func == 1u) {
-        out_color = vec3(linear_to_srgb(linear.r), linear_to_srgb(linear.g), linear_to_srgb(linear.b));
-    } else if (pc.transfer_func == 2u) {
-        out_color = vec3(linear_to_pq(linear.r), linear_to_pq(linear.g), linear_to_pq(linear.b));
+        out_color = vec3(linear_to_srgb(col.r), linear_to_srgb(col.g), linear_to_srgb(col.b));
     } else {
-        out_color = linear;
+        out_color = col;
     }
 
     imageStore(output_image, ivec2(x, y), vec4(out_color, 1.0));
