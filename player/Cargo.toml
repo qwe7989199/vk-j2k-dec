@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 vk-j2k-dec = { path = "..", features = ["surface"] }
 winit = "0.30"
+softbuffer = "0.4"
