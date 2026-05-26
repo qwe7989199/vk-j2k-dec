@@ -626,19 +626,78 @@ fn cprl_packet_sequence(
     component: &crate::codestream::TileComponentLayout,
     layers: u16,
 ) -> Vec<(usize, u32, u32, u16)> {
-    // Returns (resolution_index, precinct_x, precinct_y, layer)
-    // Many encoders emit CPRL as C → R(low→high) → P(raster) → L
-    // This matches the observed packet structure in real DCP content.
+    // ISO 15444-1 B.12.1.4 CPRL
+    // Position coordinates are in the reference grid (image coordinates).
+    // dx = min(precinct_width_r * 2^(NL-r)) for all r
+    // dy = min(precinct_height_r * 2^(NL-r)) for all r
+    // where NL = number of decomposition levels = num_resolutions - 1
+    //
+    // At position (x,y), resolution r has a packet if:
+    //   trx0 = ceil(tx0 / 2^(NL-r)), trx1 = ceil(tx1 / 2^(NL-r))
+    //   rpx = floor(trx0 / precinct_width_r)
+    //   precinct exists if floor(x / (precinct_width_r * 2^(NL-r))) matches a valid precinct
+
+    if component.resolutions.is_empty() {
+        return Vec::new();
+    }
+
+    let num_res = component.resolutions.len();
+    let nl = num_res - 1; // number of decomposition levels
+
+    // Compute step sizes in image (reference grid) coordinates
+    let mut step_x = u32::MAX;
+    let mut step_y = u32::MAX;
+    for r in 0..num_res {
+        let shift = nl - r;
+        let pw = component.resolutions[r].precinct_width;
+        let ph = component.resolutions[r].precinct_height;
+        let pw_img = pw.checked_shl(shift as u32).unwrap_or(u32::MAX);
+        let ph_img = ph.checked_shl(shift as u32).unwrap_or(u32::MAX);
+        if pw_img > 0 { step_x = step_x.min(pw_img); }
+        if ph_img > 0 { step_y = step_y.min(ph_img); }
+    }
+    if step_x == 0 || step_x == u32::MAX { step_x = 1; }
+    if step_y == 0 || step_y == u32::MAX { step_y = 1; }
+
+    let img_width = component.width;
+    let img_height = component.height;
+
     let mut sequence = Vec::new();
-    for (res_idx, resolution) in component.resolutions.iter().enumerate() {
-        for py in 0..resolution.precincts_y {
-            for px in 0..resolution.precincts_x {
+
+    let mut y = 0u32;
+    while y < img_height {
+        let mut x = 0u32;
+        while x < img_width {
+            for r in 0..num_res {
+                let shift = nl - r;
+                let pw = component.resolutions[r].precinct_width;
+                let ph = component.resolutions[r].precinct_height;
+                let pw_img = pw << shift;
+                let ph_img = ph << shift;
+
+                // Check if (x,y) is aligned to this resolution's precinct grid
+                if x % pw_img != 0 || y % ph_img != 0 {
+                    continue;
+                }
+
+                // Compute precinct index
+                let prec_x = (x / pw_img) as u32;
+                let prec_y = (y / ph_img) as u32;
+
+                let resolution = &component.resolutions[r];
+                if prec_x >= resolution.precincts_x || prec_y >= resolution.precincts_y {
+                    continue;
+                }
+
                 for layer in 0..layers {
-                    sequence.push((res_idx, px, py, layer));
+                    sequence.push((r, prec_x, prec_y, layer));
                 }
             }
+            x += step_x;
         }
+        y += step_y;
     }
+
     sequence
 }
 
@@ -683,12 +742,12 @@ fn precinct_codeblock_range_raw(
     if precincts_x <= 1 && precincts_y <= 1 {
         return (0, codeblocks_x, 0, codeblocks_y);
     }
-    let cblk_per_precinct_x = codeblocks_x.div_ceil(precincts_x);
-    let cblk_per_precinct_y = codeblocks_y.div_ceil(precincts_y);
-    let cb_x_start = precinct_x * cblk_per_precinct_x;
-    let cb_x_end = ((precinct_x + 1) * cblk_per_precinct_x).min(codeblocks_x);
-    let cb_y_start = precinct_y * cblk_per_precinct_y;
-    let cb_y_end = ((precinct_y + 1) * cblk_per_precinct_y).min(codeblocks_y);
+    let nominal_x = codeblocks_x.div_ceil(precincts_x);
+    let nominal_y = codeblocks_y.div_ceil(precincts_y);
+    let cb_x_start = (precinct_x * nominal_x).min(codeblocks_x);
+    let cb_x_end = ((precinct_x + 1) * nominal_x).min(codeblocks_x);
+    let cb_y_start = (precinct_y * nominal_y).min(codeblocks_y);
+    let cb_y_end = ((precinct_y + 1) * nominal_y).min(codeblocks_y);
     (cb_x_start, cb_x_end, cb_y_start, cb_y_end)
 }
 

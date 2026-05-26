@@ -4094,6 +4094,8 @@ fn idwt97_smoke_component() -> Result<ComponentSubbandPlanes, VulkanError> {
                 height: 2,
                 precincts_x: 1,
                 precincts_y: 1,
+                precinct_width: 32768,
+                precinct_height: 32768,
                 subbands: vec![SubbandLayout {
                     kind: SubbandKind::Ll,
                     width: 3,
@@ -4110,6 +4112,8 @@ fn idwt97_smoke_component() -> Result<ComponentSubbandPlanes, VulkanError> {
                 height: 4,
                 precincts_x: 1,
                 precincts_y: 1,
+                precinct_width: 32768,
+                precinct_height: 32768,
                 subbands: vec![
                     SubbandLayout {
                         kind: SubbandKind::Hl,
