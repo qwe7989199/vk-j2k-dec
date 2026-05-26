@@ -227,11 +227,18 @@ pub fn decode_rgb48_full_gpu(
     let height = siz.height;
 
     let mut all_plans = Vec::new();
+
+    // Group tile-parts by tile index and concatenate their data
+    let mut tile_data_map: std::collections::BTreeMap<u16, Vec<u8>> = std::collections::BTreeMap::new();
     for tile_part in &codestream.tile_parts {
-        let layout = layouts.iter().find(|l| l.tile_index == tile_part.tile_index)
-            .ok_or_else(|| DecodeError::new(format!("missing layout for tile {}", tile_part.tile_index)))?;
         let tile_data = data.get(tile_part.data_start..tile_part.data_end)
             .ok_or_else(|| DecodeError::new("tile data out of bounds"))?;
+        tile_data_map.entry(tile_part.tile_index).or_default().extend_from_slice(tile_data);
+    }
+
+    for (&tile_index, tile_data) in &tile_data_map {
+        let layout = layouts.iter().find(|l| l.tile_index == tile_index)
+            .ok_or_else(|| DecodeError::new(format!("missing layout for tile {tile_index}")))?;
         let packet_summary = parse_tile_packets(tile_data, layout, cod.layers, &cod.progression_order)
             .map_err(|e| DecodeError::new(e.to_string()))?;
         let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(

@@ -146,6 +146,8 @@ impl TilePacketHeaderState {
                         subband.kind,
                         subband.codeblocks_x,
                         subband.codeblocks_y,
+                        resolution.precincts_x,
+                        resolution.precincts_y,
                     ));
                 }
             }
@@ -185,9 +187,18 @@ pub struct SubbandPacketHeaderState {
     pub kind: SubbandKind,
     pub codeblocks_x: u32,
     pub codeblocks_y: u32,
-    pub inclusion_tree: TagTree,
-    pub zero_bit_plane_tree: TagTree,
+    pub precincts_x: u32,
+    pub precincts_y: u32,
+    precinct_trees: Vec<PrecinctTagTrees>,
     pub codeblocks: Vec<CodeblockHeaderState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrecinctTagTrees {
+    inclusion_tree: TagTree,
+    zero_bit_plane_tree: TagTree,
+    codeblocks_x: u32,
+    codeblocks_y: u32,
 }
 
 impl SubbandPacketHeaderState {
@@ -197,16 +208,38 @@ impl SubbandPacketHeaderState {
         kind: SubbandKind,
         codeblocks_x: u32,
         codeblocks_y: u32,
+        precincts_x: u32,
+        precincts_y: u32,
     ) -> Self {
         let codeblock_count = codeblocks_x.saturating_mul(codeblocks_y) as usize;
+        let precinct_count = precincts_x.saturating_mul(precincts_y) as usize;
+
+        let mut precinct_trees = Vec::with_capacity(precinct_count);
+        for py in 0..precincts_y {
+            for px in 0..precincts_x {
+                let (cx0, cx1, cy0, cy1) = precinct_codeblock_range_raw(
+                    codeblocks_x, codeblocks_y, precincts_x, precincts_y, px, py,
+                );
+                let pcb_x = cx1 - cx0;
+                let pcb_y = cy1 - cy0;
+                precinct_trees.push(PrecinctTagTrees {
+                    inclusion_tree: TagTree::new(pcb_x.max(1), pcb_y.max(1)),
+                    zero_bit_plane_tree: TagTree::new(pcb_x.max(1), pcb_y.max(1)),
+                    codeblocks_x: pcb_x,
+                    codeblocks_y: pcb_y,
+                });
+            }
+        }
+
         Self {
             component,
             resolution,
             kind,
             codeblocks_x,
             codeblocks_y,
-            inclusion_tree: TagTree::new(codeblocks_x.max(1), codeblocks_y.max(1)),
-            zero_bit_plane_tree: TagTree::new(codeblocks_x.max(1), codeblocks_y.max(1)),
+            precincts_x,
+            precincts_y,
+            precinct_trees,
             codeblocks: vec![CodeblockHeaderState::default(); codeblock_count],
         }
     }
@@ -235,6 +268,18 @@ impl SubbandPacketHeaderState {
         codeblock_x: u32,
         codeblock_y: u32,
     ) -> Result<Option<CodeblockPacketHeader>, PacketBitError> {
+        self.decode_codeblock_in_precinct(reader, layer, codeblock_x, codeblock_y, 0, 0)
+    }
+
+    pub fn decode_codeblock_in_precinct(
+        &mut self,
+        reader: &mut PacketHeaderBitReader<'_>,
+        layer: u16,
+        codeblock_x: u32,
+        codeblock_y: u32,
+        precinct_x: u32,
+        precinct_y: u32,
+    ) -> Result<Option<CodeblockPacketHeader>, PacketBitError> {
         if codeblock_x >= self.codeblocks_x || codeblock_y >= self.codeblocks_y {
             return Err(PacketBitError::new(
                 reader.consumed_bytes(),
@@ -245,15 +290,26 @@ impl SubbandPacketHeaderState {
             ));
         }
 
-        let index = (codeblock_y * self.codeblocks_x + codeblock_x) as usize;
+        let precinct_index = (precinct_y * self.precincts_x + precinct_x) as usize;
+        let trees = &mut self.precinct_trees[precinct_index];
+
+        let (cx0, _, cy0, _) = precinct_codeblock_range_raw(
+            self.codeblocks_x, self.codeblocks_y,
+            self.precincts_x, self.precincts_y,
+            precinct_x, precinct_y,
+        );
+        let local_x = codeblock_x - cx0;
+        let local_y = codeblock_y - cy0;
+
+        let global_index = (codeblock_y * self.codeblocks_x + codeblock_x) as usize;
         decode_codeblock_packet_header(
             reader,
-            &mut self.codeblocks[index],
-            &mut self.inclusion_tree,
-            &mut self.zero_bit_plane_tree,
+            &mut self.codeblocks[global_index],
+            &mut trees.inclusion_tree,
+            &mut trees.zero_bit_plane_tree,
             layer,
-            codeblock_x,
-            codeblock_y,
+            local_x,
+            local_y,
         )
     }
 }
@@ -454,115 +510,109 @@ pub fn parse_cprl_tile_packets(
     let mut packets = Vec::new();
     let mut offset = 0;
 
-    let max_resolutions = tile_layout
-        .components
-        .iter()
-        .map(|c| c.resolutions.len())
-        .max()
-        .unwrap_or(0);
-
     for (component_index, component) in tile_layout.components.iter().enumerate() {
-        // Build precinct grid for each resolution
-        // Iterate positions by resolution order: for each precinct at each resolution
-        for resolution_index in 0..component.resolutions.len() {
-            let resolution = &component.resolutions[resolution_index];
-            for precinct_y in 0..resolution.precincts_y {
-                for precinct_x in 0..resolution.precincts_x {
-                    for layer in 0..layers {
-                        let packet_start = offset;
-                        let mut reader = PacketHeaderBitReader::new(&tile_data[offset..]);
-                        let present = reader.read_bit()?;
-                        let mut body_bytes = 0usize;
-                        let mut segments = Vec::new();
+        // Generate the CPRL packet sequence for this component.
+        // CPRL = Component → Position → Resolution → Layer
+        // "Position" iterates over spatial coordinates with step = smallest precinct size.
+        // At each position, emit packets for resolutions whose precinct contains that position.
+        let packet_sequence = cprl_packet_sequence(component, layers);
 
-                        if present {
-                            for subband in &resolution.subbands {
-                                let subband_state = state
-                                    .subband_mut(component_index as u16, resolution.level, subband.kind)
+        for (res_idx, prec_x, prec_y, layer) in packet_sequence {
+            let resolution = &component.resolutions[res_idx];
+
+            let packet_start = offset;
+            let mut reader = PacketHeaderBitReader::new(&tile_data[offset..]);
+            let present = reader.read_bit()?;
+            let mut body_bytes = 0usize;
+            let mut segments = Vec::new();
+
+            if present {
+                for subband in &resolution.subbands {
+                    let subband_state = state
+                        .subband_mut(component_index as u16, resolution.level, subband.kind)
+                        .ok_or_else(|| {
+                            PacketBitError::new(
+                                offset + reader.consumed_bytes(),
+                                "missing packet header subband state",
+                            )
+                        })?;
+
+                    let (cb_x_start, cb_x_end, cb_y_start, cb_y_end) =
+                        precinct_codeblock_range(subband, prec_x, prec_y, resolution);
+
+                    for codeblock_y in cb_y_start..cb_y_end {
+                        for codeblock_x in cb_x_start..cb_x_end {
+                            if let Some(header) = subband_state.decode_codeblock_in_precinct(
+                                &mut reader,
+                                layer,
+                                codeblock_x,
+                                codeblock_y,
+                                prec_x,
+                                prec_y,
+                            )? {
+                                let body_offset = body_bytes;
+                                body_bytes = body_bytes
+                                    .checked_add(header.byte_len as usize)
                                     .ok_or_else(|| {
                                         PacketBitError::new(
                                             offset + reader.consumed_bytes(),
-                                            "missing packet header subband state",
+                                            "packet body length overflow",
                                         )
                                     })?;
-
-                                let (cb_x_start, cb_x_end, cb_y_start, cb_y_end) =
-                                    precinct_codeblock_range(subband, precinct_x, precinct_y, resolution);
-
-                                for codeblock_y in cb_y_start..cb_y_end {
-                                    for codeblock_x in cb_x_start..cb_x_end {
-                                        if let Some(header) = subband_state.decode_codeblock(
-                                            &mut reader,
-                                            layer,
-                                            codeblock_x,
-                                            codeblock_y,
-                                        )? {
-                                            let body_offset = body_bytes;
-                                            body_bytes = body_bytes
-                                                .checked_add(header.byte_len as usize)
-                                                .ok_or_else(|| {
-                                                    PacketBitError::new(
-                                                        offset + reader.consumed_bytes(),
-                                                        "packet body length overflow",
-                                                    )
-                                                })?;
-                                            segments.push(CodeblockSegmentRecord {
-                                                component: component_index as u16,
-                                                resolution: resolution.level,
-                                                subband: subband.kind,
-                                                codeblock_x,
-                                                codeblock_y,
-                                                codeblock_width: codeblock_extent(
-                                                    subband.width,
-                                                    subband.codeblock_width,
-                                                    codeblock_x,
-                                                ),
-                                                codeblock_height: codeblock_extent(
-                                                    subband.height,
-                                                    subband.codeblock_height,
-                                                    codeblock_y,
-                                                ),
-                                                newly_included: header.newly_included,
-                                                zero_bit_planes: header.zero_bit_planes,
-                                                coding_passes: header.coding_passes,
-                                                body_offset,
-                                                byte_len: header.byte_len as usize,
-                                            });
-                                        }
-                                    }
-                                }
+                                segments.push(CodeblockSegmentRecord {
+                                    component: component_index as u16,
+                                    resolution: resolution.level,
+                                    subband: subband.kind,
+                                    codeblock_x,
+                                    codeblock_y,
+                                    codeblock_width: codeblock_extent(
+                                        subband.width,
+                                        subband.codeblock_width,
+                                        codeblock_x,
+                                    ),
+                                    codeblock_height: codeblock_extent(
+                                        subband.height,
+                                        subband.codeblock_height,
+                                        codeblock_y,
+                                    ),
+                                    newly_included: header.newly_included,
+                                    zero_bit_planes: header.zero_bit_planes,
+                                    coding_passes: header.coding_passes,
+                                    body_offset,
+                                    byte_len: header.byte_len as usize,
+                                });
                             }
                         }
-
-                        reader.byte_align();
-                        let header_bytes = reader.consumed_bytes();
-                        for segment in &mut segments {
-                            segment.body_offset += packet_start + header_bytes;
-                        }
-                        offset = offset
-                            .checked_add(header_bytes)
-                            .and_then(|v| v.checked_add(body_bytes))
-                            .ok_or_else(|| PacketBitError::new(packet_start, "packet length overflow"))?;
-                        if offset > tile_data.len() {
-                            return Err(PacketBitError::new(
-                                packet_start,
-                                "packet extends past tile-part payload",
-                            ));
-                        }
-
-                        packets.push(PacketParseRecord {
-                            offset: packet_start,
-                            layer,
-                            resolution: resolution.level,
-                            component: component_index as u16,
-                            present,
-                            header_bytes,
-                            body_bytes,
-                            segments,
-                        });
                     }
                 }
             }
+
+            reader.byte_align();
+            let header_bytes = reader.consumed_bytes();
+            for segment in &mut segments {
+                segment.body_offset += packet_start + header_bytes;
+            }
+            offset = offset
+                .checked_add(header_bytes)
+                .and_then(|v| v.checked_add(body_bytes))
+                .ok_or_else(|| PacketBitError::new(packet_start, "packet length overflow"))?;
+            if offset > tile_data.len() {
+                return Err(PacketBitError::new(
+                    packet_start,
+                    "packet extends past tile-part payload",
+                ));
+            }
+
+            packets.push(PacketParseRecord {
+                offset: packet_start,
+                layer,
+                resolution: resolution.level,
+                component: component_index as u16,
+                present,
+                header_bytes,
+                body_bytes,
+                segments,
+            });
         }
     }
 
@@ -570,6 +620,26 @@ pub fn parse_cprl_tile_packets(
         packets,
         consumed_bytes: offset,
     })
+}
+
+fn cprl_packet_sequence(
+    component: &crate::codestream::TileComponentLayout,
+    layers: u16,
+) -> Vec<(usize, u32, u32, u16)> {
+    // Returns (resolution_index, precinct_x, precinct_y, layer)
+    // Many encoders emit CPRL as C → R(low→high) → P(raster) → L
+    // This matches the observed packet structure in real DCP content.
+    let mut sequence = Vec::new();
+    for (res_idx, resolution) in component.resolutions.iter().enumerate() {
+        for py in 0..resolution.precincts_y {
+            for px in 0..resolution.precincts_x {
+                for layer in 0..layers {
+                    sequence.push((res_idx, px, py, layer));
+                }
+            }
+        }
+    }
+    sequence
 }
 
 pub fn parse_tile_packets(
@@ -595,15 +665,30 @@ fn precinct_codeblock_range(
     precinct_y: u32,
     resolution: &crate::codestream::ResolutionLayout,
 ) -> (u32, u32, u32, u32) {
-    if resolution.precincts_x == 1 && resolution.precincts_y == 1 {
-        return (0, subband.codeblocks_x, 0, subband.codeblocks_y);
+    precinct_codeblock_range_raw(
+        subband.codeblocks_x, subband.codeblocks_y,
+        resolution.precincts_x, resolution.precincts_y,
+        precinct_x, precinct_y,
+    )
+}
+
+fn precinct_codeblock_range_raw(
+    codeblocks_x: u32,
+    codeblocks_y: u32,
+    precincts_x: u32,
+    precincts_y: u32,
+    precinct_x: u32,
+    precinct_y: u32,
+) -> (u32, u32, u32, u32) {
+    if precincts_x <= 1 && precincts_y <= 1 {
+        return (0, codeblocks_x, 0, codeblocks_y);
     }
-    let cblk_per_precinct_x = subband.codeblocks_x.div_ceil(resolution.precincts_x);
-    let cblk_per_precinct_y = subband.codeblocks_y.div_ceil(resolution.precincts_y);
+    let cblk_per_precinct_x = codeblocks_x.div_ceil(precincts_x);
+    let cblk_per_precinct_y = codeblocks_y.div_ceil(precincts_y);
     let cb_x_start = precinct_x * cblk_per_precinct_x;
-    let cb_x_end = ((precinct_x + 1) * cblk_per_precinct_x).min(subband.codeblocks_x);
+    let cb_x_end = ((precinct_x + 1) * cblk_per_precinct_x).min(codeblocks_x);
     let cb_y_start = precinct_y * cblk_per_precinct_y;
-    let cb_y_end = ((precinct_y + 1) * cblk_per_precinct_y).min(subband.codeblocks_y);
+    let cb_y_end = ((precinct_y + 1) * cblk_per_precinct_y).min(codeblocks_y);
     (cb_x_start, cb_x_end, cb_y_start, cb_y_end)
 }
 
