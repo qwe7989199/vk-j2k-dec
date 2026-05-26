@@ -214,7 +214,7 @@ pub fn decode_rgb48_full_gpu(
     color_shader_path: &str,
 ) -> Result<DecodedRgb48, DecodeError> {
     use crate::gpu::{GpuTier1Plan, sort_codeblock_records_by_descending_work};
-    use crate::packet::parse_lrcp_tile_packets;
+    use crate::packet::{parse_tile_packets, parse_lrcp_tile_packets};
     use crate::tier1::Tier1WorkPlan;
 
     let codestream = Codestream::parse(data).map_err(|e| DecodeError::new(e.to_string()))?;
@@ -232,7 +232,7 @@ pub fn decode_rgb48_full_gpu(
             .ok_or_else(|| DecodeError::new(format!("missing layout for tile {}", tile_part.tile_index)))?;
         let tile_data = data.get(tile_part.data_start..tile_part.data_end)
             .ok_or_else(|| DecodeError::new("tile data out of bounds"))?;
-        let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers)
+        let packet_summary = parse_tile_packets(tile_data, layout, cod.layers, &cod.progression_order)
             .map_err(|e| DecodeError::new(e.to_string()))?;
         let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
             &packet_summary, codestream.qcd.as_ref(), &codestream.qccs,

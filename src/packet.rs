@@ -445,6 +445,175 @@ pub fn parse_lrcp_tile_packets(
     })
 }
 
+pub fn parse_cprl_tile_packets(
+    tile_data: &[u8],
+    tile_layout: &TileLayout,
+    layers: u16,
+) -> Result<TilePacketParseSummary, PacketBitError> {
+    let mut state = TilePacketHeaderState::from_tile_layout(tile_layout);
+    let mut packets = Vec::new();
+    let mut offset = 0;
+
+    let max_resolutions = tile_layout
+        .components
+        .iter()
+        .map(|c| c.resolutions.len())
+        .max()
+        .unwrap_or(0);
+
+    for (component_index, component) in tile_layout.components.iter().enumerate() {
+        let max_precincts_x: u32 = component.resolutions.iter().map(|r| r.precincts_x).max().unwrap_or(1);
+        let max_precincts_y: u32 = component.resolutions.iter().map(|r| r.precincts_y).max().unwrap_or(1);
+
+        for precinct_y in 0..max_precincts_y {
+            for precinct_x in 0..max_precincts_x {
+                for resolution_index in 0..max_resolutions {
+                    let Some(resolution) = component.resolutions.get(resolution_index) else {
+                        continue;
+                    };
+                    if precinct_x >= resolution.precincts_x || precinct_y >= resolution.precincts_y {
+                        continue;
+                    }
+
+                    for layer in 0..layers {
+                        let packet_start = offset;
+                        let mut reader = PacketHeaderBitReader::new(&tile_data[offset..]);
+                        let present = reader.read_bit()?;
+                        let mut body_bytes = 0usize;
+                        let mut segments = Vec::new();
+
+                        if present {
+                            for subband in &resolution.subbands {
+                                let subband_state = state
+                                    .subband_mut(component_index as u16, resolution.level, subband.kind)
+                                    .ok_or_else(|| {
+                                        PacketBitError::new(
+                                            offset + reader.consumed_bytes(),
+                                            "missing packet header subband state",
+                                        )
+                                    })?;
+
+                                let (cb_x_start, cb_x_end, cb_y_start, cb_y_end) =
+                                    precinct_codeblock_range(subband, precinct_x, precinct_y, resolution);
+
+                                for codeblock_y in cb_y_start..cb_y_end {
+                                    for codeblock_x in cb_x_start..cb_x_end {
+                                        if let Some(header) = subband_state.decode_codeblock(
+                                            &mut reader,
+                                            layer,
+                                            codeblock_x,
+                                            codeblock_y,
+                                        )? {
+                                            let body_offset = body_bytes;
+                                            body_bytes = body_bytes
+                                                .checked_add(header.byte_len as usize)
+                                                .ok_or_else(|| {
+                                                    PacketBitError::new(
+                                                        offset + reader.consumed_bytes(),
+                                                        "packet body length overflow",
+                                                    )
+                                                })?;
+                                            segments.push(CodeblockSegmentRecord {
+                                                component: component_index as u16,
+                                                resolution: resolution.level,
+                                                subband: subband.kind,
+                                                codeblock_x,
+                                                codeblock_y,
+                                                codeblock_width: codeblock_extent(
+                                                    subband.width,
+                                                    subband.codeblock_width,
+                                                    codeblock_x,
+                                                ),
+                                                codeblock_height: codeblock_extent(
+                                                    subband.height,
+                                                    subband.codeblock_height,
+                                                    codeblock_y,
+                                                ),
+                                                newly_included: header.newly_included,
+                                                zero_bit_planes: header.zero_bit_planes,
+                                                coding_passes: header.coding_passes,
+                                                body_offset,
+                                                byte_len: header.byte_len as usize,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        reader.byte_align();
+                        let header_bytes = reader.consumed_bytes();
+                        for segment in &mut segments {
+                            segment.body_offset += packet_start + header_bytes;
+                        }
+                        offset = offset
+                            .checked_add(header_bytes)
+                            .and_then(|v| v.checked_add(body_bytes))
+                            .ok_or_else(|| PacketBitError::new(packet_start, "packet length overflow"))?;
+                        if offset > tile_data.len() {
+                            return Err(PacketBitError::new(
+                                packet_start,
+                                "packet extends past tile-part payload",
+                            ));
+                        }
+
+                        packets.push(PacketParseRecord {
+                            offset: packet_start,
+                            layer,
+                            resolution: resolution.level,
+                            component: component_index as u16,
+                            present,
+                            header_bytes,
+                            body_bytes,
+                            segments,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(TilePacketParseSummary {
+        packets,
+        consumed_bytes: offset,
+    })
+}
+
+pub fn parse_tile_packets(
+    tile_data: &[u8],
+    tile_layout: &TileLayout,
+    layers: u16,
+    progression: &crate::codestream::ProgressionOrder,
+) -> Result<TilePacketParseSummary, PacketBitError> {
+    use crate::codestream::ProgressionOrder;
+    match progression {
+        ProgressionOrder::Lrcp => parse_lrcp_tile_packets(tile_data, tile_layout, layers),
+        ProgressionOrder::Cprl => parse_cprl_tile_packets(tile_data, tile_layout, layers),
+        other => Err(PacketBitError::new(
+            0,
+            format!("unsupported progression order {other}"),
+        )),
+    }
+}
+
+fn precinct_codeblock_range(
+    subband: &crate::codestream::SubbandLayout,
+    precinct_x: u32,
+    precinct_y: u32,
+    resolution: &crate::codestream::ResolutionLayout,
+) -> (u32, u32, u32, u32) {
+    if resolution.precincts_x == 1 && resolution.precincts_y == 1 {
+        return (0, subband.codeblocks_x, 0, subband.codeblocks_y);
+    }
+    let cblk_per_precinct_x = subband.codeblocks_x.div_ceil(resolution.precincts_x);
+    let cblk_per_precinct_y = subband.codeblocks_y.div_ceil(resolution.precincts_y);
+    let cb_x_start = precinct_x * cblk_per_precinct_x;
+    let cb_x_end = ((precinct_x + 1) * cblk_per_precinct_x).min(subband.codeblocks_x);
+    let cb_y_start = precinct_y * cblk_per_precinct_y;
+    let cb_y_end = ((precinct_y + 1) * cblk_per_precinct_y).min(subband.codeblocks_y);
+    (cb_x_start, cb_x_end, cb_y_start, cb_y_end)
+}
+
 fn codeblock_extent(subband_extent: u32, nominal_extent: u32, codeblock_index: u32) -> u32 {
     let start = codeblock_index.saturating_mul(nominal_extent);
     subband_extent.saturating_sub(start).min(nominal_extent)
