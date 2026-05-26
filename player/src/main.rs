@@ -1,6 +1,7 @@
 mod color_space;
 mod frame_clock;
 mod frame_reader;
+mod gpu_decode;
 mod presenter;
 
 use std::env;
@@ -16,6 +17,7 @@ use winit::window::{Window, WindowId};
 use color_space::{ColorConfig, ColorSpace};
 use frame_clock::FrameClock;
 use frame_reader::FrameReader;
+use gpu_decode::GpuDecoder;
 use presenter::{PresentPushConstants, VulkanPresenter};
 
 fn main() -> ExitCode {
@@ -103,6 +105,7 @@ struct PlayerApp {
 struct PlayerState {
     window: Arc<Window>,
     presenter: VulkanPresenter,
+    gpu_decoder: GpuDecoder,
     frame_reader: Option<FrameReader>,
     single_frame: Option<Vec<u8>>,
     clock: FrameClock,
@@ -167,6 +170,11 @@ impl ApplicationHandler for PlayerApp {
             Err(e) => { eprintln!("vulkan error: {e}"); event_loop.exit(); return; }
         };
 
+        let gpu_decoder = match GpuDecoder::new() {
+            Ok(d) => d,
+            Err(e) => { eprintln!("gpu decoder init error: {e}"); event_loop.exit(); return; }
+        };
+
         let push_constants = PresentPushConstants {
             width,
             height,
@@ -178,13 +186,14 @@ impl ApplicationHandler for PlayerApp {
         };
 
         // Decode and upload first frame
-        if let Ok(decoded) = vk_j2k_dec::decode::decode_rgb48(&first_frame) {
+        if let Ok(decoded) = gpu_decoder.decode(&first_frame) {
             unsafe { presenter.upload_rgb48(&decoded.samples); }
         }
 
         self.state = Some(PlayerState {
             window,
             presenter,
+            gpu_decoder,
             frame_reader,
             single_frame,
             clock: FrameClock::new(self.fps),
@@ -223,7 +232,7 @@ impl ApplicationHandler for PlayerApp {
                     };
 
                     if let Some(frame_bytes) = next_bytes {
-                        if let Ok(decoded) = vk_j2k_dec::decode::decode_rgb48(&frame_bytes) {
+                        if let Ok(decoded) = state.gpu_decoder.decode(&frame_bytes) {
                             unsafe { state.presenter.upload_rgb48(&decoded.samples); }
                             state.decoded_count += 1;
                         }
