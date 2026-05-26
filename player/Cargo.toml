@@ -1,0 +1,8 @@
+[package]
+name = "vk-j2k-player"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+vk-j2k-dec = { path = "..", features = ["surface"] }
+winit = "0.30"
