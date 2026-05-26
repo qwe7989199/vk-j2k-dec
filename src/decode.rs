@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::codestream::{Codestream, WaveletTransform};
+use crate::codestream::{Codestream, WaveletTransform, component_layout};
 use crate::color::{
     ColorError, inverse_ict_sample, inverse_rct_sample, level_shift_and_clamp,
     level_shift_and_clamp_float,
@@ -204,6 +204,87 @@ pub fn decode_rgb48_with_persistent_gpu_pipeline_profiled(
         DwtBackend::PersistentGpu { pipeline },
         ColorBackend::Cpu,
     )
+}
+
+pub fn decode_rgb48_full_gpu(
+    data: &[u8],
+    cleanup_shader_path: &str,
+    scatter_shader_path: &str,
+    idwt_shader_path: &str,
+    color_shader_path: &str,
+) -> Result<DecodedRgb48, DecodeError> {
+    use crate::gpu::{GpuTier1Plan, sort_codeblock_records_by_descending_work};
+    use crate::packet::parse_lrcp_tile_packets;
+    use crate::tier1::Tier1WorkPlan;
+
+    let codestream = Codestream::parse(data).map_err(|e| DecodeError::new(e.to_string()))?;
+    let cod = codestream.cod.as_ref().ok_or_else(|| DecodeError::new("missing COD"))?;
+    let siz = codestream.siz.as_ref().ok_or_else(|| DecodeError::new("missing SIZ"))?;
+    let layouts = codestream.tile_layouts().map_err(|e| DecodeError::new(e.to_string()))?;
+
+    let precision = siz.components.first().map(|c| c.precision).unwrap_or(12);
+    let width = siz.width;
+    let height = siz.height;
+
+    let mut all_plans = Vec::new();
+    for tile_part in &codestream.tile_parts {
+        let layout = layouts.iter().find(|l| l.tile_index == tile_part.tile_index)
+            .ok_or_else(|| DecodeError::new(format!("missing layout for tile {}", tile_part.tile_index)))?;
+        let tile_data = data.get(tile_part.data_start..tile_part.data_end)
+            .ok_or_else(|| DecodeError::new("tile data out of bounds"))?;
+        let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers)
+            .map_err(|e| DecodeError::new(e.to_string()))?;
+        let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
+            &packet_summary, codestream.qcd.as_ref(), &codestream.qccs,
+        ).map_err(|e| DecodeError::new(e.to_string()))?;
+        let bound = work_plan.bind_segment_data(tile_data)
+            .map_err(|e| DecodeError::new(e.to_string()))?;
+        let plan = GpuTier1Plan::from_bound_work_plan(&bound, cod.codeblock_style_flags())
+            .map_err(|e| DecodeError::new(e.to_string()))?;
+        all_plans.push(plan);
+    }
+
+    let merged = GpuTier1Plan::merge(&all_plans);
+    let reconstruction_mode = match cod.transform {
+        WaveletTransform::Reversible53 => 0u32,
+        _ => 1u32,
+    };
+    let mut records = merged.codeblock_records_with_reconstruction(reconstruction_mode);
+    sort_codeblock_records_by_descending_work(&mut records);
+    let compressed_words = merged.compressed_u32_words();
+
+    let scatter_plan = if layouts.len() == 1 {
+        merged.scatter_plan(&layouts[0].components)
+    } else {
+        let full_layouts: Vec<_> = siz.components.iter().map(|comp| {
+            component_layout(comp, cod, siz.x_origin, siz.y_origin, siz.width, siz.height)
+        }).collect();
+        GpuTier1Plan::scatter_plan_multi_tile(&merged, &all_plans, &layouts, &full_layouts)
+    }.map_err(|e| DecodeError::new(e.to_string()))?;
+
+    let color_transform = if cod.multiple_component_transform != 0 { 1u32 } else { 0u32 };
+
+    let result = crate::vulkan::run_tier1_cleanup_scatter_rgb48_smoke(
+        cleanup_shader_path,
+        scatter_shader_path,
+        idwt_shader_path,
+        color_shader_path,
+        &records,
+        &compressed_words,
+        &scatter_plan.records,
+        &scatter_plan.planes,
+        scatter_plan.output_coefficients,
+        cod.decomposition_levels,
+        color_transform,
+        precision,
+    ).map_err(|e| DecodeError::new(e.to_string()))?;
+
+    Ok(DecodedRgb48 {
+        width,
+        height,
+        precision,
+        samples: result.samples,
+    })
 }
 
 pub fn decode_coefficient_planes(data: &[u8]) -> Result<DecodedCoefficientPlanes, DecodeError> {
