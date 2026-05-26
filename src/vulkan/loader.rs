@@ -41,8 +41,17 @@ impl VulkanLoader {
     }
 
     fn create_instance(&self) -> Result<VulkanInstance, VulkanError> {
+        self.create_instance_with_extensions(&[])
+    }
+
+    fn create_instance_with_extensions(
+        &self,
+        extensions: &[&CStr],
+    ) -> Result<VulkanInstance, VulkanError> {
         let vk_create_instance = self.load::<VkCreateInstance>(0, "vkCreateInstance")?;
         let app_name = CString::new("vk-j2k-dec").expect("static string");
+        let extension_ptrs: Vec<*const c_char> =
+            extensions.iter().map(|ext| ext.as_ptr()).collect();
         let app_info = VkApplicationInfo {
             s_type: VK_STRUCTURE_TYPE_APPLICATION_INFO,
             p_next: ptr::null(),
@@ -59,8 +68,12 @@ impl VulkanLoader {
             p_application_info: &app_info,
             enabled_layer_count: 0,
             pp_enabled_layer_names: ptr::null(),
-            enabled_extension_count: 0,
-            pp_enabled_extension_names: ptr::null(),
+            enabled_extension_count: extension_ptrs.len() as u32,
+            pp_enabled_extension_names: if extension_ptrs.is_empty() {
+                ptr::null()
+            } else {
+                extension_ptrs.as_ptr()
+            },
         };
         let mut instance = 0usize;
         let status = unsafe { vk_create_instance(&create_info, ptr::null(), &mut instance) };
@@ -265,6 +278,151 @@ impl VulkanInstance {
         if status != VK_SUCCESS {
             return Err(VulkanError::new(format!(
                 "vkCreateDevice failed with status {status}"
+            )));
+        }
+
+        let functions = VulkanDeviceFunctions {
+            destroy_device: self.load_device(device, "vkDestroyDevice")?,
+            get_device_queue: self.load_device(device, "vkGetDeviceQueue")?,
+            create_buffer: self.load_device(device, "vkCreateBuffer")?,
+            destroy_buffer: self.load_device(device, "vkDestroyBuffer")?,
+            get_buffer_memory_requirements: self
+                .load_device(device, "vkGetBufferMemoryRequirements")?,
+            allocate_memory: self.load_device(device, "vkAllocateMemory")?,
+            free_memory: self.load_device(device, "vkFreeMemory")?,
+            bind_buffer_memory: self.load_device(device, "vkBindBufferMemory")?,
+            map_memory: self.load_device(device, "vkMapMemory")?,
+            unmap_memory: self.load_device(device, "vkUnmapMemory")?,
+            invalidate_mapped_memory_ranges: self
+                .load_device(device, "vkInvalidateMappedMemoryRanges")?,
+            flush_mapped_memory_ranges: self.load_device(device, "vkFlushMappedMemoryRanges")?,
+            create_shader_module: self.load_device(device, "vkCreateShaderModule")?,
+            destroy_shader_module: self.load_device(device, "vkDestroyShaderModule")?,
+            create_descriptor_set_layout: self
+                .load_device(device, "vkCreateDescriptorSetLayout")?,
+            destroy_descriptor_set_layout: self
+                .load_device(device, "vkDestroyDescriptorSetLayout")?,
+            create_pipeline_layout: self.load_device(device, "vkCreatePipelineLayout")?,
+            destroy_pipeline_layout: self.load_device(device, "vkDestroyPipelineLayout")?,
+            create_compute_pipelines: self.load_device(device, "vkCreateComputePipelines")?,
+            destroy_pipeline: self.load_device(device, "vkDestroyPipeline")?,
+            create_descriptor_pool: self.load_device(device, "vkCreateDescriptorPool")?,
+            destroy_descriptor_pool: self.load_device(device, "vkDestroyDescriptorPool")?,
+            allocate_descriptor_sets: self.load_device(device, "vkAllocateDescriptorSets")?,
+            update_descriptor_sets: self.load_device(device, "vkUpdateDescriptorSets")?,
+            create_command_pool: self.load_device(device, "vkCreateCommandPool")?,
+            destroy_command_pool: self.load_device(device, "vkDestroyCommandPool")?,
+            allocate_command_buffers: self.load_device(device, "vkAllocateCommandBuffers")?,
+            begin_command_buffer: self.load_device(device, "vkBeginCommandBuffer")?,
+            end_command_buffer: self.load_device(device, "vkEndCommandBuffer")?,
+            cmd_bind_pipeline: self.load_device(device, "vkCmdBindPipeline")?,
+            cmd_bind_descriptor_sets: self.load_device(device, "vkCmdBindDescriptorSets")?,
+            cmd_push_constants: self.load_device(device, "vkCmdPushConstants")?,
+            cmd_dispatch: self.load_device(device, "vkCmdDispatch")?,
+            cmd_copy_buffer: self.load_device(device, "vkCmdCopyBuffer")?,
+            cmd_pipeline_barrier: self.load_device(device, "vkCmdPipelineBarrier")?,
+            create_fence: self.load_device(device, "vkCreateFence")?,
+            destroy_fence: self.load_device(device, "vkDestroyFence")?,
+            queue_submit: self.load_device(device, "vkQueueSubmit")?,
+            wait_for_fences: self.load_device(device, "vkWaitForFences")?,
+            reset_fences: self.load_device(device, "vkResetFences")?,
+            device_wait_idle: self.load_device(device, "vkDeviceWaitIdle")?,
+        };
+
+        let mut queue = 0usize;
+        unsafe {
+            (functions.get_device_queue)(device, queue_family_index, 0, &mut queue);
+        }
+        let mut memory_properties =
+            unsafe { std::mem::zeroed::<VkPhysicalDeviceMemoryProperties>() };
+        unsafe {
+            (self.get_physical_device_memory_properties)(physical_device, &mut memory_properties);
+        }
+
+        Ok(VulkanDevice {
+            device,
+            queue,
+            functions,
+            memory_properties,
+        })
+    }
+
+    #[cfg(feature = "surface")]
+    fn select_graphics_compute_device(
+        &self,
+    ) -> Result<(VkPhysicalDevice, VulkanDeviceSummary), VulkanError> {
+        let mut count = 0u32;
+        let status = unsafe {
+            (self.enumerate_physical_devices)(self.instance, &mut count, ptr::null_mut())
+        };
+        if status != VK_SUCCESS {
+            return Err(VulkanError::new(format!(
+                "vkEnumeratePhysicalDevices failed with status {status}"
+            )));
+        }
+        let mut devices = vec![0usize; count as usize];
+        let status = unsafe {
+            (self.enumerate_physical_devices)(self.instance, &mut count, devices.as_mut_ptr())
+        };
+        if status != VK_SUCCESS {
+            return Err(VulkanError::new(format!(
+                "vkEnumeratePhysicalDevices failed with status {status}"
+            )));
+        }
+
+        devices
+            .into_iter()
+            .take(count as usize)
+            .filter_map(|device| {
+                let summary = self.device_summary(device).ok()?;
+                if summary.first_graphics_compute_queue_family().is_some() {
+                    Some((device, summary))
+                } else {
+                    None
+                }
+            })
+            .min_by_key(|(_, summary)| summary.device_type != VulkanDeviceType::DiscreteGpu)
+            .ok_or_else(|| {
+                VulkanError::new("no Vulkan device with graphics+compute queue found")
+            })
+    }
+
+    #[cfg(feature = "surface")]
+    fn create_presentation_device(
+        &self,
+        physical_device: VkPhysicalDevice,
+        queue_family_index: u32,
+    ) -> Result<VulkanDevice, VulkanError> {
+        let priority = 1.0f32;
+        let queue_create_info = VkDeviceQueueCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: 0,
+            queue_family_index,
+            queue_count: 1,
+            p_queue_priorities: &priority,
+        };
+        let swapchain_ext = c"VK_KHR_swapchain";
+        let extension_ptrs = [swapchain_ext.as_ptr()];
+        let create_info = VkDeviceCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: 0,
+            queue_create_info_count: 1,
+            p_queue_create_infos: &queue_create_info,
+            enabled_layer_count: 0,
+            pp_enabled_layer_names: ptr::null(),
+            enabled_extension_count: 1,
+            pp_enabled_extension_names: extension_ptrs.as_ptr(),
+            p_enabled_features: ptr::null(),
+        };
+        let mut device = 0usize;
+        let status = unsafe {
+            (self.create_device)(physical_device, &create_info, ptr::null(), &mut device)
+        };
+        if status != VK_SUCCESS {
+            return Err(VulkanError::new(format!(
+                "vkCreateDevice (presentation) failed with status {status}"
             )));
         }
 

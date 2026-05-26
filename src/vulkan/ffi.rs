@@ -548,3 +548,268 @@ struct VkQueueFamilyProperties {
     min_image_transfer_granularity: VkExtent3D,
 }
 
+// --- Surface/Swapchain/Image types (feature = "surface") ---
+
+#[cfg(feature = "surface")]
+pub(crate) type VkSurfaceKHR = u64;
+#[cfg(feature = "surface")]
+pub(crate) type VkSwapchainKHR = u64;
+#[cfg(feature = "surface")]
+pub(crate) type VkImage = usize;
+#[cfg(feature = "surface")]
+pub(crate) type VkImageView = usize;
+#[cfg(feature = "surface")]
+pub(crate) type VkSemaphore = usize;
+
+#[cfg(feature = "surface")]
+pub(crate) const VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR: u32 = 1000001000;
+#[cfg(feature = "surface")]
+pub(crate) const VK_STRUCTURE_TYPE_PRESENT_INFO_KHR: u32 = 1000001001;
+#[cfg(feature = "surface")]
+pub(crate) const VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR: u32 = 1000009000;
+#[cfg(feature = "surface")]
+pub(crate) const VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO: u32 = 9;
+#[cfg(feature = "surface")]
+pub(crate) const VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER: u32 = 45;
+#[cfg(feature = "surface")]
+pub(crate) const VK_IMAGE_LAYOUT_UNDEFINED: u32 = 0;
+#[cfg(feature = "surface")]
+pub(crate) const VK_IMAGE_LAYOUT_GENERAL: u32 = 1;
+#[cfg(feature = "surface")]
+pub(crate) const VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: u32 = 1000001002;
+#[cfg(feature = "surface")]
+pub(crate) const VK_FORMAT_B8G8R8A8_UNORM: u32 = 44;
+#[cfg(feature = "surface")]
+pub(crate) const VK_COLOR_SPACE_SRGB_NONLINEAR_KHR: u32 = 0;
+#[cfg(feature = "surface")]
+pub(crate) const VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR: u32 = 1;
+#[cfg(feature = "surface")]
+pub(crate) const VK_PRESENT_MODE_FIFO_KHR: u32 = 2;
+#[cfg(feature = "surface")]
+pub(crate) const VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT: u32 = 0x0000_0010;
+#[cfg(feature = "surface")]
+pub(crate) const VK_IMAGE_USAGE_STORAGE_BIT: u32 = 0x0000_0008;
+#[cfg(feature = "surface")]
+pub(crate) const VK_IMAGE_USAGE_TRANSFER_DST_BIT: u32 = 0x0000_0004;
+#[cfg(feature = "surface")]
+pub(crate) const VK_SHARING_MODE_EXCLUSIVE: u32 = 0;
+#[cfg(feature = "surface")]
+pub(crate) const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: u32 = 0x0000_0001;
+#[cfg(feature = "surface")]
+pub(crate) const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: u32 = 0x0000_2000;
+#[cfg(feature = "surface")]
+pub(crate) const VK_ACCESS_MEMORY_READ_BIT: u32 = 0x0000_8000;
+#[cfg(feature = "surface")]
+pub(crate) const VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: u32 = 3;
+#[cfg(feature = "surface")]
+pub(crate) const VK_IMAGE_ASPECT_COLOR_BIT: u32 = 0x0000_0001;
+#[cfg(feature = "surface")]
+pub(crate) const VK_COMPONENT_SWIZZLE_IDENTITY: u32 = 0;
+#[cfg(feature = "surface")]
+pub(crate) const VK_IMAGE_VIEW_TYPE_2D: u32 = 1;
+#[cfg(feature = "surface")]
+pub(crate) const VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO: u32 = 15;
+
+#[cfg(feature = "surface")]
+#[repr(C)]
+pub(crate) struct VkWin32SurfaceCreateInfoKHR {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub flags: VkFlags,
+    pub hinstance: *mut c_void,
+    pub hwnd: *mut c_void,
+}
+
+#[cfg(feature = "surface")]
+#[repr(C)]
+pub(crate) struct VkSurfaceCapabilitiesKHR {
+    pub min_image_count: u32,
+    pub max_image_count: u32,
+    pub current_extent: VkExtent2D,
+    pub min_image_extent: VkExtent2D,
+    pub max_image_extent: VkExtent2D,
+    pub max_image_array_layers: u32,
+    pub supported_transforms: VkFlags,
+    pub current_transform: u32,
+    pub supported_composite_alpha: VkFlags,
+    pub supported_usage_flags: VkFlags,
+}
+
+#[cfg(feature = "surface")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct VkExtent2D {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[cfg(feature = "surface")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct VkSurfaceFormatKHR {
+    pub format: u32,
+    pub color_space: u32,
+}
+
+#[cfg(feature = "surface")]
+#[repr(C)]
+pub(crate) struct VkSwapchainCreateInfoKHR {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub flags: VkFlags,
+    pub surface: VkSurfaceKHR,
+    pub min_image_count: u32,
+    pub image_format: u32,
+    pub image_color_space: u32,
+    pub image_extent: VkExtent2D,
+    pub image_array_layers: u32,
+    pub image_usage: VkFlags,
+    pub image_sharing_mode: u32,
+    pub queue_family_index_count: u32,
+    pub p_queue_family_indices: *const u32,
+    pub pre_transform: u32,
+    pub composite_alpha: u32,
+    pub present_mode: u32,
+    pub clipped: VkBool32,
+    pub old_swapchain: VkSwapchainKHR,
+}
+
+#[cfg(feature = "surface")]
+#[repr(C)]
+pub(crate) struct VkPresentInfoKHR {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub wait_semaphore_count: u32,
+    pub p_wait_semaphores: *const VkSemaphore,
+    pub swapchain_count: u32,
+    pub p_swapchains: *const VkSwapchainKHR,
+    pub p_image_indices: *const u32,
+    pub p_results: *mut i32,
+}
+
+#[cfg(feature = "surface")]
+#[repr(C)]
+pub(crate) struct VkSemaphoreCreateInfo {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub flags: VkFlags,
+}
+
+#[cfg(feature = "surface")]
+#[repr(C)]
+pub(crate) struct VkImageMemoryBarrier {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub src_access_mask: VkFlags,
+    pub dst_access_mask: VkFlags,
+    pub old_layout: u32,
+    pub new_layout: u32,
+    pub src_queue_family_index: u32,
+    pub dst_queue_family_index: u32,
+    pub image: VkImage,
+    pub subresource_range: VkImageSubresourceRange,
+}
+
+#[cfg(feature = "surface")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct VkImageSubresourceRange {
+    pub aspect_mask: VkFlags,
+    pub base_mip_level: u32,
+    pub level_count: u32,
+    pub base_array_layer: u32,
+    pub layer_count: u32,
+}
+
+#[cfg(feature = "surface")]
+#[repr(C)]
+pub(crate) struct VkImageViewCreateInfo {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub flags: VkFlags,
+    pub image: VkImage,
+    pub view_type: u32,
+    pub format: u32,
+    pub components: VkComponentMapping,
+    pub subresource_range: VkImageSubresourceRange,
+}
+
+#[cfg(feature = "surface")]
+#[repr(C)]
+pub(crate) struct VkComponentMapping {
+    pub r: u32,
+    pub g: u32,
+    pub b: u32,
+    pub a: u32,
+}
+
+#[cfg(feature = "surface")]
+pub(crate) type VkCreateWin32SurfaceKHR = unsafe extern "system" fn(
+    VkInstance,
+    *const VkWin32SurfaceCreateInfoKHR,
+    *const c_void,
+    *mut VkSurfaceKHR,
+) -> i32;
+#[cfg(feature = "surface")]
+pub(crate) type VkDestroySurfaceKHR =
+    unsafe extern "system" fn(VkInstance, VkSurfaceKHR, *const c_void);
+#[cfg(feature = "surface")]
+pub(crate) type VkGetPhysicalDeviceSurfaceSupportKHR =
+    unsafe extern "system" fn(VkPhysicalDevice, u32, VkSurfaceKHR, *mut VkBool32) -> i32;
+#[cfg(feature = "surface")]
+pub(crate) type VkGetPhysicalDeviceSurfaceCapabilitiesKHR =
+    unsafe extern "system" fn(VkPhysicalDevice, VkSurfaceKHR, *mut VkSurfaceCapabilitiesKHR) -> i32;
+#[cfg(feature = "surface")]
+pub(crate) type VkGetPhysicalDeviceSurfaceFormatsKHR =
+    unsafe extern "system" fn(VkPhysicalDevice, VkSurfaceKHR, *mut u32, *mut VkSurfaceFormatKHR) -> i32;
+#[cfg(feature = "surface")]
+pub(crate) type VkCreateSwapchainKHR = unsafe extern "system" fn(
+    VkDevice,
+    *const VkSwapchainCreateInfoKHR,
+    *const c_void,
+    *mut VkSwapchainKHR,
+) -> i32;
+#[cfg(feature = "surface")]
+pub(crate) type VkDestroySwapchainKHR =
+    unsafe extern "system" fn(VkDevice, VkSwapchainKHR, *const c_void);
+#[cfg(feature = "surface")]
+pub(crate) type VkGetSwapchainImagesKHR =
+    unsafe extern "system" fn(VkDevice, VkSwapchainKHR, *mut u32, *mut VkImage) -> i32;
+#[cfg(feature = "surface")]
+pub(crate) type VkAcquireNextImageKHR =
+    unsafe extern "system" fn(VkDevice, VkSwapchainKHR, u64, VkSemaphore, VkFence, *mut u32) -> i32;
+#[cfg(feature = "surface")]
+pub(crate) type VkQueuePresentKHR =
+    unsafe extern "system" fn(VkQueue, *const VkPresentInfoKHR) -> i32;
+#[cfg(feature = "surface")]
+pub(crate) type VkCreateSemaphore = unsafe extern "system" fn(
+    VkDevice,
+    *const VkSemaphoreCreateInfo,
+    *const c_void,
+    *mut VkSemaphore,
+) -> i32;
+#[cfg(feature = "surface")]
+pub(crate) type VkDestroySemaphore = unsafe extern "system" fn(VkDevice, VkSemaphore, *const c_void);
+#[cfg(feature = "surface")]
+pub(crate) type VkCreateImageView = unsafe extern "system" fn(
+    VkDevice,
+    *const VkImageViewCreateInfo,
+    *const c_void,
+    *mut VkImageView,
+) -> i32;
+#[cfg(feature = "surface")]
+pub(crate) type VkDestroyImageView = unsafe extern "system" fn(VkDevice, VkImageView, *const c_void);
+#[cfg(feature = "surface")]
+pub(crate) type VkCmdPipelineBarrierWithImages = unsafe extern "system" fn(
+    VkCommandBuffer,
+    u32,
+    u32,
+    VkFlags,
+    u32,
+    *const VkMemoryBarrier,
+    u32,
+    *const c_void,
+    u32,
+    *const VkImageMemoryBarrier,
+);
+

@@ -14,6 +14,12 @@ impl VulkanDeviceSummary {
             .filter(|family| family.compute)
             .min_by_key(|family| family.graphics)
     }
+
+    pub fn first_graphics_compute_queue_family(&self) -> Option<&VulkanQueueFamilySummary> {
+        self.queue_families
+            .iter()
+            .find(|family| family.graphics && family.compute)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
