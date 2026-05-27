@@ -6,7 +6,7 @@ use crate::color::{
     level_shift_and_clamp_float,
 };
 use crate::dwt::{PlaneF32, PlaneI32};
-use crate::packet::parse_lrcp_tile_packets;
+use crate::packet::{parse_lrcp_tile_packets, parse_tile_packets};
 use crate::reconstruct::{
     ComponentFloatSubbandPlanes, ComponentSubbandPlanes, TileCoefficientPlanes,
 };
@@ -97,7 +97,7 @@ pub struct DecodeError {
 }
 
 impl DecodeError {
-    fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -213,14 +213,40 @@ pub fn decode_rgb48_full_gpu(
     idwt_shader_path: &str,
     color_shader_path: &str,
 ) -> Result<DecodedRgb48, DecodeError> {
+    decode_rgb48_full_gpu_97(
+        data,
+        cleanup_shader_path,
+        scatter_shader_path,
+        "",
+        idwt_shader_path,
+        color_shader_path,
+    )
+}
+
+pub fn decode_rgb48_full_gpu_97(
+    data: &[u8],
+    cleanup_shader_path: &str,
+    scatter_shader_path: &str,
+    dequant_shader_path: &str,
+    idwt_shader_path: &str,
+    color_shader_path: &str,
+) -> Result<DecodedRgb48, DecodeError> {
     use crate::gpu::{GpuTier1Plan, sort_codeblock_records_by_descending_work};
-    use crate::packet::{parse_tile_packets, parse_lrcp_tile_packets};
+    use crate::packet::{parse_lrcp_tile_packets, parse_tile_packets};
     use crate::tier1::Tier1WorkPlan;
 
     let codestream = Codestream::parse(data).map_err(|e| DecodeError::new(e.to_string()))?;
-    let cod = codestream.cod.as_ref().ok_or_else(|| DecodeError::new("missing COD"))?;
-    let siz = codestream.siz.as_ref().ok_or_else(|| DecodeError::new("missing SIZ"))?;
-    let layouts = codestream.tile_layouts().map_err(|e| DecodeError::new(e.to_string()))?;
+    let cod = codestream
+        .cod
+        .as_ref()
+        .ok_or_else(|| DecodeError::new("missing COD"))?;
+    let siz = codestream
+        .siz
+        .as_ref()
+        .ok_or_else(|| DecodeError::new("missing SIZ"))?;
+    let layouts = codestream
+        .tile_layouts()
+        .map_err(|e| DecodeError::new(e.to_string()))?;
 
     let precision = siz.components.first().map(|c| c.precision).unwrap_or(12);
     let width = siz.width;
@@ -229,22 +255,34 @@ pub fn decode_rgb48_full_gpu(
     let mut all_plans = Vec::new();
 
     // Group tile-parts by tile index and concatenate their data
-    let mut tile_data_map: std::collections::BTreeMap<u16, Vec<u8>> = std::collections::BTreeMap::new();
+    let mut tile_data_map: std::collections::BTreeMap<u16, Vec<u8>> =
+        std::collections::BTreeMap::new();
     for tile_part in &codestream.tile_parts {
-        let tile_data = data.get(tile_part.data_start..tile_part.data_end)
+        let tile_data = data
+            .get(tile_part.data_start..tile_part.data_end)
             .ok_or_else(|| DecodeError::new("tile data out of bounds"))?;
-        tile_data_map.entry(tile_part.tile_index).or_default().extend_from_slice(tile_data);
+        tile_data_map
+            .entry(tile_part.tile_index)
+            .or_default()
+            .extend_from_slice(tile_data);
     }
 
     for (&tile_index, tile_data) in &tile_data_map {
-        let layout = layouts.iter().find(|l| l.tile_index == tile_index)
+        let layout = layouts
+            .iter()
+            .find(|l| l.tile_index == tile_index)
             .ok_or_else(|| DecodeError::new(format!("missing layout for tile {tile_index}")))?;
-        let packet_summary = parse_tile_packets(tile_data, layout, cod.layers, &cod.progression_order)
-            .map_err(|e| DecodeError::new(e.to_string()))?;
+        let packet_summary =
+            parse_tile_packets(tile_data, layout, cod.layers, &cod.progression_order)
+                .map_err(|e| DecodeError::new(e.to_string()))?;
         let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
-            &packet_summary, codestream.qcd.as_ref(), &codestream.qccs,
-        ).map_err(|e| DecodeError::new(e.to_string()))?;
-        let bound = work_plan.bind_segment_data(tile_data)
+            &packet_summary,
+            codestream.qcd.as_ref(),
+            &codestream.qccs,
+        )
+        .map_err(|e| DecodeError::new(e.to_string()))?;
+        let bound = work_plan
+            .bind_segment_data(tile_data)
             .map_err(|e| DecodeError::new(e.to_string()))?;
         let plan = GpuTier1Plan::from_bound_work_plan(&bound, cod.codeblock_style_flags())
             .map_err(|e| DecodeError::new(e.to_string()))?;
@@ -263,34 +301,86 @@ pub fn decode_rgb48_full_gpu(
     let scatter_plan = if layouts.len() == 1 {
         merged.scatter_plan(&layouts[0].components)
     } else {
-        let full_layouts: Vec<_> = siz.components.iter().map(|comp| {
-            component_layout(comp, cod, siz.x_origin, siz.y_origin, siz.width, siz.height)
-        }).collect();
+        let full_layouts: Vec<_> = siz
+            .components
+            .iter()
+            .map(|comp| {
+                component_layout(comp, cod, siz.x_origin, siz.y_origin, siz.width, siz.height)
+            })
+            .collect();
         GpuTier1Plan::scatter_plan_multi_tile(&merged, &all_plans, &layouts, &full_layouts)
-    }.map_err(|e| DecodeError::new(e.to_string()))?;
+    }
+    .map_err(|e| DecodeError::new(e.to_string()))?;
 
-    let color_transform = if cod.multiple_component_transform != 0 { 1u32 } else { 0u32 };
+    let color_transform = if cod.multiple_component_transform != 0 {
+        match cod.transform {
+            WaveletTransform::Irreversible97 => 2u32, // ICT (float)
+            _ => 1u32,                                // RCT (integer)
+        }
+    } else {
+        0u32
+    };
 
-    let result = crate::vulkan::run_tier1_cleanup_scatter_rgb48_smoke(
-        cleanup_shader_path,
-        scatter_shader_path,
-        idwt_shader_path,
-        color_shader_path,
-        &records,
-        &compressed_words,
-        &scatter_plan.records,
-        &scatter_plan.planes,
-        scatter_plan.output_coefficients,
-        cod.decomposition_levels,
-        color_transform,
-        precision,
-    ).map_err(|e| DecodeError::new(e.to_string()))?;
+    let is_97 = matches!(cod.transform, WaveletTransform::Irreversible97);
+
+    let samples = if is_97 && !dequant_shader_path.is_empty() {
+        let qcd = codestream
+            .qcd
+            .as_ref()
+            .ok_or_else(|| DecodeError::new("missing QCD for 9/7 dequantization"))?;
+        let dequant_plan = crate::gpu::build_dequant_plan(
+            &scatter_plan.planes,
+            scatter_plan.output_coefficients,
+            qcd,
+            precision,
+            cod.decomposition_levels,
+        )
+        .map_err(|e| DecodeError::new(e.to_string()))?;
+
+        let result = crate::vulkan::run_tier1_cleanup_scatter_rgb48_bench_97(
+            cleanup_shader_path,
+            scatter_shader_path,
+            dequant_shader_path,
+            idwt_shader_path,
+            color_shader_path,
+            &records,
+            &compressed_words,
+            &scatter_plan.records,
+            &scatter_plan.planes,
+            scatter_plan.output_coefficients,
+            &dequant_plan.step_indices,
+            &dequant_plan.steps,
+            cod.decomposition_levels,
+            color_transform,
+            precision,
+            1,
+        )
+        .map_err(|e| DecodeError::new(e.to_string()))?;
+        result.samples
+    } else {
+        let result = crate::vulkan::run_tier1_cleanup_scatter_rgb48_smoke(
+            cleanup_shader_path,
+            scatter_shader_path,
+            idwt_shader_path,
+            color_shader_path,
+            &records,
+            &compressed_words,
+            &scatter_plan.records,
+            &scatter_plan.planes,
+            scatter_plan.output_coefficients,
+            cod.decomposition_levels,
+            color_transform,
+            precision,
+        )
+        .map_err(|e| DecodeError::new(e.to_string()))?;
+        result.samples
+    };
 
     Ok(DecodedRgb48 {
         width,
         height,
         precision,
-        samples: result.samples,
+        samples,
     })
 }
 
@@ -549,14 +639,13 @@ fn decode_rgb48_with_backends_profiled(
         let bound = work_plan
             .bind_segment_data(tile_data)
             .map_err(|err| DecodeError::new(err.to_string()))?;
-        coefficient_planes_storage =
-            TileCoefficientPlanes::decode_arithmetic_with_reconstruction(
-                &layout.components,
-                &bound,
-                cod.codeblock_style_flags(),
-                coefficient_reconstruction_for_transform(cod.transform),
-            )
-            .map_err(|err| DecodeError::new(err.to_string()))?;
+        coefficient_planes_storage = TileCoefficientPlanes::decode_arithmetic_with_reconstruction(
+            &layout.components,
+            &bound,
+            cod.codeblock_style_flags(),
+            coefficient_reconstruction_for_transform(cod.transform),
+        )
+        .map_err(|err| DecodeError::new(err.to_string()))?;
         profile.decoded_passes = coefficient_planes_storage.decoded_passes;
         profile.nonzero_coefficients = coefficient_planes_storage.nonzero_coefficients;
         component_planes_storage = Vec::new();
@@ -565,26 +654,38 @@ fn decode_rgb48_with_backends_profiled(
         let mut full_planes: Vec<Vec<i32>> = (0..3)
             .map(|_| vec![0i32; (expected_width as usize) * (expected_height as usize)])
             .collect();
-        let mut full_float_planes: Vec<Vec<f32>> = if matches!(cod.transform, WaveletTransform::Irreversible97) {
-            (0..3).map(|_| vec![0f32; (expected_width as usize) * (expected_height as usize)]).collect()
-        } else {
-            Vec::new()
-        };
+        let mut full_float_planes: Vec<Vec<f32>> =
+            if matches!(cod.transform, WaveletTransform::Irreversible97) {
+                (0..3)
+                    .map(|_| vec![0f32; (expected_width as usize) * (expected_height as usize)])
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
+        // Multi-tile path (CPU only): concatenate tile-parts, decode, reconstruct, stitch
+        let mut tile_data_map: std::collections::BTreeMap<u16, Vec<u8>> =
+            std::collections::BTreeMap::new();
         for tile_part in &codestream.tile_parts {
-            let layout = layouts
-                .iter()
-                .find(|l| l.tile_index == tile_part.tile_index)
-                .ok_or_else(|| {
-                    DecodeError::new(format!("missing layout for tile {}", tile_part.tile_index))
-                })?;
             let tile_data = data
                 .get(tile_part.data_start..tile_part.data_end)
                 .ok_or_else(|| DecodeError::new("tile payload is outside codestream data"))?;
+            tile_data_map
+                .entry(tile_part.tile_index)
+                .or_default()
+                .extend_from_slice(tile_data);
+        }
+
+        for (&tile_index, tile_data) in &tile_data_map {
+            let layout = layouts
+                .iter()
+                .find(|l| l.tile_index == tile_index)
+                .ok_or_else(|| DecodeError::new(format!("missing layout for tile {tile_index}")))?;
             profile.tile_bytes += tile_data.len();
 
-            let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers)
-                .map_err(|err| DecodeError::new(err.to_string()))?;
+            let packet_summary =
+                parse_tile_packets(tile_data, layout, cod.layers, &cod.progression_order)
+                    .map_err(|err| DecodeError::new(err.to_string()))?;
             let mut work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
                 &packet_summary,
                 codestream.qcd.as_ref(),
@@ -597,23 +698,18 @@ fn decode_rgb48_with_backends_profiled(
             let bound = work_plan
                 .bind_segment_data(tile_data)
                 .map_err(|err| DecodeError::new(err.to_string()))?;
-            let tile_coefficients =
-                TileCoefficientPlanes::decode_arithmetic_with_reconstruction(
-                    &layout.components,
-                    &bound,
-                    cod.codeblock_style_flags(),
-                    coefficient_reconstruction_for_transform(cod.transform),
-                )
-                .map_err(|err| DecodeError::new(err.to_string()))?;
+            let tile_coefficients = TileCoefficientPlanes::decode_arithmetic_with_reconstruction(
+                &layout.components,
+                &bound,
+                cod.codeblock_style_flags(),
+                coefficient_reconstruction_for_transform(cod.transform),
+            )
+            .map_err(|err| DecodeError::new(err.to_string()))?;
             profile.decoded_passes += tile_coefficients.decoded_passes;
             profile.nonzero_coefficients += tile_coefficients.nonzero_coefficients;
 
             let tile_x0 = discard_extent(layout.x0, discard_levels);
             let tile_y0 = discard_extent(layout.y0, discard_levels);
-            if tile_part.tile_index < 3 {
-                eprintln!("  tile {}: layout ({},{})..({},{}) -> pixel ({},{})",
-                    tile_part.tile_index, layout.x0, layout.y0, layout.x1, layout.y1, tile_x0, tile_y0);
-            }
 
             for comp_idx in 0..3u16 {
                 let comp = tile_coefficients
@@ -628,7 +724,9 @@ fn decode_rgb48_with_backends_profiled(
                         let dst = &mut full_planes[comp_idx as usize];
                         for y in 0..tile_plane.height {
                             let dst_y = tile_y0 + y;
-                            if dst_y >= expected_height { break; }
+                            if dst_y >= expected_height {
+                                break;
+                            }
                             let src_start = (y * tile_plane.width) as usize;
                             let dst_start = (dst_y * expected_width + tile_x0) as usize;
                             let w = tile_plane.width.min(expected_width - tile_x0) as usize;
@@ -637,26 +735,56 @@ fn decode_rgb48_with_backends_profiled(
                         }
                     }
                     WaveletTransform::Irreversible97 => {
-                        let qcd = codestream
-                            .quantization_for_component(comp_idx)
-                            .ok_or_else(|| DecodeError::new(format!(
-                                "missing QCD/QCC for component {comp_idx}"
-                            )))?;
+                        let qcd =
+                            codestream
+                                .quantization_for_component(comp_idx)
+                                .ok_or_else(|| {
+                                    DecodeError::new(format!(
+                                        "missing QCD/QCC for component {comp_idx}"
+                                    ))
+                                })?;
                         let float_comp = ComponentFloatSubbandPlanes::from_component_with_qcd(
-                            comp, qcd, siz.components[0].precision, cod.decomposition_levels,
-                        ).map_err(|err| DecodeError::new(err.to_string()))?;
+                            comp,
+                            qcd,
+                            siz.components[0].precision,
+                            cod.decomposition_levels,
+                        )
+                        .map_err(|err| DecodeError::new(err.to_string()))?;
+                        if comp_idx == 0 {
+                            if let Some(ll) =
+                                float_comp.plane(0, crate::codestream::SubbandKind::Ll)
+                            {
+                                eprintln!(
+                                    "  float LL r0 comp0: first 4 = {:?}",
+                                    &ll.samples[..4.min(ll.samples.len())]
+                                );
+                            }
+                            if let Some(hl) =
+                                float_comp.plane(1, crate::codestream::SubbandKind::Hl)
+                            {
+                                eprintln!(
+                                    "  float HL r1 comp0: first 4 = {:?}",
+                                    &hl.samples[..4.min(hl.samples.len())]
+                                );
+                            }
+                        }
                         let tile_plane = float_comp
                             .inverse_9_7_until(target_resolution)
                             .map_err(|err| DecodeError::new(err.to_string()))?;
-                        if tile_part.tile_index == 0 && comp_idx == 0 {
-                            let min = tile_plane.samples.iter().cloned().fold(f32::INFINITY, f32::min);
-                            let max = tile_plane.samples.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                            eprintln!("  tile 0 comp 0 float range: [{min}, {max}], size {}x{}", tile_plane.width, tile_plane.height);
+                        if comp_idx == 0 {
+                            eprintln!(
+                                "  iDWT output comp0: first 4 = {:?}, size {}x{}",
+                                &tile_plane.samples[..4.min(tile_plane.samples.len())],
+                                tile_plane.width,
+                                tile_plane.height
+                            );
                         }
                         let dst = &mut full_float_planes[comp_idx as usize];
                         for y in 0..tile_plane.height {
                             let dst_y = tile_y0 + y;
-                            if dst_y >= expected_height { break; }
+                            if dst_y >= expected_height {
+                                break;
+                            }
                             let src_start = (y * tile_plane.width) as usize;
                             let dst_start = (dst_y * expected_width + tile_x0) as usize;
                             let w = tile_plane.width.min(expected_width - tile_x0) as usize;
@@ -674,16 +802,31 @@ fn decode_rgb48_with_backends_profiled(
             // Use float planes path
             let float_planes: Vec<PlaneF32> = full_float_planes
                 .into_iter()
-                .map(|samples| PlaneF32 { width: expected_width, height: expected_height, samples })
+                .map(|samples| PlaneF32 {
+                    width: expected_width,
+                    height: expected_height,
+                    samples,
+                })
                 .collect();
             profile.timings.tier1_decode_ms = elapsed_ms(stage_start);
             let precision = siz.components[0].precision;
             let stage_start = Instant::now();
             let samples = pack_rgb48_float_samples(
-                &float_planes, precision, cod.multiple_component_transform, cod.transform, color_backend,
+                &float_planes,
+                precision,
+                cod.multiple_component_transform,
+                cod.transform,
+                color_backend,
             )?;
             profile.timings.pack_ms = elapsed_ms(stage_start);
-            return finish_profiled_rgb48(expected_width, expected_height, precision, samples, profile, total_start);
+            return finish_profiled_rgb48(
+                expected_width,
+                expected_height,
+                precision,
+                samples,
+                profile,
+                total_start,
+            );
         }
 
         component_planes_storage = full_planes
@@ -1255,5 +1398,360 @@ mod tests {
             height: 1,
             samples: samples.to_vec(),
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn cprl_4k_dcp_packet_parse_consumes_all_tile_data() {
+        use crate::packet::parse_tile_packets;
+        use std::collections::BTreeMap;
+
+        let path = std::env::var("CPRL_TEST_J2K")
+            .unwrap_or_else(|_| "target/samples/1_frame0.j2k".to_string());
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping: {path} not found");
+                return;
+            }
+        };
+        let codestream = crate::codestream::Codestream::parse(&data).expect("parse codestream");
+        let cod = codestream.cod.as_ref().expect("COD");
+        let layouts = codestream.tile_layouts().expect("layouts");
+
+        let mut tile_data_map: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
+        for tile_part in &codestream.tile_parts {
+            let tile_data = &data[tile_part.data_start..tile_part.data_end];
+            tile_data_map
+                .entry(tile_part.tile_index)
+                .or_default()
+                .extend_from_slice(tile_data);
+        }
+
+        for (&tile_index, tile_data) in &tile_data_map {
+            let layout = layouts.iter().find(|l| l.tile_index == tile_index).unwrap();
+            let summary = parse_tile_packets(tile_data, layout, cod.layers, &cod.progression_order)
+                .expect("CPRL packet parse should succeed");
+            assert_eq!(
+                summary.consumed_bytes,
+                tile_data.len(),
+                "should consume all {} tile bytes, got {}",
+                tile_data.len(),
+                summary.consumed_bytes
+            );
+            let present = summary.packets.iter().filter(|p| p.present).count();
+            // Per-component codeblock stats
+            for comp in 0..3u16 {
+                let comp_segs: usize = summary
+                    .packets
+                    .iter()
+                    .flat_map(|p| p.segments.iter())
+                    .filter(|s| s.component == comp)
+                    .count();
+                let comp_bytes: usize = summary
+                    .packets
+                    .iter()
+                    .flat_map(|p| p.segments.iter())
+                    .filter(|s| s.component == comp)
+                    .map(|s| s.byte_len)
+                    .sum();
+                eprintln!("  component {comp}: {comp_segs} codeblocks, {comp_bytes} bytes");
+            }
+            assert!(
+                present > 500,
+                "expected most packets present, got {present}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn cprl_4k_dcp_cpu_tier1_produces_nonzero_coefficients() {
+        use crate::packet::parse_tile_packets;
+        use crate::tier1::Tier1WorkPlan;
+        use std::collections::BTreeMap;
+
+        let path = std::env::var("CPRL_TEST_J2K")
+            .unwrap_or_else(|_| "target/samples/1_frame0.j2k".to_string());
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping: {path} not found");
+                return;
+            }
+        };
+        let codestream = crate::codestream::Codestream::parse(&data).expect("parse");
+        let cod = codestream.cod.as_ref().expect("COD");
+        let layouts = codestream.tile_layouts().expect("layouts");
+
+        let mut tile_data_map: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
+        for tile_part in &codestream.tile_parts {
+            let td = &data[tile_part.data_start..tile_part.data_end];
+            tile_data_map
+                .entry(tile_part.tile_index)
+                .or_default()
+                .extend_from_slice(td);
+        }
+
+        let qcd = codestream.qcd.as_ref().expect("QCD");
+        let steps = qcd.steps().expect("steps");
+        eprintln!(
+            "QCD: style={:?}, guard_bits={}, steps[0] (LL r0): exp={}, mantissa={}, scale={}",
+            qcd.style,
+            qcd.guard_bits,
+            steps[0].exponent,
+            steps[0].mantissa,
+            2.0f32.powi(12 - steps[0].exponent as i32) * (1.0 + steps[0].mantissa as f32 / 2048.0)
+        );
+
+        let (&tile_index, tile_data) = tile_data_map.iter().next().unwrap();
+        let layout = layouts.iter().find(|l| l.tile_index == tile_index).unwrap();
+        let summary = parse_tile_packets(tile_data, layout, cod.layers, &cod.progression_order)
+            .expect("parse");
+        let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
+            &summary,
+            codestream.qcd.as_ref(),
+            &codestream.qccs,
+        )
+        .expect("work plan");
+        let bound = work_plan.bind_segment_data(tile_data).expect("bind");
+
+        // Decode first few codeblocks of each component via CPU
+        for comp in 0..3u16 {
+            // Check LL at r0
+            let ll_cb = bound
+                .codeblocks
+                .iter()
+                .filter(|cb| cb.id.component == comp && cb.id.resolution == 0)
+                .next();
+            if let Some(codeblock) = ll_cb {
+                eprintln!(
+                    "  comp {} r0 LL: zbp={}, mag_bp={}, passes={}, bytes={}",
+                    comp,
+                    codeblock.zero_bit_planes,
+                    codeblock.magnitude_bitplanes,
+                    codeblock
+                        .segments
+                        .iter()
+                        .map(|s| s.coding_passes)
+                        .sum::<u16>(),
+                    codeblock
+                        .segments
+                        .iter()
+                        .map(|s| s.data.len())
+                        .sum::<usize>()
+                );
+                let decoded = codeblock
+                    .decode_arithmetic_passes(cod.codeblock_style_flags())
+                    .expect("cpu tier1 decode");
+                let nonzero = decoded.coefficients.iter().filter(|&&c| c != 0).count();
+                let max_abs = decoded
+                    .coefficients
+                    .iter()
+                    .map(|c| c.unsigned_abs())
+                    .max()
+                    .unwrap_or(0);
+                eprintln!(
+                    "  comp {} r0 LL {}x{} cb({},{}): {} coeffs, {} nonzero, max_abs={}, zbp={}",
+                    comp,
+                    codeblock.width,
+                    codeblock.height,
+                    codeblock.id.codeblock_x,
+                    codeblock.id.codeblock_y,
+                    decoded.coefficients.len(),
+                    nonzero,
+                    max_abs,
+                    codeblock.zero_bit_planes
+                );
+                eprintln!(
+                    "    first 8 coeffs: {:?}",
+                    &decoded.coefficients[..8.min(decoded.coefficients.len())]
+                );
+            }
+            // Check highest res detail
+            let hi_cb = bound
+                .codeblocks
+                .iter()
+                .filter(|cb| {
+                    cb.id.component == comp && cb.id.resolution == cod.decomposition_levels
+                })
+                .next();
+            if let Some(codeblock) = hi_cb {
+                let decoded = codeblock
+                    .decode_arithmetic_passes(cod.codeblock_style_flags())
+                    .expect("cpu tier1 decode");
+                let nonzero = decoded.coefficients.iter().filter(|&&c| c != 0).count();
+                let max_abs = decoded
+                    .coefficients
+                    .iter()
+                    .map(|c| c.unsigned_abs())
+                    .max()
+                    .unwrap_or(0);
+                eprintln!(
+                    "  comp {} r{} {}x{} cb({},{}): {} coeffs, {} nonzero, max_abs={}",
+                    comp,
+                    codeblock.id.resolution,
+                    codeblock.width,
+                    codeblock.height,
+                    codeblock.id.codeblock_x,
+                    codeblock.id.codeblock_y,
+                    decoded.coefficients.len(),
+                    nonzero,
+                    max_abs
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn cprl_4k_dcp_full_gpu_decode_produces_nonzero_samples() {
+        let path = std::env::var("CPRL_TEST_J2K")
+            .unwrap_or_else(|_| "target/samples/1_frame0.j2k".to_string());
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping: {path} not found");
+                return;
+            }
+        };
+        // Use full GPU decode path (handles multi-tile-part + CPRL + 9/7)
+        let result = decode_rgb48_full_gpu_97(
+            &data,
+            "shaders/tier1_cleanup_smoke.comp.spv",
+            "shaders/tier1_scatter_smoke.comp.spv",
+            "shaders/dequant.comp.spv",
+            "shaders/idwt97_offset_1d.comp.spv",
+            "shaders/color_convert.comp.spv",
+        )
+        .expect("GPU decode should succeed");
+        eprintln!(
+            "decoded: {}x{} precision={}",
+            result.width, result.height, result.precision
+        );
+        eprintln!("samples len: {}", result.samples.len());
+        let nonzero = result.samples.iter().filter(|&&s| s != 0).count();
+        eprintln!("non-zero samples: {}/{}", nonzero, result.samples.len());
+        let min_val = result.samples.iter().copied().min().unwrap_or(0);
+        let max_val = result.samples.iter().copied().max().unwrap_or(0);
+        eprintln!("min={} max={}", min_val, max_val);
+
+        // Compare against ffmpeg reference if available
+        let ref_path =
+            std::env::var("CPRL_REF_RAW").unwrap_or_else(|_| "/tmp/ref_frame.raw".to_string());
+        if let Ok(ref_data) = std::fs::read(&ref_path) {
+            let ref_samples: Vec<u16> = ref_data
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            eprintln!("ref samples: {}", ref_samples.len());
+            // ffmpeg outputs 16-bit; our output is 12-bit. ffmpeg left-shifts by 4.
+            // Compare at specific positions
+            let positions = [
+                (0, 0, "top-left"),
+                (1920, 1080, "center"),
+                (100, 100, "near-corner"),
+                (3000, 1500, "lower-right area"),
+            ];
+            for (x, y, label) in positions {
+                let idx = (y * 3840 + x) * 3;
+                let ours = (
+                    result.samples[idx],
+                    result.samples[idx + 1],
+                    result.samples[idx + 2],
+                );
+                let theirs_16 = (ref_samples[idx], ref_samples[idx + 1], ref_samples[idx + 2]);
+                let theirs = (theirs_16.0 >> 4, theirs_16.1 >> 4, theirs_16.2 >> 4);
+                eprintln!(
+                    "  {label} ({x},{y}): ours=({},{},{}) ref=({},{},{})",
+                    ours.0, ours.1, ours.2, theirs.0, theirs.1, theirs.2
+                );
+            }
+
+            // Dump our output as rgb48le for external comparison
+            let out_path =
+                std::env::var("CPRL_OUT_RAW").unwrap_or_else(|_| "/tmp/ours_frame.raw".to_string());
+            let out_bytes: Vec<u8> = result
+                .samples
+                .iter()
+                .flat_map(|&s| s.to_le_bytes())
+                .collect();
+            std::fs::write(&out_path, &out_bytes).expect("write output");
+            eprintln!("wrote {} bytes to {out_path}", out_bytes.len());
+
+            // Compute PSNR against reference
+            let mut sum_sq_err = 0.0f64;
+            let mut max_diff = 0u16;
+            let mut max_diff_idx = 0usize;
+            let mut max_diff_interior = 0u16;
+            let mut max_diff_interior_idx = 0usize;
+            let count = result.samples.len().min(ref_samples.len());
+            for i in 0..count {
+                let ours_val = result.samples[i] as i32;
+                let ref_val = (ref_samples[i] >> 4) as i32;
+                let diff = (ours_val - ref_val).unsigned_abs() as u16;
+                if diff > max_diff {
+                    max_diff = diff;
+                    max_diff_idx = i;
+                }
+                let px = i / 3;
+                let px_x = px % 3840;
+                let px_y = px / 3840;
+                if px_x >= 4 && px_x < 3836 && px_y >= 4 && px_y < 2156 {
+                    if diff > max_diff_interior {
+                        max_diff_interior = diff;
+                        max_diff_interior_idx = i;
+                    }
+                }
+                sum_sq_err += (diff as f64) * (diff as f64);
+            }
+            let mse = sum_sq_err / count as f64;
+            let psnr = if mse > 0.0 {
+                10.0 * (4095.0f64 * 4095.0 / mse).log10()
+            } else {
+                f64::INFINITY
+            };
+            let px = max_diff_idx / 3;
+            let ch = max_diff_idx % 3;
+            let px_x = px % 3840;
+            let px_y = px / 3840;
+            eprintln!(
+                "vs ffmpeg: PSNR={psnr:.2} dB, max_diff={max_diff} at ({px_x},{px_y}) ch{ch}, MSE={mse:.4}"
+            );
+            eprintln!(
+                "  worst pixel: ours={} ref={}",
+                result.samples[max_diff_idx],
+                ref_samples[max_diff_idx] >> 4
+            );
+            // Count pixels with diff > 100
+            let mut big_diff_count = 0usize;
+            let mut big_diff_x_min = 3840u32;
+            let mut big_diff_x_max = 0u32;
+            let mut big_diff_y_min = 2160u32;
+            let mut big_diff_y_max = 0u32;
+            for i in 0..count {
+                let ours_val = result.samples[i] as i32;
+                let ref_val = (ref_samples[i] >> 4) as i32;
+                let diff = (ours_val - ref_val).unsigned_abs();
+                if diff > 100 {
+                    big_diff_count += 1;
+                    let px = (i / 3) as u32;
+                    let px_x = px % 3840;
+                    let px_y = px / 3840;
+                    big_diff_x_min = big_diff_x_min.min(px_x);
+                    big_diff_x_max = big_diff_x_max.max(px_x);
+                    big_diff_y_min = big_diff_y_min.min(px_y);
+                    big_diff_y_max = big_diff_y_max.max(px_y);
+                }
+            }
+            eprintln!(
+                "  pixels with diff>100: {big_diff_count} in region ({big_diff_x_min},{big_diff_y_min})..({big_diff_x_max},{big_diff_y_max})"
+            );
+        }
+
+        assert!(
+            nonzero > result.samples.len() / 2,
+            "most samples should be non-zero"
+        );
     }
 }

@@ -484,7 +484,9 @@ pub fn run() -> ExitCode {
             eprintln!("  {program} tier1-gpu-plan <input.j2k>");
             eprintln!("  {program} tier1-gpu-bench <input.j2k> [iterations]");
             eprintln!("  {program} tier1-gpu-batch-bench <input.j2k> [iterations] [batch-frames]");
-            eprintln!("  {program} tier1-gpu-pipeline-bench <input.j2k> [iterations] [pipeline-depth]");
+            eprintln!(
+                "  {program} tier1-gpu-pipeline-bench <input.j2k> [iterations] [pipeline-depth]"
+            );
             eprintln!(
                 "  {program} tier1-codeblock-trace <input.j2k> <component> <resolution> <LL|HL|LH|HH> <codeblock-x> <codeblock-y>"
             );

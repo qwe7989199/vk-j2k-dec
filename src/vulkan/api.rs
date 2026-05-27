@@ -2531,9 +2531,9 @@ impl ReusableRgb48Packer {
                 component_planes.len()
             )));
         }
-        if color_transform > 1 {
+        if color_transform > 2 {
             return Err(VulkanError::new(format!(
-                "GPU integer color conversion supports only none/RCT, got mode {color_transform}"
+                "GPU color conversion supports only none/RCT/ICT, got mode {color_transform}"
             )));
         }
         if precision == 0 || precision > 16 {

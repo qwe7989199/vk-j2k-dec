@@ -571,9 +571,9 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         let thread_shader = r"target\shaders\tier1_cleanup_smoke_16.comp.spv";
         let warp_shader = r"target\shaders\tier1_cleanup_smoke.comp.spv";
         if std::path::Path::new(thread_shader).exists()
-            && frame_plans.iter().all(|frame| {
-                frame.records.iter().all(|r| r.coefficient_count <= 1024)
-            })
+            && frame_plans
+                .iter()
+                .all(|frame| frame.records.iter().all(|r| r.coefficient_count <= 1024))
         {
             thread_shader
         } else {
