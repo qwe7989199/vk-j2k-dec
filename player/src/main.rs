@@ -116,63 +116,106 @@ struct PlayerState {
 
 impl PlayerApp {
     fn new(input_path: String, colorspace: ColorSpace, fps: f64, ffmpeg_path: String) -> Self {
-        Self { input_path, colorspace, fps, ffmpeg_path, state: None }
+        Self {
+            input_path,
+            colorspace,
+            fps,
+            ffmpeg_path,
+            state: None,
+        }
     }
 }
 
 impl ApplicationHandler for PlayerApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() { return; }
+        if self.state.is_some() {
+            return;
+        }
 
         let is_mxf = self.input_path.to_lowercase().ends_with(".mxf");
 
         let (first_frame, frame_reader, single_frame) = if is_mxf {
             let mut reader = match FrameReader::open(&self.input_path, &self.ffmpeg_path) {
                 Ok(r) => r,
-                Err(e) => { eprintln!("error: {e}"); event_loop.exit(); return; }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    event_loop.exit();
+                    return;
+                }
             };
             let frame = match reader.next_frame() {
                 Some(f) => f.to_vec(),
-                None => { eprintln!("error: no frames in input"); event_loop.exit(); return; }
+                None => {
+                    eprintln!("error: no frames in input");
+                    event_loop.exit();
+                    return;
+                }
             };
             (frame, Some(reader), None)
         } else {
             let data = match std::fs::read(&self.input_path) {
                 Ok(d) => d,
-                Err(e) => { eprintln!("error: {e}"); event_loop.exit(); return; }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    event_loop.exit();
+                    return;
+                }
             };
             (data.clone(), None, Some(data))
         };
 
         let codestream = match vk_j2k_dec::codestream::Codestream::parse(&first_frame) {
             Ok(c) => c,
-            Err(e) => { eprintln!("error: {e}"); event_loop.exit(); return; }
+            Err(e) => {
+                eprintln!("error: {e}");
+                event_loop.exit();
+                return;
+            }
         };
         let siz = match &codestream.siz {
             Some(s) => s,
-            None => { eprintln!("error: missing SIZ"); event_loop.exit(); return; }
+            None => {
+                eprintln!("error: missing SIZ");
+                event_loop.exit();
+                return;
+            }
         };
         let width = siz.width;
         let height = siz.height;
         let precision = siz.components.first().map(|c| c.precision).unwrap_or(12);
 
-        eprintln!("vk-j2k-player: {}x{} {}-bit, {} fps", width, height, precision, self.fps);
+        eprintln!(
+            "vk-j2k-player: {}x{} {}-bit, {} fps",
+            width, height, precision, self.fps
+        );
 
         let color_config = ColorConfig::for_colorspace(self.colorspace, precision);
 
         let window_attrs = Window::default_attributes()
             .with_title(format!("vk-j2k-player — {}", self.input_path))
             .with_inner_size(PhysicalSize::new(width, height));
-        let window = Arc::new(event_loop.create_window(window_attrs).expect("create window"));
+        let window = Arc::new(
+            event_loop
+                .create_window(window_attrs)
+                .expect("create window"),
+        );
 
         let presenter = match unsafe { VulkanPresenter::new(&window, width, height) } {
             Ok(p) => p,
-            Err(e) => { eprintln!("vulkan error: {e}"); event_loop.exit(); return; }
+            Err(e) => {
+                eprintln!("vulkan error: {e}");
+                event_loop.exit();
+                return;
+            }
         };
 
         let gpu_decoder = match GpuDecoder::new() {
             Ok(d) => d,
-            Err(e) => { eprintln!("gpu decoder init error: {e}"); event_loop.exit(); return; }
+            Err(e) => {
+                eprintln!("gpu decoder init error: {e}");
+                event_loop.exit();
+                return;
+            }
         };
 
         let push_constants = PresentPushConstants {
@@ -187,7 +230,9 @@ impl ApplicationHandler for PlayerApp {
 
         // Decode and upload first frame
         if let Ok(decoded) = gpu_decoder.decode(&first_frame) {
-            unsafe { presenter.upload_rgb48(&decoded.samples); }
+            unsafe {
+                presenter.upload_rgb48(&decoded.samples);
+            }
         }
 
         self.state = Some(PlayerState {
@@ -233,7 +278,9 @@ impl ApplicationHandler for PlayerApp {
 
                     if let Some(frame_bytes) = next_bytes {
                         if let Ok(decoded) = state.gpu_decoder.decode(&frame_bytes) {
-                            unsafe { state.presenter.upload_rgb48(&decoded.samples); }
+                            unsafe {
+                                state.presenter.upload_rgb48(&decoded.samples);
+                            }
                             state.decoded_count += 1;
                         }
                     } else {

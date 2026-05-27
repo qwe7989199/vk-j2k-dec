@@ -52,6 +52,10 @@ void main() {
     vec3 out_color;
     if (pc.transfer_func == 1u) {
         out_color = vec3(linear_to_srgb(col.r), linear_to_srgb(col.g), linear_to_srgb(col.b));
+    } else if (pc.transfer_func == 2u) {
+        // DCI: input is gamma 2.6 encoded XYZ, decode then re-encode to sRGB
+        vec3 linear_col = vec3(pow(col.r, 2.6), pow(col.g, 2.6), pow(col.b, 2.6));
+        out_color = vec3(linear_to_srgb(linear_col.r), linear_to_srgb(linear_col.g), linear_to_srgb(linear_col.b));
     } else {
         out_color = col;
     }

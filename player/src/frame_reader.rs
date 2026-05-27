@@ -13,11 +13,16 @@ impl FrameReader {
         let mut child = Command::new(ffmpeg_path)
             .args([
                 "-hide_banner",
-                "-loglevel", "error",
-                "-i", input_path,
-                "-map", "0:v:0",
-                "-c:v", "copy",
-                "-f", "image2pipe",
+                "-loglevel",
+                "error",
+                "-i",
+                input_path,
+                "-map",
+                "0:v:0",
+                "-c:v",
+                "copy",
+                "-f",
+                "image2pipe",
                 "-",
             ])
             .stdout(Stdio::piped())
@@ -65,7 +70,8 @@ impl FrameReader {
         let frame_end = eoc_pos + 2;
 
         self.buffer.clear();
-        self.buffer.extend_from_slice(&self.pending[soc_pos..frame_end]);
+        self.buffer
+            .extend_from_slice(&self.pending[soc_pos..frame_end]);
         self.pending.drain(..frame_end);
         true
     }

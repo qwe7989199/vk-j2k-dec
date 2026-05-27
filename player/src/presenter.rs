@@ -93,8 +93,7 @@ impl VulkanPresenter {
 
         let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
 
-        let (physical_device, queue_family) =
-            select_device(&instance, &surface_loader, surface)?;
+        let (physical_device, queue_family) = select_device(&instance, &surface_loader, surface)?;
 
         let queue_priority = [1.0f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
@@ -113,45 +112,70 @@ impl VulkanPresenter {
         let queue = device.get_device_queue(queue_family, 0);
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
 
-        let (swapchain, swapchain_images, swapchain_views, swapchain_format, swapchain_extent, hdr_active) =
-            create_swapchain(
-                &instance,
-                &device,
-                &surface_loader,
-                &swapchain_loader,
-                physical_device,
-                surface,
-                width,
-                height,
-                vk::SwapchainKHR::null(),
-            )?;
+        let (
+            swapchain,
+            swapchain_images,
+            swapchain_views,
+            swapchain_format,
+            swapchain_extent,
+            hdr_active,
+        ) = create_swapchain(
+            &instance,
+            &device,
+            &surface_loader,
+            &swapchain_loader,
+            physical_device,
+            surface,
+            width,
+            height,
+            vk::SwapchainKHR::null(),
+        )?;
 
         if hdr_active {
-            eprintln!("vk-j2k-player: HDR10 swapchain active (format {:?})", swapchain_format);
+            eprintln!(
+                "vk-j2k-player: HDR10 swapchain active (format {:?})",
+                swapchain_format
+            );
         } else {
-            eprintln!("vk-j2k-player: SDR swapchain (format {:?})", swapchain_format);
+            eprintln!(
+                "vk-j2k-player: SDR swapchain (format {:?})",
+                swapchain_format
+            );
         }
 
         let sem_info = vk::SemaphoreCreateInfo::default();
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-        let image_available_sem = device.create_semaphore(&sem_info, None).map_err(|e| e.to_string())?;
-        let render_finished_sem = device.create_semaphore(&sem_info, None).map_err(|e| e.to_string())?;
-        let in_flight_fence = device.create_fence(&fence_info, None).map_err(|e| e.to_string())?;
+        let image_available_sem = device
+            .create_semaphore(&sem_info, None)
+            .map_err(|e| e.to_string())?;
+        let render_finished_sem = device
+            .create_semaphore(&sem_info, None)
+            .map_err(|e| e.to_string())?;
+        let in_flight_fence = device
+            .create_fence(&fence_info, None)
+            .map_err(|e| e.to_string())?;
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        let command_pool = device.create_command_pool(&pool_info, None).map_err(|e| e.to_string())?;
+        let command_pool = device
+            .create_command_pool(&pool_info, None)
+            .map_err(|e| e.to_string())?;
 
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
-        let command_buffer = device.allocate_command_buffers(&alloc_info).map_err(|e| e.to_string())?[0];
+        let command_buffer = device
+            .allocate_command_buffers(&alloc_info)
+            .map_err(|e| e.to_string())?[0];
 
         let rgb48_size = (width as u64) * (height as u64) * 3 * 2;
         let (rgb48_buffer, rgb48_memory) = create_host_visible_buffer(
-            &instance, &device, physical_device, rgb48_size,
+            &instance,
+            &device,
+            physical_device,
+            rgb48_size,
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
 
@@ -193,8 +217,14 @@ impl VulkanPresenter {
     }
 
     pub unsafe fn upload_rgb48(&self, samples: &[u16]) {
-        let data_ptr = self.device
-            .map_memory(self.rgb48_memory, 0, self.rgb48_size, vk::MemoryMapFlags::empty())
+        let data_ptr = self
+            .device
+            .map_memory(
+                self.rgb48_memory,
+                0,
+                self.rgb48_size,
+                vk::MemoryMapFlags::empty(),
+            )
             .expect("map memory");
         let byte_count = (samples.len() * 2).min(self.rgb48_size as usize);
         std::ptr::copy_nonoverlapping(
@@ -205,11 +235,16 @@ impl VulkanPresenter {
         self.device.unmap_memory(self.rgb48_memory);
     }
 
-    pub unsafe fn present_frame(&self, push_constants: &PresentPushConstants) -> Result<bool, String> {
+    pub unsafe fn present_frame(
+        &self,
+        push_constants: &PresentPushConstants,
+    ) -> Result<bool, String> {
         self.device
             .wait_for_fences(&[self.in_flight_fence], true, u64::MAX)
             .map_err(|e| e.to_string())?;
-        self.device.reset_fences(&[self.in_flight_fence]).map_err(|e| e.to_string())?;
+        self.device
+            .reset_fences(&[self.in_flight_fence])
+            .map_err(|e| e.to_string())?;
 
         let acquire_result = self.swapchain_loader.acquire_next_image(
             self.swapchain,
@@ -230,7 +265,9 @@ impl VulkanPresenter {
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        self.device.begin_command_buffer(self.command_buffer, &begin_info).map_err(|e| e.to_string())?;
+        self.device
+            .begin_command_buffer(self.command_buffer, &begin_info)
+            .map_err(|e| e.to_string())?;
 
         // Transition swapchain image to GENERAL for compute write
         let barrier_to_general = vk::ImageMemoryBarrier::default()
@@ -286,7 +323,8 @@ impl VulkanPresenter {
 
         let groups_x = (self.width + 15) / 16;
         let groups_y = (self.height + 15) / 16;
-        self.device.cmd_dispatch(self.command_buffer, groups_x, groups_y, 1);
+        self.device
+            .cmd_dispatch(self.command_buffer, groups_x, groups_y, 1);
 
         // Transition swapchain image to PRESENT_SRC
         let barrier_to_present = vk::ImageMemoryBarrier::default()
@@ -313,7 +351,9 @@ impl VulkanPresenter {
             &[barrier_to_present],
         );
 
-        self.device.end_command_buffer(self.command_buffer).map_err(|e| e.to_string())?;
+        self.device
+            .end_command_buffer(self.command_buffer)
+            .map_err(|e| e.to_string())?;
 
         let wait_semaphores = [self.image_available_sem];
         let wait_stages = [vk::PipelineStageFlags::COMPUTE_SHADER];
@@ -335,7 +375,10 @@ impl VulkanPresenter {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
 
-        match self.swapchain_loader.queue_present(self.queue, &present_info) {
+        match self
+            .swapchain_loader
+            .queue_present(self.queue, &present_info)
+        {
             Ok(_) => Ok(false),
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR) => Ok(true),
             Err(e) => Err(format!("queue present: {e}")),
@@ -348,19 +391,25 @@ impl Drop for VulkanPresenter {
         unsafe {
             let _ = self.device.device_wait_idle();
             self.device.destroy_pipeline(self.pipeline, None);
-            self.device.destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device.destroy_descriptor_pool(self.descriptor_pool, None);
-            self.device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.device.destroy_buffer(self.rgb48_buffer, None);
             self.device.free_memory(self.rgb48_memory, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_fence(self.in_flight_fence, None);
-            self.device.destroy_semaphore(self.render_finished_sem, None);
-            self.device.destroy_semaphore(self.image_available_sem, None);
+            self.device
+                .destroy_semaphore(self.render_finished_sem, None);
+            self.device
+                .destroy_semaphore(self.image_available_sem, None);
             for &view in &self.swapchain_views {
                 self.device.destroy_image_view(view, None);
             }
-            self.swapchain_loader.destroy_swapchain(self.swapchain, None);
+            self.swapchain_loader
+                .destroy_swapchain(self.swapchain, None);
             self.surface_loader.destroy_surface(self.surface, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -373,7 +422,9 @@ unsafe fn select_device(
     surface_loader: &ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
 ) -> Result<(vk::PhysicalDevice, u32), String> {
-    let devices = instance.enumerate_physical_devices().map_err(|e| e.to_string())?;
+    let devices = instance
+        .enumerate_physical_devices()
+        .map_err(|e| e.to_string())?;
 
     for &device in &devices {
         let props = instance.get_physical_device_queue_family_properties(device);
@@ -405,7 +456,17 @@ unsafe fn create_swapchain(
     width: u32,
     height: u32,
     old_swapchain: vk::SwapchainKHR,
-) -> Result<(vk::SwapchainKHR, Vec<vk::Image>, Vec<vk::ImageView>, vk::Format, vk::Extent2D, bool), String> {
+) -> Result<
+    (
+        vk::SwapchainKHR,
+        Vec<vk::Image>,
+        Vec<vk::ImageView>,
+        vk::Format,
+        vk::Extent2D,
+        bool,
+    ),
+    String,
+> {
     let caps = surface_loader
         .get_physical_device_surface_capabilities(physical_device, surface)
         .map_err(|e| e.to_string())?;
@@ -443,14 +504,18 @@ unsafe fn create_swapchain(
         }
     };
 
-    let image_count = (caps.min_image_count + 1).min(
-        if caps.max_image_count == 0 { u32::MAX } else { caps.max_image_count }
-    );
+    let image_count = (caps.min_image_count + 1).min(if caps.max_image_count == 0 {
+        u32::MAX
+    } else {
+        caps.max_image_count
+    });
 
     let supported_usage = caps.supported_usage_flags;
     let use_storage = supported_usage.contains(vk::ImageUsageFlags::STORAGE);
     if !use_storage {
-        eprintln!("vk-j2k-player: WARNING — swapchain does not support STORAGE usage, using TRANSFER_DST fallback");
+        eprintln!(
+            "vk-j2k-player: WARNING — swapchain does not support STORAGE usage, using TRANSFER_DST fallback"
+        );
     }
 
     let image_usage = if use_storage {
@@ -496,11 +561,20 @@ unsafe fn create_swapchain(
                     base_array_layer: 0,
                     layer_count: 1,
                 });
-            device.create_image_view(&view_info, None).expect("create image view")
+            device
+                .create_image_view(&view_info, None)
+                .expect("create image view")
         })
         .collect();
 
-    Ok((swapchain, images, views, chosen_format.format, extent, hdr_active))
+    Ok((
+        swapchain,
+        images,
+        views,
+        chosen_format.format,
+        extent,
+        hdr_active,
+    ))
 }
 
 unsafe fn create_host_visible_buffer(
@@ -515,7 +589,9 @@ unsafe fn create_host_visible_buffer(
         .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-    let buffer = device.create_buffer(&buffer_info, None).map_err(|e| e.to_string())?;
+    let buffer = device
+        .create_buffer(&buffer_info, None)
+        .map_err(|e| e.to_string())?;
     let mem_reqs = device.get_buffer_memory_requirements(buffer);
 
     let mem_props = instance.get_physical_device_memory_properties(physical_device);
@@ -523,14 +599,19 @@ unsafe fn create_host_visible_buffer(
         &mem_props,
         mem_reqs.memory_type_bits,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    ).ok_or("no suitable memory type")?;
+    )
+    .ok_or("no suitable memory type")?;
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mem_type);
 
-    let memory = device.allocate_memory(&alloc_info, None).map_err(|e| e.to_string())?;
-    device.bind_buffer_memory(buffer, memory, 0).map_err(|e| e.to_string())?;
+    let memory = device
+        .allocate_memory(&alloc_info, None)
+        .map_err(|e| e.to_string())?;
+    device
+        .bind_buffer_memory(buffer, memory, 0)
+        .map_err(|e| e.to_string())?;
 
     Ok((buffer, memory))
 }
@@ -542,7 +623,9 @@ fn find_memory_type(
 ) -> Option<u32> {
     for i in 0..props.memory_type_count {
         if (type_bits & (1 << i)) != 0
-            && props.memory_types[i as usize].property_flags.contains(required)
+            && props.memory_types[i as usize]
+                .property_flags
+                .contains(required)
         {
             return Some(i);
         }
@@ -555,7 +638,16 @@ unsafe fn create_present_pipeline(
     swapchain_views: &[vk::ImageView],
     rgb48_buffer: vk::Buffer,
     rgb48_size: u64,
-) -> Result<(vk::DescriptorSetLayout, vk::DescriptorPool, Vec<vk::DescriptorSet>, vk::PipelineLayout, vk::Pipeline), String> {
+) -> Result<
+    (
+        vk::DescriptorSetLayout,
+        vk::DescriptorPool,
+        Vec<vk::DescriptorSet>,
+        vk::PipelineLayout,
+        vk::Pipeline,
+    ),
+    String,
+> {
     let bindings = [
         vk::DescriptorSetLayoutBinding::default()
             .binding(0)
@@ -570,7 +662,9 @@ unsafe fn create_present_pipeline(
     ];
 
     let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-    let set_layout = device.create_descriptor_set_layout(&layout_info, None).map_err(|e| e.to_string())?;
+    let set_layout = device
+        .create_descriptor_set_layout(&layout_info, None)
+        .map_err(|e| e.to_string())?;
 
     let push_constant_range = vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::COMPUTE)
@@ -580,12 +674,16 @@ unsafe fn create_present_pipeline(
     let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
         .set_layouts(std::slice::from_ref(&set_layout))
         .push_constant_ranges(std::slice::from_ref(&push_constant_range));
-    let pipeline_layout = device.create_pipeline_layout(&pipeline_layout_info, None).map_err(|e| e.to_string())?;
+    let pipeline_layout = device
+        .create_pipeline_layout(&pipeline_layout_info, None)
+        .map_err(|e| e.to_string())?;
 
     let shader_code = ash::util::read_spv(&mut std::io::Cursor::new(PRESENT_SHADER_SPV))
         .map_err(|e| format!("read spv: {e}"))?;
     let shader_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
-    let shader_module = device.create_shader_module(&shader_info, None).map_err(|e| e.to_string())?;
+    let shader_module = device
+        .create_shader_module(&shader_info, None)
+        .map_err(|e| e.to_string())?;
 
     let entry_name = CStr::from_bytes_with_nul(b"main\0").unwrap();
     let stage_info = vk::PipelineShaderStageCreateInfo::default()
@@ -617,13 +715,17 @@ unsafe fn create_present_pipeline(
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .max_sets(image_count)
         .pool_sizes(&pool_sizes);
-    let descriptor_pool = device.create_descriptor_pool(&pool_info, None).map_err(|e| e.to_string())?;
+    let descriptor_pool = device
+        .create_descriptor_pool(&pool_info, None)
+        .map_err(|e| e.to_string())?;
 
     let layouts: Vec<vk::DescriptorSetLayout> = vec![set_layout; image_count as usize];
     let alloc_info = vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(descriptor_pool)
         .set_layouts(&layouts);
-    let descriptor_sets = device.allocate_descriptor_sets(&alloc_info).map_err(|e| e.to_string())?;
+    let descriptor_sets = device
+        .allocate_descriptor_sets(&alloc_info)
+        .map_err(|e| e.to_string())?;
 
     for (i, &set) in descriptor_sets.iter().enumerate() {
         let buffer_info = vk::DescriptorBufferInfo::default()
@@ -651,5 +753,11 @@ unsafe fn create_present_pipeline(
         device.update_descriptor_sets(&writes, &[]);
     }
 
-    Ok((set_layout, descriptor_pool, descriptor_sets, pipeline_layout, pipeline))
+    Ok((
+        set_layout,
+        descriptor_pool,
+        descriptor_sets,
+        pipeline_layout,
+        pipeline,
+    ))
 }
