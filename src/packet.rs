@@ -140,14 +140,28 @@ impl TilePacketHeaderState {
         for (component_index, component) in tile.components.iter().enumerate() {
             for resolution in &component.resolutions {
                 for subband in &resolution.subbands {
+                    let (cbg_w, cbg_h) = if resolution.level == 0 {
+                        (resolution.precinct_width, resolution.precinct_height)
+                    } else {
+                        (
+                            resolution.precinct_width >> 1,
+                            resolution.precinct_height >> 1,
+                        )
+                    };
                     subbands.push(SubbandPacketHeaderState::new(
                         component_index as u16,
                         resolution.level,
                         subband.kind,
+                        subband.width,
+                        subband.height,
+                        subband.codeblock_width,
+                        subband.codeblock_height,
                         subband.codeblocks_x,
                         subband.codeblocks_y,
                         resolution.precincts_x,
                         resolution.precincts_y,
+                        cbg_w,
+                        cbg_h,
                     ));
                 }
             }
@@ -185,10 +199,16 @@ pub struct SubbandPacketHeaderState {
     pub component: u16,
     pub resolution: u8,
     pub kind: SubbandKind,
+    pub subband_width: u32,
+    pub subband_height: u32,
+    pub codeblock_width: u32,
+    pub codeblock_height: u32,
     pub codeblocks_x: u32,
     pub codeblocks_y: u32,
     pub precincts_x: u32,
     pub precincts_y: u32,
+    cbg_width: u32,
+    cbg_height: u32,
     precinct_trees: Vec<PrecinctTagTrees>,
     pub codeblocks: Vec<CodeblockHeaderState>,
 }
@@ -206,10 +226,16 @@ impl SubbandPacketHeaderState {
         component: u16,
         resolution: u8,
         kind: SubbandKind,
+        subband_width: u32,
+        subband_height: u32,
+        codeblock_width: u32,
+        codeblock_height: u32,
         codeblocks_x: u32,
         codeblocks_y: u32,
         precincts_x: u32,
         precincts_y: u32,
+        cbg_width: u32,
+        cbg_height: u32,
     ) -> Self {
         let codeblock_count = codeblocks_x.saturating_mul(codeblocks_y) as usize;
         let precinct_count = precincts_x.saturating_mul(precincts_y) as usize;
@@ -218,7 +244,16 @@ impl SubbandPacketHeaderState {
         for py in 0..precincts_y {
             for px in 0..precincts_x {
                 let (cx0, cx1, cy0, cy1) = precinct_codeblock_range_raw(
-                    codeblocks_x, codeblocks_y, precincts_x, precincts_y, px, py,
+                    subband_width,
+                    subband_height,
+                    codeblock_width,
+                    codeblock_height,
+                    codeblocks_x,
+                    codeblocks_y,
+                    cbg_width,
+                    cbg_height,
+                    px,
+                    py,
                 );
                 let pcb_x = cx1 - cx0;
                 let pcb_y = cy1 - cy0;
@@ -235,10 +270,16 @@ impl SubbandPacketHeaderState {
             component,
             resolution,
             kind,
+            subband_width,
+            subband_height,
+            codeblock_width,
+            codeblock_height,
             codeblocks_x,
             codeblocks_y,
             precincts_x,
             precincts_y,
+            cbg_width,
+            cbg_height,
             precinct_trees,
             codeblocks: vec![CodeblockHeaderState::default(); codeblock_count],
         }
@@ -294,9 +335,16 @@ impl SubbandPacketHeaderState {
         let trees = &mut self.precinct_trees[precinct_index];
 
         let (cx0, _, cy0, _) = precinct_codeblock_range_raw(
-            self.codeblocks_x, self.codeblocks_y,
-            self.precincts_x, self.precincts_y,
-            precinct_x, precinct_y,
+            self.subband_width,
+            self.subband_height,
+            self.codeblock_width,
+            self.codeblock_height,
+            self.codeblocks_x,
+            self.codeblocks_y,
+            self.cbg_width,
+            self.cbg_height,
+            precinct_x,
+            precinct_y,
         );
         let local_x = codeblock_x - cx0;
         let local_y = codeblock_y - cy0;
@@ -653,11 +701,19 @@ fn cprl_packet_sequence(
         let ph = component.resolutions[r].precinct_height;
         let pw_img = pw.checked_shl(shift as u32).unwrap_or(u32::MAX);
         let ph_img = ph.checked_shl(shift as u32).unwrap_or(u32::MAX);
-        if pw_img > 0 { step_x = step_x.min(pw_img); }
-        if ph_img > 0 { step_y = step_y.min(ph_img); }
+        if pw_img > 0 {
+            step_x = step_x.min(pw_img);
+        }
+        if ph_img > 0 {
+            step_y = step_y.min(ph_img);
+        }
     }
-    if step_x == 0 || step_x == u32::MAX { step_x = 1; }
-    if step_y == 0 || step_y == u32::MAX { step_y = 1; }
+    if step_x == 0 || step_x == u32::MAX {
+        step_x = 1;
+    }
+    if step_y == 0 || step_y == u32::MAX {
+        step_y = 1;
+    }
 
     let img_width = component.width;
     let img_height = component.height;
@@ -724,30 +780,55 @@ fn precinct_codeblock_range(
     precinct_y: u32,
     resolution: &crate::codestream::ResolutionLayout,
 ) -> (u32, u32, u32, u32) {
+    // ISO 15444-1 Annex B: the precinct's footprint in the subband is the
+    // "code-block group" (cbg).  For the LL band at resolution 0 the cbg
+    // equals the full precinct size; for detail subbands (HL/LH/HH) at
+    // resolution > 0 it is half the precinct size in each dimension.
+    let (cbg_w, cbg_h) = if resolution.level == 0 {
+        (resolution.precinct_width, resolution.precinct_height)
+    } else {
+        (
+            resolution.precinct_width >> 1,
+            resolution.precinct_height >> 1,
+        )
+    };
     precinct_codeblock_range_raw(
-        subband.codeblocks_x, subband.codeblocks_y,
-        resolution.precincts_x, resolution.precincts_y,
-        precinct_x, precinct_y,
+        subband.width,
+        subband.height,
+        subband.codeblock_width,
+        subband.codeblock_height,
+        subband.codeblocks_x,
+        subband.codeblocks_y,
+        cbg_w,
+        cbg_h,
+        precinct_x,
+        precinct_y,
     )
 }
 
 fn precinct_codeblock_range_raw(
+    subband_width: u32,
+    subband_height: u32,
+    codeblock_width: u32,
+    codeblock_height: u32,
     codeblocks_x: u32,
     codeblocks_y: u32,
-    precincts_x: u32,
-    precincts_y: u32,
+    cbg_width: u32,
+    cbg_height: u32,
     precinct_x: u32,
     precinct_y: u32,
 ) -> (u32, u32, u32, u32) {
-    if precincts_x <= 1 && precincts_y <= 1 {
-        return (0, codeblocks_x, 0, codeblocks_y);
-    }
-    let nominal_x = codeblocks_x.div_ceil(precincts_x);
-    let nominal_y = codeblocks_y.div_ceil(precincts_y);
-    let cb_x_start = (precinct_x * nominal_x).min(codeblocks_x);
-    let cb_x_end = ((precinct_x + 1) * nominal_x).min(codeblocks_x);
-    let cb_y_start = (precinct_y * nominal_y).min(codeblocks_y);
-    let cb_y_end = ((precinct_y + 1) * nominal_y).min(codeblocks_y);
+    // Compute the subband sample range covered by this precinct's cbg
+    let sbx0 = (precinct_x * cbg_width).min(subband_width);
+    let sbx1 = ((precinct_x + 1) * cbg_width).min(subband_width);
+    let sby0 = (precinct_y * cbg_height).min(subband_height);
+    let sby1 = ((precinct_y + 1) * cbg_height).min(subband_height);
+
+    // Map sample range to codeblock indices
+    let cb_x_start = (sbx0 / codeblock_width).min(codeblocks_x);
+    let cb_x_end = sbx1.div_ceil(codeblock_width).min(codeblocks_x);
+    let cb_y_start = (sby0 / codeblock_height).min(codeblocks_y);
+    let cb_y_end = sby1.div_ceil(codeblock_height).min(codeblocks_y);
     (cb_x_start, cb_x_end, cb_y_start, cb_y_end)
 }
 
@@ -1231,6 +1312,8 @@ mod tests {
                     height: 64,
                     precincts_x: 1,
                     precincts_y: 1,
+                    precinct_width: 32768,
+                    precinct_height: 32768,
                     subbands: vec![SubbandLayout {
                         kind: SubbandKind::Ll,
                         width: 128,
@@ -1264,5 +1347,86 @@ mod tests {
         }
 
         bytes
+    }
+
+    #[test]
+    fn precinct_codeblock_range_ll_single_precinct() {
+        // LL band at level 0: cbg = full precinct size (32768)
+        // subband 60x34, codeblock 32x32 → 2x2 codeblocks
+        let (x0, x1, y0, y1) =
+            precinct_codeblock_range_raw(60, 34, 32, 32, 2, 2, 32768, 32768, 0, 0);
+        assert_eq!((x0, x1, y0, y1), (0, 2, 0, 2));
+    }
+
+    #[test]
+    fn precinct_codeblock_range_detail_band_multi_precinct() {
+        // Detail band (HL) at resolution 6: precinct_width=256, so cbg_width=128
+        // subband 1920x1080, codeblock 32x32 → 60x34 codeblocks
+        // precinct (0,0) should cover subband samples [0..128, 0..128]
+        //   → codeblocks [0..4, 0..4]
+        let (x0, x1, y0, y1) =
+            precinct_codeblock_range_raw(1920, 1080, 32, 32, 60, 34, 128, 128, 0, 0);
+        assert_eq!((x0, x1, y0, y1), (0, 4, 0, 4));
+
+        // precinct (1,0) covers subband samples [128..256, 0..128]
+        //   → codeblocks [4..8, 0..4]
+        let (x0, x1, y0, y1) =
+            precinct_codeblock_range_raw(1920, 1080, 32, 32, 60, 34, 128, 128, 1, 0);
+        assert_eq!((x0, x1, y0, y1), (4, 8, 0, 4));
+
+        // last precinct x=14: covers [14*128..15*128]=[1792..1920]
+        //   → codeblocks [56..60, 0..4]
+        let (x0, x1, y0, y1) =
+            precinct_codeblock_range_raw(1920, 1080, 32, 32, 60, 34, 128, 128, 14, 0);
+        assert_eq!((x0, x1, y0, y1), (56, 60, 0, 4));
+
+        // last precinct y=8: covers [8*128..9*128]=[1024..1080] (clamped)
+        //   → codeblocks y: [32..34]
+        let (x0, x1, y0, y1) =
+            precinct_codeblock_range_raw(1920, 1080, 32, 32, 60, 34, 128, 128, 0, 8);
+        assert_eq!((x0, x1, y0, y1), (0, 4, 32, 34));
+    }
+
+    #[test]
+    fn precinct_codeblock_range_old_naive_would_differ() {
+        // This test demonstrates the fix: the old naive div_ceil approach
+        // would compute nominal_x = ceil(60/15) = 4, giving the same result
+        // for this specific case. But for non-power-of-2 subband sizes where
+        // cbg_width doesn't evenly divide the subband, the results differ.
+        //
+        // subband 1920x1080, codeblock 32x32, cbg 128x128
+        // Old: nominal = ceil(60/15) = 4, precinct 14 → [56..60]
+        // New: precinct 14 → samples [1792..1920] → cblk [56..60]
+        // Same here, but consider subband width 1900:
+        //   Old: codeblocks_x = ceil(1900/32) = 60, precincts still 15
+        //        nominal = ceil(60/15) = 4, precinct 14 → [56..60]
+        //   New: precinct 14 → samples [1792..1900] → cblk [56..60] (ceil(1900/32)=60)
+        // The difference shows with non-aligned subband sizes.
+        //
+        // More critically: for a subband of width 100, cblk 32, cbg 128:
+        //   codeblocks_x = ceil(100/32) = 4
+        //   Only 1 precinct needed (ceil(100/128) = 1)
+        //   Old with precincts=1: returns (0, 4, ...)
+        //   New: precinct 0 → samples [0..100] → cblk [0..4] ✓
+        //
+        // The real difference: with 2 precincts and subband width 200, cbg 128:
+        //   codeblocks_x = ceil(200/32) = 7
+        //   precincts_x = ceil(200/128) = 2
+        //   Old: nominal = ceil(7/2) = 4
+        //     precinct 0 → [0..4], precinct 1 → [4..7]
+        //   New: precinct 0 → samples [0..128] → cblk [0..4]
+        //     precinct 1 → samples [128..200] → cblk [4..7]
+        //   Same result here! But with subband width 129:
+        //     codeblocks_x = ceil(129/32) = 5
+        //     precincts_x = ceil(129/128) = 2
+        //     Old: nominal = ceil(5/2) = 3
+        //       precinct 0 → [0..3], precinct 1 → [3..5]
+        //     New: precinct 0 → samples [0..128] → cblk [0..4]
+        //       precinct 1 → samples [128..129] → cblk [4..5]
+        let (x0, x1, _, _) = precinct_codeblock_range_raw(129, 64, 32, 32, 5, 2, 128, 128, 0, 0);
+        assert_eq!((x0, x1), (0, 4)); // New: correct (4 codeblocks in first precinct)
+
+        let (x0, x1, _, _) = precinct_codeblock_range_raw(129, 64, 32, 32, 5, 2, 128, 128, 1, 0);
+        assert_eq!((x0, x1), (4, 5)); // New: correct (1 codeblock in second precinct)
     }
 }
