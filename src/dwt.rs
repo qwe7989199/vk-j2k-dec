@@ -81,9 +81,7 @@ pub fn inverse_9_7_1d(low: &[f32], high: &[f32]) -> Result<Vec<f32>, DwtError> {
         return Ok(Vec::new());
     }
 
-    let unscaled_low = (0..low.len())
-        .map(|index| low[index] / DWT97_K)
-        .collect::<Vec<_>>();
+    let unscaled_low = low.to_vec();
     let unscaled_high = (0..high.len())
         .map(|index| high[index] * DWT97_K)
         .collect::<Vec<_>>();
@@ -102,10 +100,11 @@ pub fn inverse_9_7_1d(low: &[f32], high: &[f32]) -> Result<Vec<f32>, DwtError> {
     let mut updated_high = Vec::with_capacity(high.len());
     for index in 0..high.len() {
         let left = updated_low[index];
-        let right = updated_low
-            .get(index + 1)
-            .copied()
-            .unwrap_or(updated_low[index]);
+        let right = if index + 1 < updated_low.len() {
+            updated_low[index + 1]
+        } else {
+            updated_low[index]
+        };
         updated_high.push(unscaled_high[index] - DWT97_GAMMA * (left + right));
     }
 
@@ -121,10 +120,11 @@ pub fn inverse_9_7_1d(low: &[f32], high: &[f32]) -> Result<Vec<f32>, DwtError> {
 
     for index in 0..updated_high.len() {
         let left = updated_low[index];
-        let right = updated_low
-            .get(index + 1)
-            .copied()
-            .unwrap_or(updated_low[index]);
+        let right = if index + 1 < updated_low.len() {
+            updated_low[index + 1]
+        } else {
+            updated_low[index]
+        };
         updated_high[index] -= DWT97_ALPHA * (left + right);
     }
 
@@ -657,9 +657,6 @@ mod tests {
             low[index] += DWT97_DELTA * (left + right);
         }
 
-        for value in &mut low {
-            *value *= DWT97_K;
-        }
         for value in &mut high {
             *value /= DWT97_K;
         }
@@ -753,6 +750,46 @@ mod tests {
         assert!(
             (actual - expected).abs() <= 0.0001,
             "got {actual}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn inverse_97_dc_gain_2d_6_levels() {
+        use super::*;
+        // Forward transform a constant signal through 6 levels to measure
+        // what coefficient values the encoder produces.
+        let signal = PlaneF32 {
+            width: 3840,
+            height: 2160,
+            samples: vec![1000.0f32; 3840 * 2160],
+        };
+        // Do 6 levels of forward 2D DWT
+        let mut current = signal;
+        for _level in 0..6 {
+            let (ll, _hl, _lh, _hh) = forward_9_7_level(&current);
+            current = ll;
+        }
+        // The LL coefficient after 6 levels of forward DWT on constant 1000
+        let ll_coeff = current.samples[current.samples.len() / 2];
+        eprintln!("forward 6-level LL of constant 1000: {ll_coeff}");
+        eprintln!("  ratio = {}", ll_coeff / 1000.0);
+        eprintln!("  K^12 = {}", 1.2301741f64.powi(12));
+        // Now inverse should give back 1000
+        // dequant_scale should be such that: ll_coeff / dequant_scale * iDWT_gain = 1000
+        assert!((ll_coeff / 1000.0 - DWT97_K.powi(12)).abs() < 0.05);
+    }
+
+    #[test]
+    fn inverse_9_7_low_band_dc_gain_is_one_over_k() {
+        let low = vec![-2047.0; 8];
+        let high = vec![0.0; 8];
+        let reconstructed = inverse_9_7_1d(&low, &high).expect("inverse");
+        let expected = -2047.0 / DWT97_K;
+
+        assert!(
+            (reconstructed[reconstructed.len() / 2] - expected).abs() < 0.001,
+            "got {}, expected {expected}",
+            reconstructed[reconstructed.len() / 2]
         );
     }
 }

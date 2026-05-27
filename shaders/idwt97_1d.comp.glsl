@@ -44,7 +44,7 @@ float unscaled_high_at(uint line, uint index) {
 }
 
 float low_unscaled_at(uint line, uint index) {
-    return low_band[line * pc.low_line_stride + index * pc.low_sample_stride] / DWT97_K;
+    return low_band[line * pc.low_line_stride + index * pc.low_sample_stride];
 }
 
 float after_delta_low_at(uint line, uint index) {

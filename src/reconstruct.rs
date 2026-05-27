@@ -439,20 +439,33 @@ impl QcdScaleMap {
     }
 
     fn scale_for(&self, resolution: u8, subband: SubbandKind) -> Result<f32, Tier1DecodeError> {
-        match self.style {
-            QuantizationStyle::NoQuantization => Ok(1.0),
+        let base_scale = match self.style {
+            QuantizationStyle::NoQuantization => 1.0,
             QuantizationStyle::ScalarExpounded => {
                 let step = self.expounded_step(resolution, subband)?;
-                Ok(quantization_step_scale(step, self.precision, subband))
+                quantization_step_scale(step, self.precision, subband)
             }
             QuantizationStyle::ScalarDerived => {
                 let step = self.derived_step(resolution, subband)?;
-                Ok(quantization_step_scale(step, self.precision, subband))
+                quantization_step_scale(step, self.precision, subband)
             }
-            QuantizationStyle::Unknown(value) => Err(Tier1DecodeError::new(format!(
-                "unsupported QCD quantization style {value}"
-            ))),
-        }
+            QuantizationStyle::Unknown(value) => {
+                return Err(Tier1DecodeError::new(format!(
+                    "unsupported QCD quantization style {value}"
+                )));
+            }
+        };
+        // Match the 9/7 normalization used by FFmpeg/OpenJPEG: after the
+        // inverse 1D pass has DC gain 1/K, LL carries K^2 per decomposition.
+        let k: f32 = 1.2301741;
+        let nl = self.decomposition_levels as i32;
+        let r = resolution as i32;
+        let k_power = match subband {
+            SubbandKind::Ll => 2 * nl,
+            SubbandKind::Hl | SubbandKind::Lh => 2 * (nl - r) - 1,
+            SubbandKind::Hh => 2 * (nl - r) - 4,
+        };
+        Ok(base_scale * k.powi(k_power))
     }
 
     fn expounded_step(
@@ -597,6 +610,8 @@ mod tests {
                 height: 4,
                 precincts_x: 1,
                 precincts_y: 1,
+                precinct_width: 32768,
+                precinct_height: 32768,
                 subbands: vec![SubbandLayout {
                     kind: SubbandKind::Ll,
                     width: 8,
@@ -646,6 +661,8 @@ mod tests {
                 height: 1,
                 precincts_x: 1,
                 precincts_y: 1,
+                precinct_width: 32768,
+                precinct_height: 32768,
                 subbands: vec![SubbandLayout {
                     kind: SubbandKind::Ll,
                     width: 1,
@@ -712,6 +729,8 @@ mod tests {
                     height: 2,
                     precincts_x: 1,
                     precincts_y: 1,
+                    precinct_width: 32768,
+                    precinct_height: 32768,
                     subbands: vec![SubbandLayout {
                         kind: SubbandKind::Ll,
                         width: 3,
@@ -728,6 +747,8 @@ mod tests {
                     height: 4,
                     precincts_x: 1,
                     precincts_y: 1,
+                    precinct_width: 32768,
+                    precinct_height: 32768,
                     subbands: vec![
                         SubbandLayout {
                             kind: SubbandKind::Hl,
@@ -823,29 +844,29 @@ mod tests {
         assert_f32_slices_close(
             &plane.samples,
             &[
-                -4.4902697,
-                -0.65487915,
-                -7.339456,
-                -0.48657295,
-                10.977664,
-                1.3847177,
-                7.50584,
-                3.533594,
-                1.0696449,
-                5.0084,
-                0.011556479,
-                -3.2508037,
-                -4.2915163,
-                6.1909294,
-                4.2609515,
-                -4.837547,
-                7.402795,
-                7.862847,
-                4.539947,
-                -1.3311605,
+                -4.9983344,
+                -0.7467388,
+                -9.613315,
+                -0.2599589,
+                15.541199,
+                2.1961172,
+                9.223418,
+                4.208291,
+                2.3557115,
+                7.369725,
+                -0.33785442,
+                -3.324371,
+                -4.599637,
+                8.222093,
+                6.7605853,
+                -5.3024955,
+                8.784266,
+                10.593021,
+                7.070576,
+                -1.0562062,
             ],
         );
-        assert_f32_close(plane.sample(4, 3).unwrap(), -1.3311605);
+        assert_f32_close(plane.sample(4, 3).unwrap(), -1.0562062);
         assert_eq!(plane.sample(5, 3), None);
     }
 
@@ -952,33 +973,58 @@ mod tests {
             ComponentFloatSubbandPlanes::from_component_with_qcd(&component, &qcd, 12, 1)
                 .expect("QCD scales");
 
-        assert_eq!(
+        const K: f32 = 1.2301741;
+
+        assert_f32_slices_close(
             float_component
                 .plane(0, SubbandKind::Ll)
                 .expect("LL")
-                .samples,
-            vec![4.0, -3.0, 12.0, 1.0, 5.0, 9.0]
+                .samples
+                .as_slice(),
+            &[
+                4.0 * K.powi(2),
+                -3.0 * K.powi(2),
+                12.0 * K.powi(2),
+                1.0 * K.powi(2),
+                5.0 * K.powi(2),
+                9.0 * K.powi(2),
+            ],
         );
-        assert_eq!(
+        assert_f32_slices_close(
             float_component
                 .plane(1, SubbandKind::Hl)
                 .expect("HL")
-                .samples,
-            vec![10.5, -7.5, 3.0, 4.5]
+                .samples
+                .as_slice(),
+            &[7.0 * 1.5 / K, -5.0 * 1.5 / K, 2.0 * 1.5 / K, 3.0 * 1.5 / K],
         );
-        assert_eq!(
+        assert_f32_slices_close(
             float_component
                 .plane(1, SubbandKind::Lh)
                 .expect("LH")
-                .samples,
-            vec![3.0, 4.0, -2.0, 0.0, 5.5, -3.5]
+                .samples
+                .as_slice(),
+            &[
+                6.0 * 0.5 / K,
+                8.0 * 0.5 / K,
+                -4.0 * 0.5 / K,
+                0.0,
+                11.0 * 0.5 / K,
+                -7.0 * 0.5 / K,
+            ],
         );
-        assert_eq!(
+        assert_f32_slices_close(
             float_component
                 .plane(1, SubbandKind::Hh)
                 .expect("HH")
-                .samples,
-            vec![1.0, -2.0, 4.0, -3.0]
+                .samples
+                .as_slice(),
+            &[
+                1.0 / K.powi(4),
+                -2.0 / K.powi(4),
+                4.0 / K.powi(4),
+                -3.0 / K.powi(4),
+            ],
         );
     }
 
@@ -1012,26 +1058,43 @@ mod tests {
             ComponentFloatSubbandPlanes::from_component_with_qcd(&component, &qcd, 12, 1)
                 .expect("QCD scales");
 
-        assert_eq!(
+        const K: f32 = 1.2301741;
+
+        assert_f32_slices_close(
             float_component
                 .plane(0, SubbandKind::Ll)
                 .expect("LL")
-                .samples,
-            vec![6.0, -4.5, 18.0, 1.5, 7.5, 13.5]
+                .samples
+                .as_slice(),
+            &[
+                6.0 * K.powi(2),
+                -4.5 * K.powi(2),
+                18.0 * K.powi(2),
+                1.5 * K.powi(2),
+                7.5 * K.powi(2),
+                13.5 * K.powi(2),
+            ],
         );
-        assert_eq!(
+        assert_f32_slices_close(
             float_component
                 .plane(1, SubbandKind::Hl)
                 .expect("HL")
-                .samples,
-            vec![21.0, -15.0, 6.0, 9.0]
+                .samples
+                .as_slice(),
+            &[7.0 * 3.0 / K, -5.0 * 3.0 / K, 2.0 * 3.0 / K, 3.0 * 3.0 / K],
         );
-        assert_eq!(
+        assert_f32_slices_close(
             float_component
                 .plane(1, SubbandKind::Hh)
                 .expect("HH")
-                .samples,
-            vec![6.0, -12.0, 24.0, -18.0]
+                .samples
+                .as_slice(),
+            &[
+                1.0 * 6.0 / K.powi(4),
+                -2.0 * 6.0 / K.powi(4),
+                4.0 * 6.0 / K.powi(4),
+                -3.0 * 6.0 / K.powi(4),
+            ],
         );
     }
 
@@ -1046,6 +1109,8 @@ mod tests {
                     height: 2,
                     precincts_x: 1,
                     precincts_y: 1,
+                    precinct_width: 32768,
+                    precinct_height: 32768,
                     subbands: vec![SubbandLayout {
                         kind: SubbandKind::Ll,
                         width: 3,
@@ -1062,6 +1127,8 @@ mod tests {
                     height: 4,
                     precincts_x: 1,
                     precincts_y: 1,
+                    precinct_width: 32768,
+                    precinct_height: 32768,
                     subbands: vec![
                         SubbandLayout {
                             kind: SubbandKind::Hl,
