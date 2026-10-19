@@ -37,12 +37,15 @@ const VK_PIPELINE_STAGE_TRANSFER_BIT: u32 = 0x0000_1000;
 const VK_PIPELINE_STAGE_HOST_BIT: u32 = 0x0000_4000;
 const VK_ACCESS_TRANSFER_READ_BIT: u32 = 0x0000_0800;
 const VK_ACCESS_TRANSFER_WRITE_BIT: u32 = 0x0000_1000;
+const VK_ACCESS_HOST_READ_BIT: u32 = 0x0000_2000;
 const VK_ACCESS_HOST_WRITE_BIT: u32 = 0x0000_4000;
 const VK_ACCESS_SHADER_READ_BIT: u32 = 0x0000_0020;
 const VK_ACCESS_SHADER_WRITE_BIT: u32 = 0x0000_0040;
 const VK_PIPELINE_BIND_POINT_COMPUTE: u32 = 1;
 const VK_COMMAND_BUFFER_LEVEL_PRIMARY: u32 = 0;
 const VK_WHOLE_SIZE: u64 = !0;
+const VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT: u32 = 0x0000_0002;
+const VK_MEMORY_HEAP_DEVICE_LOCAL_BIT: u32 = 0x0000_0001;
 
 type VkInstance = usize;
 type VkPhysicalDevice = usize;
@@ -488,6 +491,7 @@ struct VkMemoryBarrier {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct VkBufferCopy {
     src_offset: u64,
     dst_offset: u64,
@@ -501,7 +505,10 @@ struct VkFenceCreateInfo {
     flags: VkFlags,
 }
 
-#[repr(C)]
+// VkPhysicalDeviceLimits contains VkDeviceSize fields, so it is 8-byte aligned: without
+// align(8) it would sit 4 bytes early inside VkPhysicalDeviceProperties and the driver would
+// write past the end of the struct.
+#[repr(C, align(8))]
 #[derive(Clone, Copy)]
 struct VkPhysicalDeviceLimits {
     bytes: [u8; 504],

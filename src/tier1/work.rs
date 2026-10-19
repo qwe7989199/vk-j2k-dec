@@ -255,7 +255,9 @@ pub fn tier1_pass_for_index(
     let (bitplane, kind) = if index == 0 {
         (first_bitplane, Tier1PassKind::Cleanup)
     } else {
-        let bitplane = first_bitplane - 1 - ((index - 1) / 3) as i32;
+        // Some streams signal more passes than bitplanes; like the GPU shaders (and FFmpeg's
+        // output), keep decoding the surplus passes at bitplane 0.
+        let bitplane = (first_bitplane - 1 - ((index - 1) / 3) as i32).max(0);
         match (index - 1) % 3 {
             0 => (bitplane, Tier1PassKind::SignificancePropagation),
             1 => (bitplane, Tier1PassKind::MagnitudeRefinement),

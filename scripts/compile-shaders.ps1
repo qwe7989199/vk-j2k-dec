@@ -27,14 +27,20 @@ $shaders = @(
     @{ Source = "shaders\tier1_plan_smoke.comp.glsl"; Output = "tier1_plan_smoke.comp.spv" },
     @{ Source = "shaders\tier1_mq_smoke.comp.glsl"; Output = "tier1_mq_smoke.comp.spv" },
     @{ Source = "shaders\tier1_cleanup_smoke.comp.glsl"; Output = "tier1_cleanup_smoke.comp.spv" },
+    @{ Source = "shaders\tier1_cleanup_smoke.comp.glsl"; Output = "tier1_cleanup_nostats.comp.spv"; Defines = @("-DTIER1_NO_STATS") },
+    @{ Source = "shaders\tier1_thread_per_codeblock.comp.glsl"; Output = "tier1_cleanup_smoke_16.comp.spv" },
+    @{ Source = "shaders\tier1_thread_per_codeblock.comp.glsl"; Output = "tier1_thread_per_codeblock_nostats.comp.spv"; Defines = @("-DTIER1_NO_STATS") },
     @{ Source = "shaders\tier1_scatter_smoke.comp.glsl"; Output = "tier1_scatter_smoke.comp.spv" }
 )
 
 foreach ($shader in $shaders) {
     $output = Join-Path $OutputDir $shader.Output
     $extraArgs = @()
-    if ($shader.Source -match "tier1_cleanup_smoke") {
+    if ($shader.Source -match "tier1_cleanup_smoke|tier1_thread_per_codeblock") {
         $extraArgs = @("--target-env=vulkan1.1")
+    }
+    if ($shader.Defines) {
+        $extraArgs += $shader.Defines
     }
     & $glslc -fshader-stage=compute @extraArgs $shader.Source -o $output
     & $spirvVal $output

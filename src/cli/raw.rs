@@ -5,7 +5,7 @@ use std::process::Command;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use vk_j2k_dec::codestream::{Codestream, SubbandKind, WaveletTransform};
+use vk_j2k_dec::codestream::{CodeblockStyle, Codestream, SubbandKind, WaveletTransform};
 use vk_j2k_dec::decode::{
     DecodeProfile, decode_coefficient_planes, decode_reversible_component_planes_with_discard,
     decode_rgb48_with_discard, decode_rgb48_with_discard_profiled, decode_rgb48_with_gpu_dwt,
@@ -14,14 +14,19 @@ use vk_j2k_dec::decode::{
 };
 use vk_j2k_dec::gpu::{
     GpuTier1CodeblockRecord, GpuTier1Plan, GpuTier1ScatterPlan, GpuTier1ScatterRecord,
-    sort_codeblock_records_by_descending_work,
+    cpu_decodable, decode_codeblock_record_cpu, sort_codeblock_records_by_descending_work,
+    thread_per_codeblock_eligible,
 };
 use vk_j2k_dec::packet::parse_lrcp_tile_packets;
 use vk_j2k_dec::reconstruct::{ComponentSubbandPlanes, ResolutionSubbandPlane};
 use vk_j2k_dec::tier1::{
     CoefficientReconstruction, DecodedCodeblock, MqDecoder, Tier1CodingMode, Tier1WorkPlan,
 };
-use vk_j2k_dec::vulkan::{VulkanRgb48Pipeline, VulkanTier1Rgb48Pipeline};
+use vk_j2k_dec::tune::{BatchSizeTuner, CpuOffloadController};
+use vk_j2k_dec::vulkan::{
+    TIER1_PIPELINE_MAX_BATCH_FRAMES, Tier1BatchFrame, Tier1CpuCodeblock, VulkanRgb48Pipeline,
+    VulkanTier1Rgb48Pipeline, VulkanTier1Rgb48PipelineConfig,
+};
 
 pub fn decode_rgb48_file(input: &str, output: &str) -> ExitCode {
     decode_rgb48_file_with_discard(input, 0, output)
@@ -515,6 +520,7 @@ struct FastTier1Rgb48Frame {
     target_resolution: u8,
     color_transform: u32,
     precision: u8,
+    codeblock_style: CodeblockStyle,
 }
 
 fn profile_mxf_ffmpeg_gpu_tier1_file(
@@ -567,19 +573,6 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         eprintln!("profile-mxf-ffmpeg gpu-tier1 failed: no frames decoded");
         return ExitCode::FAILURE;
     };
-    let cleanup_shader_path = {
-        let thread_shader = r"target\shaders\tier1_cleanup_smoke_16.comp.spv";
-        let warp_shader = r"target\shaders\tier1_cleanup_smoke.comp.spv";
-        if std::path::Path::new(thread_shader).exists()
-            && frame_plans.iter().all(|frame| {
-                frame.records.iter().all(|r| r.coefficient_count <= 1024)
-            })
-        {
-            thread_shader
-        } else {
-            warp_shader
-        }
-    };
     let (template_records, template_scatter_records, flat_coefficient_count) =
         match build_tier1_union_template(&frame_plans) {
             Ok(template) => template,
@@ -598,6 +591,7 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
             );
             return ExitCode::FAILURE;
         }
+        // Heaviest first: the CPU offload takes each frame's leading records.
         sort_codeblock_records_by_descending_work(&mut frame.records);
     }
     let first_frame = frame_plans
@@ -639,21 +633,47 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         }
     }
 
-    let pipeline = match VulkanTier1Rgb48Pipeline::new(
+    let thread_per_codeblock = thread_per_codeblock_eligible(&template_records)
+        && first_existing(TIER1_THREAD_SHADERS).is_some();
+    let cleanup_shader_path = if thread_per_codeblock {
+        first_existing(TIER1_THREAD_SHADERS)
+    } else {
+        first_existing(TIER1_WARP_SHADERS)
+    }
+    .unwrap_or(TIER1_WARP_SHADERS[TIER1_WARP_SHADERS.len() - 1]);
+
+    // The CPU may take up to a quarter of a frame's codeblocks; size its upload region for the
+    // largest codeblocks so any choice the controller makes fits.
+    let max_cpu_per_frame = (codeblock_count / 4).min(TIER1_MAX_CPU_CODEBLOCKS_PER_FRAME);
+    let mut coefficient_counts = template_records
+        .iter()
+        .map(|record| record.coefficient_count as usize)
+        .collect::<Vec<_>>();
+    coefficient_counts.sort_unstable_by(|a, b| b.cmp(a));
+    let cpu_coefficient_capacity = coefficient_counts.iter().take(max_cpu_per_frame).sum();
+    let fixed_batch = env_usize("VK_J2K_BATCH").filter(|batch| *batch > 0);
+    let fixed_cpu_codeblocks = env_usize("VK_J2K_CPU_CBLKS").map(|k| k.min(max_cpu_per_frame));
+
+    let mut pipeline = match VulkanTier1Rgb48Pipeline::new(&VulkanTier1Rgb48PipelineConfig {
         cleanup_shader_path,
+        thread_per_codeblock,
         scatter_shader_path,
         idwt53_shader_path,
         color_shader_path,
         codeblock_count,
         compressed_word_capacity,
         flat_coefficient_count,
-        &scatter_plan.records,
-        &scatter_plan.planes,
-        scatter_plan.output_coefficients,
+        scatter_records: &scatter_plan.records,
+        scatter_planes: &scatter_plan.planes,
+        output_coefficients: scatter_plan.output_coefficients,
         target_resolution,
         color_transform,
         precision,
-    ) {
+        max_batch_frames: fixed_batch
+            .unwrap_or(TIER1_PIPELINE_MAX_BATCH_FRAMES)
+            .min(frame_plans.len()),
+        cpu_coefficient_capacity,
+    }) {
         Ok(pipeline) => pipeline,
         Err(err) => {
             eprintln!("profile-mxf-ffmpeg gpu-tier1 failed: pipeline setup failed: {err}");
@@ -661,89 +681,40 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         }
     };
 
-    let mut frame_total_ms = Vec::with_capacity(frame_count);
-    let mut upload_ms = Vec::with_capacity(frame_count);
-    let mut dispatch_ms = Vec::with_capacity(frame_count);
-    let mut copy_ms = Vec::with_capacity(frame_count);
-    let mut readback_ms = Vec::with_capacity(frame_count);
-    let mut last_samples = None;
+    let cpu_threads = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let mut tuner = match fixed_batch {
+        Some(batch) => BatchSizeTuner::fixed(batch.min(pipeline.max_batch_frames())),
+        None => BatchSizeTuner::new(pipeline.max_batch_frames()),
+    };
+    let mut offload = match fixed_cpu_codeblocks {
+        Some(per_frame) => CpuOffloadController::fixed(per_frame),
+        None => CpuOffloadController::new(max_cpu_per_frame, cpu_threads),
+    };
+    let hash_frames = std::env::var_os("VK_J2K_HASH_FRAMES").is_some();
+
     let decode_loop_start = Instant::now();
-    // Double-buffered: submit to alternating slots, read previous slot's result
-    let mut pending_slot: Option<usize> = None;
-    for (frame_index, frame) in frame_plans.iter().enumerate() {
-        let slot = frame_index % 2;
-        let frame_start = Instant::now();
-
-        // If this slot has a pending result, wait and read it first
-        if let Some(prev_slot) = pending_slot {
-            if prev_slot == slot {
-                let decoded = match pipeline.wait_and_read_frame(prev_slot) {
-                    Ok(d) => d,
-                    Err(err) => {
-                        eprintln!("profile-mxf-ffmpeg gpu-tier1 failed reading frame: {err}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                last_samples = Some(decoded.samples);
-            }
-        }
-
-        if let Err(err) = pipeline.submit_frame(slot, &frame.records, &frame.compressed_words) {
-            eprintln!(
-                "profile-mxf-ffmpeg gpu-tier1 failed on frame {}: {err}",
-                frame_index + 1
-            );
+    let outcome = match run_tier1_mxf_decode_loop(
+        &mut pipeline,
+        &frame_plans,
+        &mut tuner,
+        &mut offload,
+        cpu_threads,
+        hash_frames,
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            eprintln!("profile-mxf-ffmpeg gpu-tier1 failed: {err}");
             return ExitCode::FAILURE;
         }
-
-        // Read the OTHER slot if it has a pending result (true overlap)
-        let other_slot = 1 - slot;
-        if let Some(prev_slot) = pending_slot {
-            if prev_slot == other_slot {
-                let decoded = match pipeline.wait_and_read_frame(other_slot) {
-                    Ok(d) => d,
-                    Err(err) => {
-                        eprintln!("profile-mxf-ffmpeg gpu-tier1 failed reading frame: {err}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                let total_ms = elapsed_ms(frame_start);
-                dispatch_ms.push(decoded.fused_dispatch_ms);
-                copy_ms.push(decoded.color_copy_ms);
-                readback_ms.push(decoded.color_readback_ms);
-                frame_total_ms.push(total_ms);
-                upload_ms.push(0.0);
-                last_samples = Some(decoded.samples);
-            }
-        }
-
-        pending_slot = Some(slot);
-
-        if frame_index % 100 == 0 || frame_index + 1 == frame_count {
-            println!("  frame {:>4}: submitted to slot {}", frame_index + 1, slot);
-        }
-    }
-    // Drain the last pending slot
-    if let Some(slot) = pending_slot {
-        let decoded = match pipeline.wait_and_read_frame(slot) {
-            Ok(d) => d,
-            Err(err) => {
-                eprintln!("profile-mxf-ffmpeg gpu-tier1 failed reading final frame: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-        dispatch_ms.push(decoded.fused_dispatch_ms);
-        copy_ms.push(decoded.color_copy_ms);
-        readback_ms.push(decoded.color_readback_ms);
-        frame_total_ms.push(0.0);
-        upload_ms.push(0.0);
-        last_samples = Some(decoded.samples);
-    }
+    };
     let decode_loop_ms = elapsed_ms(decode_loop_start);
-    let Some(samples) = last_samples else {
+    let samples = outcome.last_samples;
+    if samples.is_empty() {
         eprintln!("profile-mxf-ffmpeg gpu-tier1 failed: no frames decoded");
         return ExitCode::FAILURE;
-    };
+    }
     let write_start = Instant::now();
     if let Err(err) = fs::write(output, samples_to_le_bytes(&samples)) {
         eprintln!("failed to write {output}: {err}");
@@ -762,31 +733,322 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
     println!("  input {input}");
     println!("  work_dir {}", work_dir.display());
     println!("  vulkan_device {}", pipeline.device_name());
+    println!(
+        "  device_local_heap_mib {} cpu_threads {}",
+        pipeline.device_local_heap_bytes() / (1024 * 1024),
+        cpu_threads
+    );
+    println!(
+        "  tier1_shader {} ({})",
+        cleanup_shader_path,
+        if thread_per_codeblock { "thread-per-codeblock" } else { "warp-per-codeblock" }
+    );
     println!("  ffmpeg_demux_ms {:.3}", demux_ms);
     println!("  read_frames_ms {:.3}", read_total_ms);
     println!("  pipeline_setup_ms {:.3}", pipeline.setup_ms());
     println!("  decode_loop_ms {:.3}", decode_loop_ms);
     println!("  write_last_ms {:.3}", write_ms);
-    print_fast_tier1_average(
-        "avg_all_frames",
-        &frame_total_ms,
-        &upload_ms,
-        &dispatch_ms,
-        &copy_ms,
-        &readback_ms,
+    let probes = tuner
+        .results()
+        .iter()
+        .map(|(batch, ms)| format!("{batch}:{ms:.2}ms"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "  autotune batch {} (max {}{}) probes [{}] cpu_codeblocks_per_frame {} (max {}{})",
+        tuner.current(),
+        pipeline.max_batch_frames(),
+        if fixed_batch.is_some() { ", fixed" } else { "" },
+        probes,
+        offload.per_frame(),
+        max_cpu_per_frame,
+        if fixed_cpu_codeblocks.is_some() { ", fixed" } else { "" },
     );
-    if frame_total_ms.len() > 1 {
-        print_fast_tier1_average(
-            "avg_skip_first_frame",
-            &frame_total_ms[1..],
-            &upload_ms[1..],
-            &dispatch_ms[1..],
-            &copy_ms[1..],
-            &readback_ms[1..],
-        );
+    println!(
+        "  loop_avg_ms_per_frame total {:.3} fps {:.2}",
+        decode_loop_ms / frame_plans.len() as f64,
+        frame_plans.len() as f64 * 1000.0 / decode_loop_ms
+    );
+    print_tier1_iteration_average("tuning", &outcome.iterations, |it| !it.steady);
+    print_tier1_iteration_average("steady", &outcome.iterations, |it| it.steady);
+    if let Some(hash) = outcome.frames_hash {
+        println!("  frames_hash {hash:016x}");
     }
     println!("  output_pixels {}", sample_count);
     ExitCode::SUCCESS
+}
+
+/// Production Tier-1 shaders without diagnostic counters first, then the validation builds.
+const TIER1_WARP_SHADERS: &[&str] = &[
+    r"target\shaders\tier1_cleanup_nostats.comp.spv",
+    r"target\shaders\tier1_cleanup_smoke.comp.spv",
+];
+const TIER1_THREAD_SHADERS: &[&str] = &[
+    r"target\shaders\tier1_thread_per_codeblock_nostats.comp.spv",
+    r"target\shaders\tier1_cleanup_smoke_16.comp.spv",
+];
+const TIER1_MAX_CPU_CODEBLOCKS_PER_FRAME: usize = 256;
+
+fn first_existing(paths: &[&'static str]) -> Option<&'static str> {
+    paths.iter().copied().find(|path| Path::new(path).exists())
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.trim().parse().ok()
+}
+
+struct Tier1DecodeIteration {
+    frames_read: usize,
+    wall_ms: f64,
+    cpu_ms: f64,
+    wait_ms: f64,
+    read_ms: f64,
+    /// Batch size was settled (and offload adapting) when this iteration ran.
+    steady: bool,
+}
+
+struct Tier1DecodeLoopOutcome {
+    iterations: Vec<Tier1DecodeIteration>,
+    last_samples: Vec<u16>,
+    frames_hash: Option<u64>,
+}
+
+/// Double-buffered batch loop. Iteration `k` decodes batch `k`'s heaviest codeblocks on the CPU
+/// while the GPU runs batch `k-1`, submits batch `k`, then reads batch `k-1` back.
+fn run_tier1_mxf_decode_loop(
+    pipeline: &mut VulkanTier1Rgb48Pipeline,
+    frame_plans: &[FastTier1Rgb48Frame],
+    tuner: &mut BatchSizeTuner,
+    offload: &mut CpuOffloadController,
+    cpu_threads: usize,
+    hash_frames: bool,
+) -> Result<Tier1DecodeLoopOutcome, String> {
+    let frame_total = frame_plans.len();
+    let mut in_flight: [Option<(usize, usize)>; 2] = [None, None];
+    let mut iterations = Vec::new();
+    let mut last_samples = Vec::new();
+    let mut frames_hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut next_frame = 0;
+    let mut slot = 0;
+    while next_frame < frame_total || in_flight.iter().any(Option::is_some) {
+        let iteration_start = Instant::now();
+        let mut cpu_ms = 0.0;
+        let mut frames_submitted = 0;
+        let submitted = next_frame < frame_total;
+        if submitted {
+            let batch = tuner
+                .current()
+                .min(pipeline.max_batch_frames())
+                .min(frame_total - next_frame);
+            let batch_plans = &frame_plans[next_frame..next_frame + batch];
+            let cpu_start = Instant::now();
+            let cpu_codeblocks =
+                decode_heaviest_codeblocks_cpu(batch_plans, offload.per_frame(), cpu_threads)?;
+            cpu_ms = elapsed_ms(cpu_start);
+            let batch_frames = batch_plans
+                .iter()
+                .zip(&cpu_codeblocks)
+                .map(|(plan, cpu)| Tier1BatchFrame {
+                    gpu_records: &plan.records[cpu.len()..],
+                    compressed_words: &plan.compressed_words,
+                    cpu_codeblocks: cpu,
+                })
+                .collect::<Vec<_>>();
+            pipeline
+                .submit_batch(slot, &batch_frames)
+                .map_err(|err| format!("frame {}: {err}", next_frame + 1))?;
+            in_flight[slot] = Some((next_frame, batch));
+            next_frame += batch;
+            frames_submitted = batch;
+        }
+
+        // Read the older batch; once nothing is left to submit, drain this slot too.
+        let read_slot = if in_flight[1 - slot].is_some() {
+            Some(1 - slot)
+        } else if !submitted {
+            Some(slot)
+        } else {
+            None
+        };
+        let mut wait_ms = 0.0;
+        let mut read_ms = 0.0;
+        let mut frames_read = 0;
+        if let Some((read_slot, (first_frame, count))) =
+            read_slot.and_then(|read_slot| in_flight[read_slot].take().map(|batch| (read_slot, batch)))
+        {
+            let read_start = Instant::now();
+            wait_ms = pipeline
+                .wait_and_read_batch(read_slot, |index, samples| {
+                    if hash_frames {
+                        frames_hash = samples.iter().fold(frames_hash, |hash, sample| {
+                            (hash ^ u64::from(*sample)).wrapping_mul(0x0000_0100_0000_01b3)
+                        });
+                    }
+                    if first_frame + index + 1 == frame_total {
+                        last_samples = samples.to_vec();
+                    }
+                })
+                .map_err(|err| format!("reading frame {}: {err}", first_frame + 1))?;
+            read_ms = elapsed_ms(read_start) - wait_ms;
+            frames_read = count;
+        }
+        slot = 1 - slot;
+
+        // Only iterations that both decoded on the CPU and waited on the GPU are steady state.
+        if submitted && frames_read > 0 {
+            let wall_ms = elapsed_ms(iteration_start);
+            let steady = tuner.chosen().is_some();
+            iterations.push(Tier1DecodeIteration {
+                frames_read,
+                wall_ms,
+                cpu_ms,
+                wait_ms,
+                read_ms,
+                steady,
+            });
+            tuner.record(frames_read, wall_ms);
+            offload.update(cpu_ms, wait_ms, wall_ms, frames_submitted);
+        }
+    }
+    Ok(Tier1DecodeLoopOutcome {
+        iterations,
+        last_samples,
+        frames_hash: hash_frames.then_some(frames_hash),
+    })
+}
+
+/// Decodes the `per_frame` heaviest codeblocks of every frame on a scoped thread pool. Records
+/// are sorted heaviest first, so these are each frame's leading records.
+fn decode_heaviest_codeblocks_cpu(
+    frames: &[FastTier1Rgb48Frame],
+    per_frame: usize,
+    threads: usize,
+) -> Result<Vec<Vec<Tier1CpuCodeblock>>, String> {
+    // The GPU decodes `records[cpu_count..]`, so the CPU share must be a prefix; it stops at the
+    // first record the CPU decoder cannot reproduce bit-exactly.
+    let cpu_counts = frames
+        .iter()
+        .map(|frame| {
+            frame
+                .records
+                .iter()
+                .take(per_frame)
+                .take_while(|record| cpu_decodable(record))
+                .count()
+        })
+        .collect::<Vec<_>>();
+    // Rank-major: every frame's heaviest codeblock is handed out before anyone's second.
+    let jobs = (0..per_frame)
+        .flat_map(|rank| {
+            let cpu_counts = &cpu_counts;
+            (0..frames.len())
+                .filter(move |frame| rank < cpu_counts[*frame])
+                .map(move |frame| (frame, rank))
+        })
+        .collect::<Vec<_>>();
+    let mut decoded = cpu_counts
+        .iter()
+        .map(|count| {
+            (0..*count)
+                .map(|_| None)
+                .collect::<Vec<Option<Tier1CpuCodeblock>>>()
+        })
+        .collect::<Vec<_>>();
+    if jobs.is_empty() {
+        return Ok(decoded.into_iter().map(|_| Vec::new()).collect());
+    }
+    let next_job = std::sync::atomic::AtomicUsize::new(0);
+    let worker_results = std::thread::scope(|scope| {
+        let handles = (0..threads.clamp(1, jobs.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut results = Vec::new();
+                    loop {
+                        let job = next_job.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&(frame_index, rank)) = jobs.get(job) else {
+                            break;
+                        };
+                        let frame = &frames[frame_index];
+                        let record = &frame.records[rank];
+                        let coefficients = decode_codeblock_record_cpu(
+                            record,
+                            &frame.compressed_words,
+                            frame.codeblock_style,
+                        )
+                        .map_err(|err| {
+                            format!(
+                                "C{} R{} S{} {},{} {}x{} mbp {} zbp {} passes {} bytes {}: {err}",
+                                record.component,
+                                record.resolution,
+                                record.subband,
+                                record.codeblock_x,
+                                record.codeblock_y,
+                                record.width,
+                                record.height,
+                                record.magnitude_bitplanes,
+                                record.zero_bit_planes,
+                                record.pass_count,
+                                record.byte_len
+                            )
+                        });
+                        results.push((frame_index, rank, record.coefficient_offset, coefficients));
+                    }
+                    results
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join())
+            .collect::<Vec<_>>()
+    });
+    for results in worker_results {
+        let results = results.map_err(|_| "CPU Tier-1 worker thread panicked".to_string())?;
+        for (frame_index, rank, coefficient_offset, coefficients) in results {
+            let coefficients = coefficients.map_err(|err| {
+                format!("CPU Tier-1 decode of frame-local codeblock {rank} failed: {err}")
+            })?;
+            decoded[frame_index][rank] = Some(Tier1CpuCodeblock {
+                coefficient_offset,
+                coefficients,
+            });
+        }
+    }
+    decoded
+        .into_iter()
+        .map(|frame| {
+            frame
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| "CPU Tier-1 decode skipped a codeblock".to_string())
+        })
+        .collect()
+}
+
+fn print_tier1_iteration_average(
+    label: &str,
+    iterations: &[Tier1DecodeIteration],
+    include: impl Fn(&Tier1DecodeIteration) -> bool,
+) {
+    let selected = iterations.iter().filter(|it| include(it)).collect::<Vec<_>>();
+    let frames = selected.iter().map(|it| it.frames_read).sum::<usize>();
+    if frames == 0 {
+        return;
+    }
+    let per_frame = |value: fn(&Tier1DecodeIteration) -> f64| {
+        selected.iter().map(|it| value(it)).sum::<f64>() / frames as f64
+    };
+    let total = per_frame(|it| it.wall_ms);
+    println!(
+        "  {label}_ms_per_frame total {:.3} fps {:.2} cpu_tier1 {:.3} gpu_wait {:.3} readback {:.3} (iterations {}, frames {})",
+        total,
+        1000.0 / total,
+        per_frame(|it| it.cpu_ms),
+        per_frame(|it| it.wait_ms),
+        per_frame(|it| it.read_ms),
+        selected.len(),
+        frames
+    );
 }
 
 fn build_fast_tier1_rgb48_frame(data: &[u8]) -> Result<FastTier1Rgb48Frame, String> {
@@ -849,6 +1111,7 @@ fn build_fast_tier1_rgb48_frame(data: &[u8]) -> Result<FastTier1Rgb48Frame, Stri
         target_resolution: cod.decomposition_levels,
         color_transform: u32::from(cod.multiple_component_transform),
         precision,
+        codeblock_style: cod.codeblock_style_flags(),
     })
 }
 
@@ -998,33 +1261,6 @@ fn samples_to_le_bytes(samples: &[u16]) -> Vec<u8> {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
     bytes
-}
-
-fn print_fast_tier1_average(
-    label: &str,
-    total_ms: &[f64],
-    upload_ms: &[f64],
-    dispatch_ms: &[f64],
-    copy_ms: &[f64],
-    readback_ms: &[f64],
-) {
-    let total = average_f64(total_ms);
-    println!(
-        "  {label}_ms total {:.3} fps {:.2} upload {:.3} fused_dispatch {:.3} color_copy {:.3} color_readback {:.3}",
-        total,
-        1000.0 / total,
-        average_f64(upload_ms),
-        average_f64(dispatch_ms),
-        average_f64(copy_ms),
-        average_f64(readback_ms)
-    );
-}
-
-fn average_f64(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.iter().sum::<f64>() / values.len() as f64
 }
 
 pub fn diff_rgb48_files(actual: &str, reference: &str) -> ExitCode {

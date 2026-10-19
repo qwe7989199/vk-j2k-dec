@@ -4,6 +4,8 @@ pub struct VulkanDeviceSummary {
     pub vendor_id: u32,
     pub device_id: u32,
     pub device_type: VulkanDeviceType,
+    /// `VkPhysicalDeviceLimits::maxStorageBufferRange`, in bytes.
+    pub max_storage_buffer_range: u32,
     pub queue_families: Vec<VulkanQueueFamilySummary>,
 }
 
@@ -2626,243 +2628,457 @@ impl ReusableRgb48Packer {
     }
 }
 
+/// Most frames one persistent-pipeline submit may carry.
+pub const TIER1_PIPELINE_MAX_BATCH_FRAMES: usize = 8;
+/// Share of the device-local heap the batched pipeline plans to use; the rest is left for the
+/// display, other applications, and allocation overhead.
+const TIER1_PIPELINE_VRAM_BUDGET_FRACTION: f64 = 0.5;
+/// Per-frame regions of the batched coefficient buffer start on this byte boundary so per-frame
+/// descriptor offsets satisfy any `minStorageBufferOffsetAlignment` (the spec caps it at 256).
+const TIER1_PIPELINE_FRAME_ALIGNMENT: u64 = 256;
+/// `local_size_x` of the thread-per-codeblock shader, which decodes one codeblock per invocation.
+const TIER1_THREAD_PER_CODEBLOCK_GROUP_SIZE: u32 = 128;
+/// Guaranteed minimum of `maxComputeWorkGroupCount[0]`.
+const MIN_MAX_COMPUTE_WORKGROUP_COUNT: usize = 65_535;
+
+pub struct VulkanTier1Rgb48PipelineConfig<'a> {
+    pub cleanup_shader_path: &'a str,
+    /// `cleanup_shader_path` decodes one codeblock per invocation (codeblocks up to 16x16)
+    /// instead of one codeblock per subgroup.
+    pub thread_per_codeblock: bool,
+    pub scatter_shader_path: &'a str,
+    pub idwt53_shader_path: &'a str,
+    pub color_shader_path: &'a str,
+    pub codeblock_count: usize,
+    pub compressed_word_capacity: usize,
+    pub flat_coefficient_count: usize,
+    pub scatter_records: &'a [crate::gpu::GpuTier1ScatterRecord],
+    pub scatter_planes: &'a [crate::gpu::GpuTier1ScatterPlane],
+    pub output_coefficients: usize,
+    pub target_resolution: u8,
+    pub color_transform: u32,
+    pub precision: u8,
+    /// Upper bound on frames per submit; device memory and limits may lower it further.
+    pub max_batch_frames: usize,
+    /// Most CPU-decoded coefficients a single frame may hand to `submit_batch`.
+    pub cpu_coefficient_capacity: usize,
+}
+
+/// A codeblock the host already decoded; the pipeline copies its coefficients into place.
+pub struct Tier1CpuCodeblock {
+    pub coefficient_offset: u32,
+    pub coefficients: Vec<i32>,
+}
+
+pub struct Tier1BatchFrame<'a> {
+    /// Codeblocks for the GPU to decode, with offsets local to this frame.
+    pub gpu_records: &'a [crate::gpu::GpuTier1CodeblockRecord],
+    pub compressed_words: &'a [u32],
+    pub cpu_codeblocks: &'a [Tier1CpuCodeblock],
+}
+
+/// Double-buffered GPU Tier-1 -> scatter -> IDWT 5/3 -> RGB48 pipeline that decodes a batch of
+/// frames per submit. One Tier-1 dispatch over several frames lets the long-tail codeblocks of
+/// one frame overlap the bulk of the others, which a single small frame cannot do.
 pub struct VulkanTier1Rgb48Pipeline {
     device_name: String,
+    device_local_heap_bytes: u64,
+    setup_ms: f64,
+    max_batch_frames: usize,
+    thread_per_codeblock: bool,
     codeblock_count: usize,
     compressed_word_capacity: usize,
-    setup_ms: f64,
-    slots: [PipelineSlot; 2],
+    cpu_coefficient_capacity: usize,
+    flat_coefficient_count: usize,
+    flat_stride: u64,
+    scatter_push: Tier1ScatterSmokePushConstants,
+    scatter_groups: [u32; 3],
+    slots: Vec<PipelineSlot>,
     _scatter_records_buffer: HostBuffer,
-    _cleanup_program: StorageComputeProgram,
-    _scatter_program: StorageComputeProgram,
-    _idwt53_program: StorageComputeProgram,
-    _color_program: StorageComputeProgram,
-    _context: VulkanComputeContext,
+    programs: Tier1PipelinePrograms,
+    context: VulkanComputeContext,
+}
+
+struct Tier1PipelinePrograms {
+    cleanup: StorageComputeProgram,
+    scatter: StorageComputeProgram,
+    idwt53: StorageComputeProgram,
+    color: StorageComputeProgram,
+}
+
+/// Byte offsets of the host-visible upload regions inside a slot's staging buffer.
+#[derive(Clone, Copy)]
+struct Tier1StagingLayout {
+    compressed_offset: u64,
+    cpu_offset: u64,
+    total: u64,
+}
+
+impl Tier1StagingLayout {
+    fn new(records_bytes: u64, compressed_bytes: u64, cpu_bytes: u64) -> Self {
+        let compressed_offset = records_bytes.next_multiple_of(16);
+        let cpu_offset = (compressed_offset + compressed_bytes).next_multiple_of(16);
+        Self {
+            compressed_offset,
+            cpu_offset,
+            total: (cpu_offset + cpu_bytes).max(16),
+        }
+    }
 }
 
 struct PipelineSlot {
-    cleanup_records_buffer: HostBuffer,
+    staging: HostBuffer,
+    staging_layout: Tier1StagingLayout,
+    records_buffer: HostBuffer,
     compressed_buffer: HostBuffer,
-    _output_buffer: HostBuffer,
-    _flat_coefficient_buffer: HostBuffer,
+    flat_coefficient_buffer: HostBuffer,
+    _output_words_buffer: HostBuffer,
     _state_buffer: HostBuffer,
-    _plane_buffer: HostBuffer,
     _cleanup_descriptor_pool: DescriptorPoolHandle,
+    cleanup_descriptor_set: VkDescriptorSet,
     _scatter_descriptor_pool: DescriptorPoolHandle,
-    _fused_command_pool: CommandPoolHandle,
-    fused_command_buffer: VkCommandBuffer,
+    frames: Vec<PipelineFrameStage>,
+    _command_pool: CommandPoolHandle,
+    command_buffer: VkCommandBuffer,
     fence: FenceHandle,
-    rgb48_packer: ReusableRgb48Packer,
-    _idwt_components: Vec<ReusableScatteredIdwt53Component>,
+    pending_frames: usize,
 }
 
-impl VulkanTier1Rgb48Pipeline {
-    pub fn new(
-        cleanup_shader_path: &str,
-        scatter_shader_path: &str,
-        idwt53_shader_path: &str,
-        color_shader_path: &str,
-        codeblock_count: usize,
-        compressed_word_capacity: usize,
-        flat_coefficient_count: usize,
-        scatter_records: &[crate::gpu::GpuTier1ScatterRecord],
-        scatter_planes: &[crate::gpu::GpuTier1ScatterPlane],
-        output_coefficients: usize,
-        target_resolution: u8,
-        color_transform: u32,
-        precision: u8,
+/// Per-frame scatter/IDWT/color resources; the frame's Tier-1 coefficients live in the slot's
+/// batched coefficient buffer at `frame_index * flat_stride`.
+struct PipelineFrameStage {
+    scatter_descriptor_set: VkDescriptorSet,
+    rgb48_packer: ReusableRgb48Packer,
+    idwt_components: Vec<ReusableScatteredIdwt53Component>,
+    _plane_buffer: HostBuffer,
+}
+
+impl PipelineSlot {
+    fn new(
+        device: &VulkanDevice,
+        queue_family_index: u32,
+        config: &VulkanTier1Rgb48PipelineConfig<'_>,
+        programs: &Tier1PipelinePrograms,
+        scatter_records_buffer: &HostBuffer,
+        batch_frames: usize,
+        flat_stride: u64,
     ) -> Result<Self, VulkanError> {
-        if codeblock_count == 0 {
-            return Err(VulkanError::new(
-                "persistent GPU Tier-1 RGB48 pipeline requires at least one codeblock",
-            ));
-        }
-        if compressed_word_capacity == 0 {
-            return Err(VulkanError::new(
-                "persistent GPU Tier-1 RGB48 pipeline requires compressed word capacity",
-            ));
-        }
-        let max_scatter_coefficients =
-            validate_tier1_scatter_inputs(scatter_records, flat_coefficient_count, output_coefficients)?;
-        let cleanup_spirv = read_spirv(cleanup_shader_path)?;
-        let scatter_spirv = read_spirv(scatter_shader_path)?;
-        let idwt53_spirv = read_spirv(idwt53_shader_path)?;
-        let color_spirv = read_spirv(color_shader_path)?;
-        let (context, summary, queue_family_index) = create_compute_context()?;
-        let device = &context.device;
-        let setup_start = std::time::Instant::now();
-        let cleanup_program = StorageComputeProgram::new(
-            device,
-            &cleanup_spirv,
-            5,
-            std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
+        let record_count = batch_frames * config.codeblock_count;
+        let records_bytes = bytes_len::<crate::gpu::GpuTier1CodeblockRecord>(record_count)?;
+        let compressed_bytes = bytes_len::<u32>(batch_frames * config.compressed_word_capacity)?;
+        let cpu_bytes = bytes_len::<i32>(batch_frames * config.cpu_coefficient_capacity)?;
+        let staging_layout = Tier1StagingLayout::new(records_bytes, compressed_bytes, cpu_bytes);
+        let staging =
+            device.create_host_cached_buffer(staging_layout.total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)?;
+        let upload_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        let records_buffer = device.create_device_local_buffer(records_bytes, upload_usage)?;
+        let compressed_buffer = device.create_device_local_buffer(compressed_bytes, upload_usage)?;
+        let output_words_buffer = device.create_device_local_buffer(
+            bytes_len::<u32>(record_count * 9)?,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         )?;
-        let scatter_program = StorageComputeProgram::new(
-            device,
-            &scatter_spirv,
-            3,
-            std::mem::size_of::<Tier1ScatterSmokePushConstants>() as u32,
-        )?;
-        let idwt53_program = StorageComputeProgram::new(
-            device,
-            &idwt53_spirv,
-            3,
-            std::mem::size_of::<Idwt53OffsetPushConstants>() as u32,
-        )?;
-        let color_program = StorageComputeProgram::new(
-            device,
-            &color_spirv,
-            4,
-            std::mem::size_of::<ColorPushConstants>() as u32,
-        )?;
-
-        let records_byte_len = bytes_len::<crate::gpu::GpuTier1CodeblockRecord>(codeblock_count)?;
-        let compressed_byte_len = bytes_len::<u32>(compressed_word_capacity)?;
-        let scatter_records_buffer = create_device_buffer_from_slice(
-            device, queue_family_index, scatter_records, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        )?;
-        let output_len = codeblock_count * 9;
-        let flat_coefficient_byte_len = bytes_len::<i32>(flat_coefficient_count)?;
-        let plane_byte_len = bytes_len::<i32>(output_coefficients)?;
-
-        let cleanup_push = Tier1CleanupSmokePushConstants {
-            codeblock_count: codeblock_count as u32,
-            reconstruction_mode: 0,
-            codeblock_offset: 0,
+        let frame_bytes = flat_stride * 4;
+        let flat_coefficient_buffer =
+            device.create_device_local_buffer(frame_bytes * batch_frames as u64, upload_usage)?;
+        // The thread-per-codeblock shader keeps codeblock state in private memory.
+        let state_bytes = if config.thread_per_codeblock {
+            16
+        } else {
+            frame_bytes * batch_frames as u64
         };
-        let scatter_push = Tier1ScatterSmokePushConstants {
-            codeblock_count: scatter_records.len() as u32,
-        };
+        let state_buffer =
+            device.create_device_local_buffer(state_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)?;
 
-        let mut slots_vec = Vec::with_capacity(2);
-        for _ in 0..2 {
-            let cleanup_records_buffer = device.create_host_cached_buffer(
-                records_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            )?;
-            let compressed_buffer = device.create_host_cached_buffer(
-                compressed_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            )?;
-            let output_buffer = device.create_device_local_buffer(
-                bytes_len::<u32>(output_len)?,
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            )?;
-            let flat_coefficient_buffer = device.create_device_local_buffer(
-                flat_coefficient_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            )?;
-            let state_buffer = device.create_device_local_buffer(
-                flat_coefficient_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            )?;
-            let plane_buffer = device.create_device_local_buffer(
-                plane_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            )?;
+        let cleanup_descriptor_pool = device.create_descriptor_pool(5, 1)?;
+        let cleanup_descriptor_set = device.allocate_descriptor_set(
+            cleanup_descriptor_pool.handle,
+            programs.cleanup.descriptor_set_layout.handle,
+        )?;
+        device.update_storage_descriptor_set(
+            cleanup_descriptor_set,
+            &[
+                records_buffer.descriptor_info(),
+                compressed_buffer.descriptor_info(),
+                output_words_buffer.descriptor_info(),
+                flat_coefficient_buffer.descriptor_info(),
+                state_buffer.descriptor_info(),
+            ],
+        );
 
-            let mut component_ids = scatter_planes.iter().map(|p| p.component).collect::<Vec<_>>();
-            component_ids.sort_unstable();
-            component_ids.dedup();
+        let scatter_descriptor_pool =
+            device.create_descriptor_pool(3 * batch_frames as u32, batch_frames as u32)?;
+        let plane_byte_len = bytes_len::<i32>(config.output_coefficients)?;
+        let component_ids = scattered_component_ids(config.scatter_planes);
+        let mut frames = Vec::with_capacity(batch_frames);
+        for frame_index in 0..batch_frames {
+            let plane_buffer =
+                device.create_device_local_buffer(plane_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)?;
             let idwt_components = component_ids
                 .iter()
                 .map(|component| {
                     ReusableScatteredIdwt53Component::new(
-                        device, &idwt53_program, &plane_buffer,
-                        scatter_planes, *component, target_resolution,
+                        device,
+                        &programs.idwt53,
+                        &plane_buffer,
+                        config.scatter_planes,
+                        *component,
+                        config.target_resolution,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let rgb48_packer = ReusableRgb48Packer::new(
-                device, &color_program, &idwt_components, color_transform, precision,
+                device,
+                &programs.color,
+                &idwt_components,
+                config.color_transform,
+                config.precision,
             )?;
-
-            let cleanup_descriptors = [
-                cleanup_records_buffer.descriptor_info(),
-                compressed_buffer.descriptor_info(),
-                output_buffer.descriptor_info(),
-                flat_coefficient_buffer.descriptor_info(),
-                state_buffer.descriptor_info(),
-            ];
-            let cleanup_descriptor_pool = device.create_descriptor_pool(5, 1)?;
-            let cleanup_descriptor_set = device.allocate_descriptor_set(
-                cleanup_descriptor_pool.handle, cleanup_program.descriptor_set_layout.handle,
-            )?;
-            device.update_storage_descriptor_set(cleanup_descriptor_set, &cleanup_descriptors);
-
-            let scatter_descriptors = [
-                scatter_records_buffer.descriptor_info(),
-                flat_coefficient_buffer.descriptor_info(),
-                plane_buffer.descriptor_info(),
-            ];
-            let scatter_descriptor_pool = device.create_descriptor_pool(3, 1)?;
             let scatter_descriptor_set = device.allocate_descriptor_set(
-                scatter_descriptor_pool.handle, scatter_program.descriptor_set_layout.handle,
+                scatter_descriptor_pool.handle,
+                programs.scatter.descriptor_set_layout.handle,
             )?;
-            device.update_storage_descriptor_set(scatter_descriptor_set, &scatter_descriptors);
-
-            let fused_command_pool = device.create_command_pool(queue_family_index)?;
-            let fused_command_buffer = device.allocate_command_buffer(fused_command_pool.handle)?;
-            let mut fused_dispatches = Vec::new();
-            fused_dispatches.push(StorageDispatch {
-                pipeline: cleanup_program.pipeline.handle,
-                pipeline_layout: cleanup_program.pipeline_layout.handle,
-                descriptor_set: cleanup_descriptor_set,
-                push_constants: bytes_of(&cleanup_push),
-                groups: [tier1_cleanup_groups(codeblock_count), 1, 1],
-                no_barrier_before: false,
-            });
-            fused_dispatches.push(StorageDispatch {
-                pipeline: scatter_program.pipeline.handle,
-                pipeline_layout: scatter_program.pipeline_layout.handle,
-                descriptor_set: scatter_descriptor_set,
-                push_constants: bytes_of(&scatter_push),
-                groups: [max_scatter_coefficients.div_ceil(256), scatter_records.len() as u32, 1],
-                no_barrier_before: false,
-            });
-            for component in &idwt_components {
-                component.extend_storage_dispatches(&idwt53_program, &mut fused_dispatches);
-            }
-            rgb48_packer.extend_storage_dispatches(&color_program, &mut fused_dispatches);
-            device.record_storage_dispatches_with_copies(
-                fused_command_buffer, &fused_dispatches,
-                &[BufferCopy {
-                    source: &rgb48_packer.output_buffer,
-                    destination: &rgb48_packer.staging_buffer,
-                    byte_len: rgb48_packer.output_byte_len,
-                }],
-            )?;
-
-            let fence = device.create_fence()?;
-            slots_vec.push(PipelineSlot {
-                cleanup_records_buffer,
-                compressed_buffer,
-                _output_buffer: output_buffer,
-                _flat_coefficient_buffer: flat_coefficient_buffer,
-                _state_buffer: state_buffer,
-                _plane_buffer: plane_buffer,
-                _cleanup_descriptor_pool: cleanup_descriptor_pool,
-                _scatter_descriptor_pool: scatter_descriptor_pool,
-                _fused_command_pool: fused_command_pool,
-                fused_command_buffer,
-                fence,
+            device.update_storage_descriptor_set(
+                scatter_descriptor_set,
+                &[
+                    scatter_records_buffer.descriptor_info(),
+                    flat_coefficient_buffer
+                        .descriptor_info_range(frame_index as u64 * frame_bytes, frame_bytes),
+                    plane_buffer.descriptor_info(),
+                ],
+            );
+            frames.push(PipelineFrameStage {
+                scatter_descriptor_set,
                 rgb48_packer,
-                _idwt_components: idwt_components,
+                idwt_components,
+                _plane_buffer: plane_buffer,
             });
         }
 
-        let [slot0, slot1] = match slots_vec.try_into() {
-            Ok(arr) => arr,
-            Err(_) => return Err(VulkanError::new("failed to create pipeline slots")),
+        let command_pool = device.create_resettable_command_pool(queue_family_index)?;
+        let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
+        let fence = device.create_fence()?;
+        Ok(Self {
+            staging,
+            staging_layout,
+            records_buffer,
+            compressed_buffer,
+            flat_coefficient_buffer,
+            _output_words_buffer: output_words_buffer,
+            _state_buffer: state_buffer,
+            _cleanup_descriptor_pool: cleanup_descriptor_pool,
+            cleanup_descriptor_set,
+            _scatter_descriptor_pool: scatter_descriptor_pool,
+            frames,
+            _command_pool: command_pool,
+            command_buffer,
+            fence,
+            pending_frames: 0,
+        })
+    }
+}
+
+fn scattered_component_ids(planes: &[crate::gpu::GpuTier1ScatterPlane]) -> Vec<u16> {
+    let mut component_ids = planes.iter().map(|plane| plane.component).collect::<Vec<_>>();
+    component_ids.sort_unstable();
+    component_ids.dedup();
+    component_ids
+}
+
+/// Device-local bytes `ReusableScatteredIdwt53Component::new` allocates for one component, plus
+/// the reconstructed component's width and height.
+fn scattered_idwt53_footprint(
+    planes: &[crate::gpu::GpuTier1ScatterPlane],
+    component: u16,
+    target_resolution: u8,
+) -> Result<(u64, u32, u32), VulkanError> {
+    let ll = require_scattered_plane(planes, component, 0, SubbandKind::Ll)?;
+    let (mut width, mut height) = (u64::from(ll.width), u64::from(ll.height));
+    let mut bytes = 0u64;
+    for resolution in 1..=target_resolution {
+        let hl = require_scattered_plane(planes, component, resolution, SubbandKind::Hl)?;
+        let lh = require_scattered_plane(planes, component, resolution, SubbandKind::Lh)?;
+        let output_width = width + u64::from(hl.width);
+        let output_height = height + u64::from(lh.height);
+        // low columns + high columns + level output, all i32
+        bytes += 4 * output_width * (height + u64::from(lh.height) + output_height);
+        width = output_width;
+        height = output_height;
+    }
+    let width = u32::try_from(width).map_err(|_| VulkanError::new("IDWT width exceeds u32"))?;
+    let height = u32::try_from(height).map_err(|_| VulkanError::new("IDWT height exceeds u32"))?;
+    Ok((bytes, width, height))
+}
+
+/// Device-local bytes one frame of a batch needs: Tier-1 coefficients and state, subband planes,
+/// IDWT intermediates, and the packed RGB48 output.
+fn tier1_pipeline_frame_device_bytes(
+    config: &VulkanTier1Rgb48PipelineConfig<'_>,
+    flat_stride: u64,
+) -> Result<u64, VulkanError> {
+    let flat_bytes = flat_stride * 4;
+    let state_bytes = if config.thread_per_codeblock { 0 } else { flat_bytes };
+    let mut bytes = flat_bytes + state_bytes + bytes_len::<i32>(config.output_coefficients)?;
+    let mut output_samples = 0u64;
+    for component in scattered_component_ids(config.scatter_planes) {
+        let (idwt_bytes, width, height) =
+            scattered_idwt53_footprint(config.scatter_planes, component, config.target_resolution)?;
+        bytes += idwt_bytes;
+        output_samples = u64::from(width) * u64::from(height);
+    }
+    // Packed RGB48: three u32 words per pixel pair.
+    bytes += output_samples.div_ceil(2) * 12;
+    Ok(bytes)
+}
+
+/// Largest batch the device can hold: bounded by the VRAM budget (two slots of `batch` frames),
+/// by `maxStorageBufferRange` (each batched buffer is bound through one descriptor), and by the
+/// guaranteed Tier-1 workgroup count.
+fn tier1_pipeline_batch_limit(
+    config: &VulkanTier1Rgb48PipelineConfig<'_>,
+    summary: &VulkanDeviceSummary,
+    device_local_heap_bytes: u64,
+    frame_device_bytes: u64,
+    flat_stride: u64,
+) -> usize {
+    let mut limit = config
+        .max_batch_frames
+        .clamp(1, TIER1_PIPELINE_MAX_BATCH_FRAMES);
+    if device_local_heap_bytes > 0 && frame_device_bytes > 0 {
+        let budget = device_local_heap_bytes as f64 * TIER1_PIPELINE_VRAM_BUDGET_FRACTION;
+        limit = limit.min(((budget / (2.0 * frame_device_bytes as f64)) as usize).max(1));
+    }
+    let max_range = u64::from(summary.max_storage_buffer_range);
+    if max_range > 0 {
+        limit = limit.min(((max_range / (flat_stride * 4)) as usize).max(1));
+    }
+    let codeblocks_per_group = if config.thread_per_codeblock {
+        TIER1_THREAD_PER_CODEBLOCK_GROUP_SIZE as usize
+    } else {
+        TIER1_CLEANUP_CODEBLOCKS_PER_WORKGROUP as usize
+    };
+    limit.min((MIN_MAX_COMPUTE_WORKGROUP_COUNT * codeblocks_per_group / config.codeblock_count).max(1))
+}
+
+impl VulkanTier1Rgb48Pipeline {
+    pub fn new(config: &VulkanTier1Rgb48PipelineConfig<'_>) -> Result<Self, VulkanError> {
+        if config.codeblock_count == 0 {
+            return Err(VulkanError::new(
+                "persistent GPU Tier-1 RGB48 pipeline requires at least one codeblock",
+            ));
+        }
+        if config.compressed_word_capacity == 0 {
+            return Err(VulkanError::new(
+                "persistent GPU Tier-1 RGB48 pipeline requires compressed word capacity",
+            ));
+        }
+        let max_scatter_coefficients = validate_tier1_scatter_inputs(
+            config.scatter_records,
+            config.flat_coefficient_count,
+            config.output_coefficients,
+        )?;
+        let cleanup_spirv = read_spirv(config.cleanup_shader_path)?;
+        let scatter_spirv = read_spirv(config.scatter_shader_path)?;
+        let idwt53_spirv = read_spirv(config.idwt53_shader_path)?;
+        let color_spirv = read_spirv(config.color_shader_path)?;
+        let (context, summary, queue_family_index) = create_compute_context()?;
+        let device = &context.device;
+        let setup_start = std::time::Instant::now();
+        let programs = Tier1PipelinePrograms {
+            cleanup: StorageComputeProgram::new(
+                device,
+                &cleanup_spirv,
+                5,
+                std::mem::size_of::<Tier1CleanupSmokePushConstants>() as u32,
+            )?,
+            scatter: StorageComputeProgram::new(
+                device,
+                &scatter_spirv,
+                3,
+                std::mem::size_of::<Tier1ScatterSmokePushConstants>() as u32,
+            )?,
+            idwt53: StorageComputeProgram::new(
+                device,
+                &idwt53_spirv,
+                3,
+                std::mem::size_of::<Idwt53OffsetPushConstants>() as u32,
+            )?,
+            color: StorageComputeProgram::new(
+                device,
+                &color_spirv,
+                4,
+                std::mem::size_of::<ColorPushConstants>() as u32,
+            )?,
+        };
+        let scatter_records_buffer = create_device_buffer_from_slice(
+            device,
+            queue_family_index,
+            config.scatter_records,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        )?;
+
+        let flat_stride = bytes_len::<i32>(config.flat_coefficient_count)?
+            .next_multiple_of(TIER1_PIPELINE_FRAME_ALIGNMENT)
+            / 4;
+        let frame_device_bytes = tier1_pipeline_frame_device_bytes(config, flat_stride)?;
+        let device_local_heap_bytes = device.device_local_heap_bytes();
+        let mut batch_frames = tier1_pipeline_batch_limit(
+            config,
+            &summary,
+            device_local_heap_bytes,
+            frame_device_bytes,
+            flat_stride,
+        );
+        let slots = loop {
+            let attempt = (0..2)
+                .map(|_| {
+                    PipelineSlot::new(
+                        device,
+                        queue_family_index,
+                        config,
+                        &programs,
+                        &scatter_records_buffer,
+                        batch_frames,
+                        flat_stride,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>();
+            match attempt {
+                Ok(slots) => break slots,
+                // The estimate was optimistic (VRAM shared with other work): retry smaller.
+                Err(err) if batch_frames > 1 => {
+                    eprintln!(
+                        "GPU Tier-1 pipeline: {batch_frames}-frame slots failed ({err}), retrying with {}",
+                        batch_frames / 2
+                    );
+                    batch_frames /= 2;
+                }
+                Err(err) => return Err(err),
+            }
         };
 
         Ok(Self {
             device_name: summary.name.clone(),
-            codeblock_count,
-            compressed_word_capacity,
+            device_local_heap_bytes,
             setup_ms: setup_start.elapsed().as_secs_f64() * 1000.0,
-            slots: [slot0, slot1],
+            max_batch_frames: batch_frames,
+            thread_per_codeblock: config.thread_per_codeblock,
+            codeblock_count: config.codeblock_count,
+            compressed_word_capacity: config.compressed_word_capacity,
+            cpu_coefficient_capacity: config.cpu_coefficient_capacity,
+            flat_coefficient_count: config.flat_coefficient_count,
+            flat_stride,
+            scatter_push: Tier1ScatterSmokePushConstants {
+                codeblock_count: config.scatter_records.len() as u32,
+            },
+            scatter_groups: [
+                max_scatter_coefficients.div_ceil(256),
+                config.scatter_records.len() as u32,
+                1,
+            ],
+            slots,
             _scatter_records_buffer: scatter_records_buffer,
-            _cleanup_program: cleanup_program,
-            _scatter_program: scatter_program,
-            _idwt53_program: idwt53_program,
-            _color_program: color_program,
-            _context: context,
+            programs,
+            context,
         })
     }
 
@@ -2874,56 +3090,257 @@ impl VulkanTier1Rgb48Pipeline {
         &self.device_name
     }
 
-    pub fn decode_frame(
-        &self,
-        records: &[crate::gpu::GpuTier1CodeblockRecord],
-        compressed_words: &[u32],
-    ) -> Result<VulkanTier1Rgb48FrameResult, VulkanError> {
-        self.submit_frame(0, records, compressed_words)?;
-        self.wait_and_read_frame(0)
+    pub fn device_local_heap_bytes(&self) -> u64 {
+        self.device_local_heap_bytes
     }
 
-    pub fn submit_frame(
-        &self,
-        slot: usize,
-        records: &[crate::gpu::GpuTier1CodeblockRecord],
-        compressed_words: &[u32],
+    /// Frames per submit this device can hold (two slots are allocated at this size).
+    pub fn max_batch_frames(&self) -> usize {
+        self.max_batch_frames
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Uploads and submits one batch to `slot_index`, which must not have a batch in flight.
+    pub fn submit_batch(
+        &mut self,
+        slot_index: usize,
+        frames: &[Tier1BatchFrame<'_>],
     ) -> Result<(), VulkanError> {
-        if records.len() != self.codeblock_count {
+        if frames.is_empty() || frames.len() > self.max_batch_frames {
             return Err(VulkanError::new(format!(
-                "persistent GPU Tier-1 RGB48 pipeline expected {} records, got {}",
-                self.codeblock_count, records.len()
+                "GPU Tier-1 batch must hold 1..={} frames, got {}",
+                self.max_batch_frames,
+                frames.len()
             )));
         }
-        if compressed_words.len() > self.compressed_word_capacity {
+        let slot = self.slots.get(slot_index).ok_or_else(|| {
+            VulkanError::new(format!("GPU Tier-1 pipeline has no slot {slot_index}"))
+        })?;
+        if slot.pending_frames != 0 {
             return Err(VulkanError::new(format!(
-                "persistent GPU Tier-1 RGB48 compressed words {} exceed capacity {}",
-                compressed_words.len(), self.compressed_word_capacity
+                "GPU Tier-1 pipeline slot {slot_index} still has a batch in flight"
             )));
         }
-        let device = &self._context.device;
-        let s = &self.slots[slot];
-        s.cleanup_records_buffer.write_slice(records)?;
-        s.compressed_buffer.write_slice(compressed_words)?;
-        device.reset_fence(s.fence.handle)?;
-        device.submit_with_fence(s.fused_command_buffer, s.fence.handle)
+
+        let frame_bytes = self.flat_stride * 4;
+        let mut records = Vec::with_capacity(frames.len() * self.codeblock_count);
+        let mut compressed = Vec::with_capacity(frames.len() * self.compressed_word_capacity);
+        let mut cpu_coefficients = Vec::new();
+        let mut cpu_regions = Vec::new();
+        for (frame_index, frame) in frames.iter().enumerate() {
+            if frame.gpu_records.len() + frame.cpu_codeblocks.len() > self.codeblock_count {
+                return Err(VulkanError::new(format!(
+                    "GPU Tier-1 batch frame {frame_index} has {} codeblocks, pipeline holds {}",
+                    frame.gpu_records.len() + frame.cpu_codeblocks.len(),
+                    self.codeblock_count
+                )));
+            }
+            if frame.compressed_words.len() > self.compressed_word_capacity {
+                return Err(VulkanError::new(format!(
+                    "GPU Tier-1 batch frame {frame_index} has {} compressed words, capacity {}",
+                    frame.compressed_words.len(),
+                    self.compressed_word_capacity
+                )));
+            }
+            let byte_base = u32::try_from(compressed.len() * 4)
+                .map_err(|_| VulkanError::new("GPU Tier-1 batched byte offset exceeds u32"))?;
+            let coefficient_base = u32::try_from(frame_index as u64 * self.flat_stride)
+                .map_err(|_| VulkanError::new("GPU Tier-1 batched coefficient offset exceeds u32"))?;
+            compressed.extend_from_slice(frame.compressed_words);
+            for record in frame.gpu_records {
+                let mut record = *record;
+                record.byte_offset = record
+                    .byte_offset
+                    .checked_add(byte_base)
+                    .ok_or_else(|| VulkanError::new("GPU Tier-1 batched byte offset overflow"))?;
+                record.coefficient_offset = record
+                    .coefficient_offset
+                    .checked_add(coefficient_base)
+                    .ok_or_else(|| VulkanError::new("GPU Tier-1 batched coefficient offset overflow"))?;
+                records.push(record);
+            }
+
+            let frame_cpu_start = cpu_coefficients.len();
+            for codeblock in frame.cpu_codeblocks {
+                let end = codeblock.coefficient_offset as usize + codeblock.coefficients.len();
+                if end > self.flat_coefficient_count {
+                    return Err(VulkanError::new(format!(
+                        "CPU codeblock coefficients end at {end}, frame holds {}",
+                        self.flat_coefficient_count
+                    )));
+                }
+                if codeblock.coefficients.is_empty() {
+                    continue;
+                }
+                cpu_regions.push(VkBufferCopy {
+                    src_offset: slot.staging_layout.cpu_offset + bytes_len::<i32>(cpu_coefficients.len())?,
+                    dst_offset: frame_index as u64 * frame_bytes
+                        + u64::from(codeblock.coefficient_offset) * 4,
+                    size: bytes_len::<i32>(codeblock.coefficients.len())?,
+                });
+                cpu_coefficients.extend_from_slice(&codeblock.coefficients);
+            }
+            if cpu_coefficients.len() - frame_cpu_start > self.cpu_coefficient_capacity {
+                return Err(VulkanError::new(format!(
+                    "GPU Tier-1 batch frame {frame_index} has {} CPU coefficients, capacity {}",
+                    cpu_coefficients.len() - frame_cpu_start,
+                    self.cpu_coefficient_capacity
+                )));
+            }
+        }
+        // Heaviest codeblocks first across all frames, so the long tail of one frame runs
+        // alongside the bulk of the others instead of idling the GPU at the end of each frame.
+        records.sort_by_key(|record| {
+            std::cmp::Reverse(u64::from(record.byte_len) * u64::from(record.pass_count))
+        });
+
+        slot.staging.write_slice_at(0, &records)?;
+        slot.staging
+            .write_slice_at(slot.staging_layout.compressed_offset, &compressed)?;
+        slot.staging
+            .write_slice_at(slot.staging_layout.cpu_offset, &cpu_coefficients)?;
+        let records_region = [VkBufferCopy {
+            src_offset: 0,
+            dst_offset: 0,
+            size: bytes_len::<crate::gpu::GpuTier1CodeblockRecord>(records.len())?,
+        }];
+        let compressed_region = [VkBufferCopy {
+            src_offset: slot.staging_layout.compressed_offset,
+            dst_offset: 0,
+            size: bytes_len::<u32>(compressed.len())?,
+        }];
+        let mut leading_copies = Vec::with_capacity(3);
+        if !records.is_empty() {
+            leading_copies.push(RegionCopy {
+                source: &slot.staging,
+                destination: &slot.records_buffer,
+                regions: &records_region,
+            });
+        }
+        if !compressed.is_empty() {
+            leading_copies.push(RegionCopy {
+                source: &slot.staging,
+                destination: &slot.compressed_buffer,
+                regions: &compressed_region,
+            });
+        }
+        if !cpu_regions.is_empty() {
+            leading_copies.push(RegionCopy {
+                source: &slot.staging,
+                destination: &slot.flat_coefficient_buffer,
+                regions: &cpu_regions,
+            });
+        }
+
+        let cleanup_push = Tier1CleanupSmokePushConstants {
+            codeblock_count: records.len() as u32,
+            reconstruction_mode: 0,
+            codeblock_offset: 0,
+        };
+        let mut dispatches = Vec::new();
+        if !records.is_empty() {
+            let groups = if self.thread_per_codeblock {
+                (records.len() as u32).div_ceil(TIER1_THREAD_PER_CODEBLOCK_GROUP_SIZE)
+            } else {
+                tier1_cleanup_groups(records.len())
+            };
+            dispatches.push(StorageDispatch {
+                pipeline: self.programs.cleanup.pipeline.handle,
+                pipeline_layout: self.programs.cleanup.pipeline_layout.handle,
+                descriptor_set: slot.cleanup_descriptor_set,
+                push_constants: bytes_of(&cleanup_push),
+                groups: [groups, 1, 1],
+                no_barrier_before: false,
+            });
+        }
+        // Each frame's scatter -> IDWT -> color chain touches only that frame's buffers, so
+        // step `i` of every frame shares one barrier interval instead of running frame by frame.
+        let stages = &slot.frames[..frames.len()];
+        let chains = stages
+            .iter()
+            .map(|stage| {
+                let mut chain = vec![StorageDispatch {
+                    pipeline: self.programs.scatter.pipeline.handle,
+                    pipeline_layout: self.programs.scatter.pipeline_layout.handle,
+                    descriptor_set: stage.scatter_descriptor_set,
+                    push_constants: bytes_of(&self.scatter_push),
+                    groups: self.scatter_groups,
+                    no_barrier_before: false,
+                }];
+                for component in &stage.idwt_components {
+                    component.extend_storage_dispatches(&self.programs.idwt53, &mut chain);
+                }
+                stage
+                    .rgb48_packer
+                    .extend_storage_dispatches(&self.programs.color, &mut chain);
+                chain
+            })
+            .collect::<Vec<_>>();
+        for step in 0..chains[0].len() {
+            for (frame_index, chain) in chains.iter().enumerate() {
+                let mut dispatch = chain[step];
+                dispatch.no_barrier_before |= frame_index > 0;
+                dispatches.push(dispatch);
+            }
+        }
+        let readback_copies = stages
+            .iter()
+            .map(|stage| BufferCopy {
+                source: &stage.rgb48_packer.output_buffer,
+                destination: &stage.rgb48_packer.staging_buffer,
+                byte_len: stage.rgb48_packer.output_byte_len,
+            })
+            .collect::<Vec<_>>();
+
+        let device = &self.context.device;
+        device.record_storage_dispatches_with_region_copies(
+            slot.command_buffer,
+            &leading_copies,
+            &dispatches,
+            &readback_copies,
+        )?;
+        device.reset_fence(slot.fence.handle)?;
+        device.submit_with_fence(slot.command_buffer, slot.fence.handle)?;
+        self.slots[slot_index].pending_frames = frames.len();
+        Ok(())
     }
 
-    pub fn wait_and_read_frame(&self, slot: usize) -> Result<VulkanTier1Rgb48FrameResult, VulkanError> {
-        let device = &self._context.device;
-        let s = &self.slots[slot];
+    /// Waits for the batch in `slot_index` and hands each frame's RGB48 samples to `consume`
+    /// straight from mapped memory. Returns the time spent blocked on the GPU, in milliseconds.
+    pub fn wait_and_read_batch(
+        &mut self,
+        slot_index: usize,
+        mut consume: impl FnMut(usize, &[u16]),
+    ) -> Result<f64, VulkanError> {
+        let slot = self.slots.get_mut(slot_index).ok_or_else(|| {
+            VulkanError::new(format!("GPU Tier-1 pipeline has no slot {slot_index}"))
+        })?;
+        if slot.pending_frames == 0 {
+            return Err(VulkanError::new(format!(
+                "GPU Tier-1 pipeline slot {slot_index} has no batch in flight"
+            )));
+        }
         let wait_start = std::time::Instant::now();
-        device.wait_fence(s.fence.handle)?;
-        let fused_dispatch_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
-        let packed = s.rgb48_packer.read_staging()?;
-        Ok(VulkanTier1Rgb48FrameResult {
-            samples: packed.samples,
-            upload_ms: 0.0,
-            fused_dispatch_ms,
-            color_copy_ms: packed.copy_ms,
-            color_readback_ms: packed.readback_ms,
-            total_ms: 0.0,
-        })
+        self.context.device.wait_fence(slot.fence.handle)?;
+        let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
+        let pending_frames = std::mem::take(&mut slot.pending_frames);
+        for (frame_index, stage) in slot.frames[..pending_frames].iter().enumerate() {
+            let packer = &stage.rgb48_packer;
+            packer
+                .staging_buffer
+                .with_mapped::<u16, _>(packer.output_count, |samples| consume(frame_index, samples))?;
+        }
+        Ok(wait_ms)
+    }
+}
+
+impl Drop for VulkanTier1Rgb48Pipeline {
+    fn drop(&mut self) {
+        // Slot buffers are freed before the device; make sure no batch still uses them.
+        let _ = self.context.device.wait_idle();
     }
 }
 

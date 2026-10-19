@@ -3,6 +3,14 @@
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
+// Build with -DTIER1_NO_STATS for production decode: drops the per-codeblock
+// diagnostic counters and summary words that only the smoke/bench paths validate.
+#ifdef TIER1_NO_STATS
+#define STAT_ADD(counter, amount)
+#else
+#define STAT_ADD(counter, amount) counter += (amount)
+#endif
+
 struct Tier1Codeblock {
     uint component;
     uint resolution;
@@ -400,10 +408,10 @@ void decode_significant_sample(uint x, uint y, uint bitplane, bool mark_visit) {
     if (mark_visit) {
         mark_visited_index(index);
     }
-    sign_bits += 1u;
-    significance_bits += 1u;
-    became_significant += 1u;
-    visited += 1u;
+    STAT_ADD(sign_bits, 1u);
+    STAT_ADD(significance_bits, 1u);
+    STAT_ADD(became_significant, 1u);
+    STAT_ADD(visited, 1u);
 }
 
 void decode_cleanup_sample(uint x, uint y, uint bitplane) {
@@ -422,8 +430,8 @@ void decode_cleanup_sample(uint x, uint y, uint bitplane) {
     if (is_significant != 0u) {
         decode_significant_sample(x, y, bitplane, false);
     } else {
-        significance_bits += 1u;
-        visited += 1u;
+        STAT_ADD(significance_bits, 1u);
+        STAT_ADD(visited, 1u);
     }
 }
 
@@ -440,16 +448,16 @@ void decode_cleanup_pass(uint bitplane) {
             for (uint x = 0u; x < codeblock.width; x++) {
                 if (cleanup_run_length_candidate(x, stripe_y)) {
                     uint any_significant = decode_bit(17u);
-                    run_length_bits += 1u;
+                    STAT_ADD(run_length_bits, 1u);
                     if (any_significant == 0u) {
-                        significance_bits += 4u;
-                        visited += 4u;
+                        STAT_ADD(significance_bits, 4u);
+                        STAT_ADD(visited, 4u);
                         continue;
                     }
                     uint run = (decode_bit(18u) << 1u) | decode_bit(18u);
-                    uniform_bits += 2u;
-                    significance_bits += run;
-                    visited += run;
+                    STAT_ADD(uniform_bits, 2u);
+                    STAT_ADD(significance_bits, run);
+                    STAT_ADD(visited, run);
                     decode_significant_sample(x, stripe_y + run, bitplane, false);
                     for (uint y_offset = run + 1u; y_offset < 4u; y_offset++) {
                         decode_cleanup_sample(x, stripe_y + y_offset, bitplane);
@@ -490,8 +498,8 @@ void decode_significance_pass(uint bitplane) {
                         decode_significant_sample(x, y, bitplane, true);
                     } else {
                         mark_visited_index(index);
-                        significance_bits += 1u;
-                        visited += 1u;
+                        STAT_ADD(significance_bits, 1u);
+                        STAT_ADD(visited, 1u);
                     }
                 }
             }
@@ -509,8 +517,8 @@ void decode_significance_pass(uint bitplane) {
                         decode_significant_sample(x, y, bitplane, true);
                     } else {
                         mark_visited_index(index);
-                        significance_bits += 1u;
-                        visited += 1u;
+                        STAT_ADD(significance_bits, 1u);
+                        STAT_ADD(visited, 1u);
                     }
                 }
             }
@@ -545,8 +553,8 @@ void decode_refinement_pass(uint bitplane) {
                     uint offset = coeff_offset(index);
                     output_coefficients[offset] += state_is_negative(state) ? -delta : delta;
                     state_data[state_base + index] = ((state | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
-                    refinement_bits += 1u;
-                    visited += 1u;
+                    STAT_ADD(refinement_bits, 1u);
+                    STAT_ADD(visited, 1u);
                 }
             }
         } else {
@@ -570,8 +578,8 @@ void decode_refinement_pass(uint bitplane) {
                     uint offset = coeff_offset(index);
                     output_coefficients[offset] += state_is_negative(state) ? -delta : delta;
                     state_data[state_base + index] = ((state | STATE_REFINED) & ~STATE_VISIT_MASK) | visit_word;
-                    refinement_bits += 1u;
-                    visited += 1u;
+                    STAT_ADD(refinement_bits, 1u);
+                    STAT_ADD(visited, 1u);
                 }
             }
         }
@@ -664,10 +672,17 @@ void main() {
     subgroupBarrier();
 
     // Collaborative parallel write-back and local counting (per-warp)
-    uint thread_nonzero = 0u;
-    uint thread_checksum = 0u;
     uint coeff_count = codeblock.coefficient_count;
     uint coeff_offset_base = codeblock.coefficient_offset;
+#ifdef TIER1_NO_STATS
+    for (uint i = lane_id; i < coeff_count; i += 32u) {
+        if (!is_significant_index(i)) {
+            output_coefficients[coeff_offset_base + i] = 0;
+        }
+    }
+#else
+    uint thread_nonzero = 0u;
+    uint thread_checksum = 0u;
 
     for (uint i = lane_id; i < coeff_count; i += 32u) {
         uint offset = coeff_offset_base + i;
@@ -710,4 +725,5 @@ void main() {
         output_words[codeblock_index * 9u + 7u] = became_significant;
         output_words[codeblock_index * 9u + 8u] = visited;
     }
+#endif
 }

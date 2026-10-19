@@ -1,5 +1,8 @@
 use crate::codestream::{Codestream, QuantizationStep, QuantizationStyle, SubbandKind, WaveletTransform};
-use crate::tier1::{Tier1BoundWorkPlan, Tier1CodingMode, Tier1DecodeError};
+use crate::tier1::{
+    BoundCodeblockSegment, BoundCompressedCodeblock, CodeblockId, CoefficientReconstruction,
+    Tier1BoundWorkPlan, Tier1CodingMode, Tier1DecodeError,
+};
 
 const DWT_LOCAL_SIZE_X: u32 = 16;
 const DWT_LOCAL_SIZE_Y: u32 = 16;
@@ -182,7 +185,84 @@ pub fn sort_codeblock_records_by_descending_work(records: &mut [GpuTier1Codebloc
     });
 }
 
-const THREAD_PER_CBLK_MAX_COEFFICIENTS: u32 = 1024;
+/// Largest codeblock the thread-per-codeblock shader can hold in its private
+/// `local_state[256]` array (16x16). Larger codeblocks must use the warp shader.
+pub const THREAD_PER_CBLK_MAX_COEFFICIENTS: u32 = 256;
+
+pub fn thread_per_codeblock_eligible(records: &[GpuTier1CodeblockRecord]) -> bool {
+    !records.is_empty()
+        && records
+            .iter()
+            .all(|r| r.coefficient_count <= THREAD_PER_CBLK_MAX_COEFFICIENTS)
+}
+
+/// Whether `decode_codeblock_record_cpu` reproduces the shaders bit-exactly for this record.
+/// Records signalling more zero bitplanes than magnitude bitplanes rely on the shaders'
+/// unsigned bitplane arithmetic, so they stay on the GPU.
+pub fn cpu_decodable(record: &GpuTier1CodeblockRecord) -> bool {
+    record.magnitude_bitplanes > record.zero_bit_planes
+}
+
+/// Decodes one GPU codeblock record on the CPU, producing the same row-major
+/// coefficients the Tier-1 shaders write. Used to offload the heaviest
+/// codeblocks of a frame while the GPU works on the rest.
+pub fn decode_codeblock_record_cpu(
+    record: &GpuTier1CodeblockRecord,
+    compressed_words: &[u32],
+    codeblock_style: crate::codestream::CodeblockStyle,
+) -> Result<Vec<i32>, Tier1DecodeError> {
+    let start = record.byte_offset as usize;
+    let end = start
+        .checked_add(record.byte_len as usize)
+        .filter(|end| *end <= compressed_words.len() * 4)
+        .ok_or_else(|| Tier1DecodeError::new("codeblock bytes outside compressed words"))?;
+    let bytes = (start..end)
+        .map(|index| (compressed_words[index >> 2] >> ((index & 3) * 8)) as u8)
+        .collect::<Vec<_>>();
+    let subband = match record.subband {
+        0 => SubbandKind::Ll,
+        1 => SubbandKind::Hl,
+        2 => SubbandKind::Lh,
+        3 => SubbandKind::Hh,
+        other => return Err(Tier1DecodeError::new(format!("invalid GPU subband id {other}"))),
+    };
+    let id = CodeblockId {
+        component: u16::try_from(record.component)
+            .map_err(|_| Tier1DecodeError::new("codeblock component exceeds u16"))?,
+        resolution: u8::try_from(record.resolution)
+            .map_err(|_| Tier1DecodeError::new("codeblock resolution exceeds u8"))?,
+        subband,
+        codeblock_x: record.codeblock_x,
+        codeblock_y: record.codeblock_y,
+    };
+    let segments = if record.pass_count == 0 {
+        Vec::new()
+    } else {
+        vec![BoundCodeblockSegment {
+            packet_index: 0,
+            layer: 0,
+            coding_passes: u16::try_from(record.pass_count)
+                .map_err(|_| Tier1DecodeError::new("codeblock pass count exceeds u16"))?,
+            data: &bytes,
+        }]
+    };
+    let codeblock = BoundCompressedCodeblock {
+        id,
+        width: record.width,
+        height: record.height,
+        magnitude_bitplanes: record.magnitude_bitplanes,
+        zero_bit_planes: record.zero_bit_planes,
+        segments,
+    };
+    let reconstruction = if record.reconstruction_mode == 1 {
+        CoefficientReconstruction::Midpoint
+    } else {
+        CoefficientReconstruction::Exact
+    };
+    let decoded =
+        codeblock.decode_arithmetic_passes_with_reconstruction(codeblock_style, reconstruction)?;
+    Ok(decoded.coefficients)
+}
 
 pub fn partition_records_by_shader_affinity(records: &mut [GpuTier1CodeblockRecord]) -> usize {
     let small_count = records

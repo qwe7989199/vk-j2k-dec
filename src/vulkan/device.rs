@@ -50,6 +50,7 @@ struct VulkanDevice {
     memory_properties: VkPhysicalDeviceMemoryProperties,
 }
 
+#[derive(Clone, Copy)]
 struct StorageDispatch<'a> {
     pipeline: VkPipeline,
     pipeline_layout: VkPipelineLayout,
@@ -65,7 +66,25 @@ struct BufferCopy<'a> {
     byte_len: u64,
 }
 
+struct RegionCopy<'a> {
+    source: &'a HostBuffer,
+    destination: &'a HostBuffer,
+    regions: &'a [VkBufferCopy],
+}
+
 impl VulkanDevice {
+    /// Size of the largest device-local memory heap (VRAM on discrete GPUs).
+    fn device_local_heap_bytes(&self) -> u64 {
+        let heap_count = (self.memory_properties.memory_heap_count as usize)
+            .min(self.memory_properties.memory_heaps.len());
+        self.memory_properties.memory_heaps[..heap_count]
+            .iter()
+            .filter(|heap| heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT != 0)
+            .map(|heap| heap.size)
+            .max()
+            .unwrap_or(0)
+    }
+
     fn create_host_buffer(&self, size: u64) -> Result<HostBuffer, VulkanError> {
         self.create_buffer(
             size,
@@ -404,10 +423,29 @@ impl VulkanDevice {
         &self,
         queue_family_index: u32,
     ) -> Result<CommandPoolHandle, VulkanError> {
+        self.create_command_pool_with_flags(queue_family_index, 0)
+    }
+
+    /// Command buffers from this pool may be re-recorded with `vkBeginCommandBuffer`.
+    fn create_resettable_command_pool(
+        &self,
+        queue_family_index: u32,
+    ) -> Result<CommandPoolHandle, VulkanError> {
+        self.create_command_pool_with_flags(
+            queue_family_index,
+            VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        )
+    }
+
+    fn create_command_pool_with_flags(
+        &self,
+        queue_family_index: u32,
+        flags: VkFlags,
+    ) -> Result<CommandPoolHandle, VulkanError> {
         let create_info = VkCommandPoolCreateInfo {
             s_type: VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
             p_next: ptr::null(),
-            flags: 0,
+            flags,
             queue_family_index,
         };
         let mut handle = 0usize;
@@ -468,6 +506,23 @@ impl VulkanDevice {
         dispatches: &[StorageDispatch<'_>],
         trailing_copies: &[BufferCopy<'_>],
     ) -> Result<(), VulkanError> {
+        self.record_storage_dispatches_with_region_copies(
+            command_buffer,
+            &[],
+            dispatches,
+            trailing_copies,
+        )
+    }
+
+    /// Like `record_storage_dispatches_with_copies`, but first records buffer-region copies
+    /// (e.g. host-staged data into a device buffer) that the dispatches depend on.
+    fn record_storage_dispatches_with_region_copies(
+        &self,
+        command_buffer: VkCommandBuffer,
+        leading_copies: &[RegionCopy<'_>],
+        dispatches: &[StorageDispatch<'_>],
+        trailing_copies: &[BufferCopy<'_>],
+    ) -> Result<(), VulkanError> {
         let begin_info = VkCommandBufferBeginInfo {
             s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
             p_next: ptr::null(),
@@ -478,6 +533,20 @@ impl VulkanDevice {
             unsafe { (self.functions.begin_command_buffer)(command_buffer, &begin_info) },
             "vkBeginCommandBuffer",
         )?;
+        for copy_request in leading_copies {
+            if copy_request.regions.is_empty() {
+                continue;
+            }
+            unsafe {
+                (self.functions.cmd_copy_buffer)(
+                    command_buffer,
+                    copy_request.source.buffer,
+                    copy_request.destination.buffer,
+                    copy_request.regions.len() as u32,
+                    copy_request.regions.as_ptr(),
+                );
+            }
+        }
         if dispatches.is_empty() && trailing_copies.is_empty() {
             return vk_check(
                 unsafe { (self.functions.end_command_buffer)(command_buffer) },
@@ -601,6 +670,27 @@ impl VulkanDevice {
                         &copy,
                     );
                 }
+            }
+            // Make the copied data visible to host reads once the fence signals.
+            let host_barrier = VkMemoryBarrier {
+                s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                p_next: ptr::null(),
+                src_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT,
+                dst_access_mask: VK_ACCESS_HOST_READ_BIT,
+            };
+            unsafe {
+                (self.functions.cmd_pipeline_barrier)(
+                    command_buffer,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_HOST_BIT,
+                    0,
+                    1,
+                    &host_barrier,
+                    0,
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                );
             }
         }
         vk_check(
@@ -817,6 +907,39 @@ impl HostBuffer {
         Ok(())
     }
 
+    fn write_slice_at<T: Copy>(&self, byte_offset: u64, values: &[T]) -> Result<(), VulkanError> {
+        let byte_len = bytes_len::<T>(values.len())?;
+        if byte_len == 0 {
+            return Ok(());
+        }
+        let end = byte_offset
+            .checked_add(byte_len)
+            .filter(|end| *end <= self.size)
+            .ok_or_else(|| {
+                VulkanError::new(format!(
+                    "host buffer write of {byte_len} bytes at {byte_offset} exceeds {} bytes",
+                    self.size
+                ))
+            })?;
+        let mut mapped = ptr::null_mut();
+        vk_check(
+            unsafe {
+                (self.functions.map_memory)(self.device, self.memory, byte_offset, byte_len, 0, &mut mapped)
+            },
+            "vkMapMemory",
+        )?;
+        unsafe {
+            ptr::copy_nonoverlapping(values.as_ptr() as *const u8, mapped as *mut u8, byte_len as usize);
+        }
+        if self.memory_properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT == 0 {
+            self.flush_range(end)?;
+        }
+        unsafe {
+            (self.functions.unmap_memory)(self.device, self.memory);
+        }
+        Ok(())
+    }
+
     fn read_vec<T: Copy>(&self, count: usize) -> Result<Vec<T>, VulkanError> {
         let byte_len = bytes_len::<T>(count)?;
         if byte_len > self.size {
@@ -846,6 +969,34 @@ impl HostBuffer {
         Ok(values)
     }
 
+    /// Maps the buffer and hands `count` elements to `read` without an intermediate copy.
+    fn with_mapped<T: Copy, R>(
+        &self,
+        count: usize,
+        read: impl FnOnce(&[T]) -> R,
+    ) -> Result<R, VulkanError> {
+        let byte_len = bytes_len::<T>(count)?;
+        if byte_len > self.size {
+            return Err(VulkanError::new(format!(
+                "host buffer read of {byte_len} bytes exceeds {} bytes",
+                self.size
+            )));
+        }
+        self.invalidate_range(byte_len)?;
+        let mut mapped = ptr::null_mut();
+        vk_check(
+            unsafe {
+                (self.functions.map_memory)(self.device, self.memory, 0, byte_len, 0, &mut mapped)
+            },
+            "vkMapMemory",
+        )?;
+        let result = read(unsafe { std::slice::from_raw_parts(mapped as *const T, count) });
+        unsafe {
+            (self.functions.unmap_memory)(self.device, self.memory);
+        }
+        Ok(result)
+    }
+
     fn flush_range(&self, _byte_len: u64) -> Result<(), VulkanError> {
         let range = VkMappedMemoryRange {
             s_type: VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
@@ -872,6 +1023,14 @@ impl HostBuffer {
             unsafe { (self.functions.invalidate_mapped_memory_ranges)(self.device, 1, &range) },
             "vkInvalidateMappedMemoryRanges",
         )
+    }
+
+    fn descriptor_info_range(&self, offset: u64, range: u64) -> VkDescriptorBufferInfo {
+        VkDescriptorBufferInfo {
+            buffer: self.buffer,
+            offset,
+            range,
+        }
     }
 
     fn descriptor_info(&self) -> VkDescriptorBufferInfo {

@@ -180,6 +180,9 @@ impl VulkanInstance {
             vendor_id: properties.vendor_id,
             device_id: properties.device_id,
             device_type: VulkanDeviceType::from(properties.device_type),
+            max_storage_buffer_range: u32::from_ne_bytes(
+                properties.limits.bytes[28..32].try_into().expect("4-byte slice"),
+            ),
             queue_families: queue_families
                 .into_iter()
                 .take(queue_count as usize)

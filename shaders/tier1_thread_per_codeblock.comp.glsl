@@ -263,8 +263,10 @@ void main() {
         // Write zeros and summary
         for (uint i = 0u; i < cb.coefficient_count; i++)
             output_coefficients[cb.coefficient_offset + i] = 0;
+#ifndef TIER1_NO_STATS
         for (uint i = 0u; i < 9u; i++)
             output_words[codeblock_index * 9u + i] = 0u;
+#endif
         return;
     }
 
@@ -417,6 +419,13 @@ void main() {
     }
 
     // Write summary and zero non-significant coefficients
+#ifdef TIER1_NO_STATS
+    for (uint i = 0u; i < cb.coefficient_count; i++) {
+        if ((local_state[i] & STATE_SIGNIFICANT) == 0u) {
+            output_coefficients[cb.coefficient_offset + i] = 0;
+        }
+    }
+#else
     uint nonzero = 0u;
     uint checksum = 0u;
     for (uint i = 0u; i < cb.coefficient_count; i++) {
@@ -436,4 +445,5 @@ void main() {
     output_words[codeblock_index * 9u + 6u] = 0u;
     output_words[codeblock_index * 9u + 7u] = 0u;
     output_words[codeblock_index * 9u + 8u] = 0u;
+#endif
 }

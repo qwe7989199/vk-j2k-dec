@@ -15,6 +15,7 @@ mod tests {
             vendor_id: 0,
             device_id: 0,
             device_type: VulkanDeviceType::DiscreteGpu,
+            max_storage_buffer_range: 0,
             queue_families: vec![
                 VulkanQueueFamilySummary {
                     index: 0,

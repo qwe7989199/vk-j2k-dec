@@ -6,4 +6,5 @@ pub mod gpu;
 pub mod packet;
 pub mod reconstruct;
 pub mod tier1;
+pub mod tune;
 pub mod vulkan;
