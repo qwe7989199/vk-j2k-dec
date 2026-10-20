@@ -191,12 +191,15 @@ void renormalize() {
     ct_reg -= k;
 }
 
-uint decode_bit(uint context_index) {
-    uint ctx_packed = ctx_at(context_index);
-    uint state = ctx_packed & 0x7fu;
-    uint mps = ctx_packed >> 7u;
+// Each context holds MQ_TABLE[state] with the MPS in bit 31, so Qe needs no table lookup;
+// the table is read only when the state changes.
+uint mq_context(uint state, uint mps) {
+    return MQ_TABLE[state] | (mps << 31u);
+}
 
-    uint mq_entry = MQ_TABLE[state];
+uint decode_bit(uint context_index) {
+    uint mq_entry = ctx_at(context_index);
+    uint mps = mq_entry >> 31u;
     uint qe = mq_entry & 0xffffu;
     uint next_mps_val = (mq_entry >> 16u) & 0x3fu;
     uint next_lps_val = (mq_entry >> 22u) & 0x3fu;
@@ -216,7 +219,7 @@ uint decode_bit(uint context_index) {
     if (cond_lps || (a_reg < 0x8000u)) {
         uint new_state = choose_mps ? next_mps_val : next_lps_val;
         uint new_mps = choose_mps ? mps : (mps ^ switch_mps_val);
-        ctx_at(context_index) = new_state | (new_mps << 7u);
+        ctx_at(context_index) = mq_context(new_state, new_mps);
         decoded = choose_mps ? mps : (1u - mps);
         renormalize();
     } else {
@@ -479,11 +482,11 @@ void main() {
 
     if (lane_id == 0u) {
         for (uint i = 0u; i < MQ_CONTEXT_COUNT; i++) {
-            ctx_at(i) = 0u;
+            ctx_at(i) = mq_context(0u, 0u);
         }
-        ctx_at(0) = 4u;
-        ctx_at(17) = 3u;
-        ctx_at(18) = 46u;
+        ctx_at(0) = mq_context(4u, 0u);
+        ctx_at(17) = mq_context(3u, 0u);
+        ctx_at(18) = mq_context(46u, 0u);
 
         cached_word_index = 0xffffffffu;
 
