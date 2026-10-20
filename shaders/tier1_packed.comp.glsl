@@ -139,6 +139,10 @@ uint col_left;
 uint col_cur;
 uint col_right;
 uint recon_mode;
+// Bit s set once stripe s holds a significant sample. Only tracked when every stripe index
+// fits (codeblocks can be up to 1024 rows tall); otherwise no stripe is skipped.
+uint sig_stripes;
+bool stripe_skip;
 
 uint byte_at(uint index) {
     uint absolute = codeblock.byte_offset + index;
@@ -322,6 +326,9 @@ void make_significant(uint x, uint s, uint r, uint bitplane) {
     uint index = (s * 4u + r) * codeblock.width + x;
     output_coefficients[codeblock.coefficient_offset + index] = sign_bit != 0u ? -magnitude : magnitude;
     col_cur |= (2u << r) | (sign_bit << (COL_SIGN_SHIFT + 1u + r));
+    if (stripe_skip) {
+        sig_stripes |= 1u << s;
+    }
     // Mirror into the adjacent stripe: row 0 is that stripe's row 4, row 3 its row -1.
     if (r == 0u && s > 0u) {
         atomicOr(state_data[state_base + (s - 1u) * codeblock.width + x],
@@ -387,6 +394,11 @@ void decode_cleanup_pass(uint bitplane) {
 
 void decode_significance_pass(uint bitplane) {
     for (uint s = 0u; s < stripe_count; s++) {
+        // Candidates need a significant neighbour, which can only sit in this stripe or the
+        // stripes above and below it.
+        if (stripe_skip && ((((sig_stripes << 1u) | sig_stripes | (sig_stripes >> 1u)) >> s) & 1u) == 0u) {
+            continue;
+        }
         uint stripe_height = min(4u, codeblock.height - s * 4u);
         uint valid_rows = (1u << stripe_height) - 1u;
         uint base = state_base + s * codeblock.width;
@@ -415,6 +427,10 @@ void decode_significance_pass(uint bitplane) {
 
 void decode_refinement_pass(uint bitplane) {
     for (uint s = 0u; s < stripe_count; s++) {
+        // Only significant samples are refined.
+        if (stripe_skip && ((sig_stripes >> s) & 1u) == 0u) {
+            continue;
+        }
         uint stripe_height = min(4u, codeblock.height - s * 4u);
         uint valid_rows = (1u << stripe_height) - 1u;
         uint base = state_base + s * codeblock.width;
@@ -467,6 +483,8 @@ void main() {
     codeblock = codeblocks[codeblock_index];
     state_base = codeblock.coefficient_offset;
     stripe_count = (codeblock.height + 3u) >> 2u;
+    sig_stripes = 0u;
+    stripe_skip = stripe_count <= 31u;
     recon_mode = codeblocks[0].reconstruction_mode;
 
     // All 32 lanes clear the column words and the coefficients; only significant samples are

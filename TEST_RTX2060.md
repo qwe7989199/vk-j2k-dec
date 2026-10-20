@@ -12,9 +12,9 @@ FFmpeg: `C:/Users/zhangqingxuan/Desktop/Tools/ffmpeg/bin/ffmpeg.exe`
 | vk-j2k-dec cpu (10 frames) | 212.3 | 4.71 |
 | FFmpeg native (240 frames, multi-thread) | 37.3 | 26.8 |
 | gpu-tier1 before batching (main @ 88fd8ee, 30 frames) | 29.2 | 34.2 |
-| gpu-tier1, batch 1, no CPU offload | 13.0 | 77.1 |
-| gpu-tier1, batch 8, no CPU offload (pure GPU, 6 runs) | 9.0-10.1 | 99.3-111.6 |
-| gpu-tier1, fully auto (7 runs) | 8.6-9.2 | 108.2-116.5 |
+| gpu-tier1, batch 1, no CPU offload | 11.7 | 85.4 |
+| gpu-tier1, batch 8, no CPU offload (pure GPU, 6 runs) | 7.8-8.2 | 122.5-128.9 |
+| gpu-tier1, fully auto (6 runs) | 7.2-8.5 | 117.8-139.6 |
 | nvjpeg2000, 1 worker (reference) | 12.9 | 77.6 |
 | nvjpeg2000, 8 workers, decode only (reference) | 6.9 | 146.0 |
 
@@ -35,12 +35,12 @@ other GPU clients. Compare changes with interleaved multi-round A/B, not single 
 
 | stage | batch 1 | batch 8 | auto (batch 8 + CPU offload) |
 | --- | ---: | ---: | ---: |
-| upload | 0.03 | 0.02 | 0.26 |
-| Tier-1 | 11.94 | 8.81 | 7.31 |
+| upload | 0.02 | 0.03 | 0.22 |
+| Tier-1 | 10.84 | 6.82 | 5.51 |
 | scatter | 0.14 | 0.14 | 0.14 |
-| IDWT | 0.59 | 0.52 | 0.52 |
-| color + pack | 0.13 | 0.13 | 0.13 |
-| readback copy (transfer queue) | 1.21 | 1.20 | 1.23 |
+| IDWT | 0.56 | 0.51 | 0.51 |
+| color + pack | 0.12 | 0.13 | 0.12 |
+| readback copy (transfer queue) | 1.17 | 1.17 | 1.22 |
 
 The readback copy runs on the transfer queue and mostly overlaps compute, so the stage sum is
 larger than the loop time per frame.
@@ -54,6 +54,10 @@ larger than the loop time per frame.
 | Fused 2D IDWT, one dispatch per level for all components | IDWT 1.37 -> 0.52 ms/frame, 90.9 -> 96.5 fps |
 | Readback on dedicated transfer queue | 88.8 -> 93.5 fps (5-round mean) |
 | Tier-1 micro-optimizations (hoisted reconstruction mode, atomic refinement/mirror writes, computed contexts) | Tier-1 8.25-8.59 -> 8.04-8.15 ms, 105.1-109.0 -> 110.0-111.4 fps (4-round interleaved) |
+| Full MQ table entry stored in each context | Tier-1 9.89-10.13 -> 9.54-9.92 ms (4-round interleaved, low-clock session) |
+| Skip stripes with no significant sample (refinement) or no significant neighbour (significance) | Tier-1 7.78-7.91 -> 6.84-6.97 ms, 112.0-114.7 -> 126.3-128.3 fps (4-round interleaved) |
+| Tried, not adopted: unconditional byte loads (no word cache) | within noise, slower in 2 of 4 rounds |
+| Tried, not adopted: 2 or 8 warps per workgroup (vs 4) | 2 slower in all rounds, 8 mixed |
 
 The computed significance/sign contexts were checked exhaustively against the old lookup tables
 (all 189 input cases).
@@ -73,7 +77,7 @@ thread-per-codeblock 66.2 fps, packed 124.4 fps, both with hash `459b94164d4f7e2
 The packed shader is therefore the default for both codeblock sizes; thread-per-codeblock is
 only a fallback when `tier1_packed.comp.spv` is missing.
 
-## gpu-tier1, fully auto (2026-10-20)
+## gpu-tier1, fully auto (2026-10-20, before stripe skip)
 
 ```
 profile-mxf-ffmpeg test_j2k_rgb12_1080p24_3min.mxf 240 0 gpu-tier1 ...
@@ -84,7 +88,7 @@ profile-mxf-ffmpeg test_j2k_rgb12_1080p24_3min.mxf 240 0 gpu-tier1 ...
 Whole-loop fps over 7 auto runs: 116.53, 111.55, 115.68, 116.44, 113.80, 109.77, 108.24.
 The tuner settled on batch 8 with 71-84 CPU-decoded codeblocks per frame.
 
-## Fixed configurations (2026-10-20)
+## Fixed configurations (2026-10-20, before stripe skip)
 
 ```
 VK_J2K_BATCH=8 VK_J2K_CPU_CBLKS=0
