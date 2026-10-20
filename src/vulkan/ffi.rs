@@ -1,4 +1,36 @@
 const VK_SUCCESS: i32 = 0;
+
+#[repr(C)]
+struct VkExternalMemoryBufferCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    handle_types: u32,
+}
+#[repr(C)]
+struct VkExportMemoryAllocateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    handle_types: u32,
+}
+#[repr(C)]
+struct VkMemoryDedicatedAllocateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    image: usize,
+    buffer: VkBuffer,
+}
+#[repr(C)]
+struct VkBufferMemoryBarrier {
+    s_type: u32,
+    p_next: *const c_void,
+    src_access_mask: u32,
+    dst_access_mask: u32,
+    src_queue_family_index: u32,
+    dst_queue_family_index: u32,
+    buffer: VkBuffer,
+    offset: u64,
+    size: u64,
+}
 const VK_STRUCTURE_TYPE_APPLICATION_INFO: u32 = 0;
 const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
 const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: u32 = 2;

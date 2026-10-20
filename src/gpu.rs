@@ -51,6 +51,38 @@ pub fn build_dequant_plan(
     })
 }
 
+/// Per-codeblock dequantization fused into scatter, without a full-frame index buffer.
+pub fn build_scatter_dequant_scales(
+    plan: &GpuTier1ScatterPlan,
+    qcd: &crate::codestream::QcdSegment,
+    qccs: &[crate::codestream::QccSegment],
+    precision: u8,
+    levels: u8,
+) -> Result<Vec<f32>, Tier1DecodeError> {
+    plan.records.iter().map(|record| {
+        let plane = plan.planes.iter().find(|p| p.plane_offset == record.plane_offset)
+            .ok_or_else(|| Tier1DecodeError::new("scatter plane missing"))?;
+        let (style, steps) = if let Some(qcc) = qccs.iter().find(|q| q.component == plane.component) {
+            (qcc.quantization.style, qcc.quantization.steps().map_err(|e| Tier1DecodeError::new(e.to_string()))?)
+        } else {
+            (qcd.style, qcd.steps().map_err(|e| Tier1DecodeError::new(e.to_string()))?)
+        };
+        Ok(compute_subband_scale(&steps, style, precision, levels, plane.resolution, plane.subband)? / 256.0)
+    }).collect()
+}
+
+/// Reject coefficients outside the signed Q8 staging range before dispatching a shader.
+pub fn validate_q8_records(records: &[GpuTier1CodeblockRecord]) -> Result<(), Tier1DecodeError> {
+    for record in records.iter().filter(|r| r.pass_count > 0) {
+        let first = record.magnitude_bitplanes as i64 - record.zero_bit_planes as i64 - 1;
+        let last = first - (record.pass_count as i64 + 1) / 3;
+        if first > 22 || last < -7 {
+            return Err(Tier1DecodeError::new(format!("9/7 coefficient bitplanes {first}..{last} exceed Q8 staging")));
+        }
+    }
+    Ok(())
+}
+
 fn compute_subband_scale(
     steps: &[QuantizationStep],
     style: crate::codestream::QuantizationStyle,
@@ -276,7 +308,9 @@ pub fn decode_codeblock_record_cpu(
         zero_bit_planes: record.zero_bit_planes,
         segments,
     };
-    let reconstruction = if record.reconstruction_mode == 1 {
+    let reconstruction = if record.reconstruction_mode == 2 {
+        CoefficientReconstruction::MidpointQ8
+    } else if record.reconstruction_mode == 1 {
         CoefficientReconstruction::Midpoint
     } else {
         CoefficientReconstruction::Exact

@@ -20,5 +20,6 @@ include!("vulkan/api.rs");
 include!("vulkan/pipeline.rs");
 include!("vulkan/loader.rs");
 include!("vulkan/device.rs");
+include!("vulkan/nvenc.rs");
 include!("vulkan/util.rs");
 include!("vulkan/tests.rs");

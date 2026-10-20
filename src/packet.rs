@@ -70,6 +70,13 @@ impl<'a> PacketHeaderBitReader<'a> {
         self.bits_left = 0;
     }
 
+    /// Packet headers ending in 0xff include one additional stuffed byte.
+    pub fn finish_header(&mut self) -> Result<(), PacketBitError> {
+        if self.previous_raw_ff { self.load_next_byte()?; }
+        self.bits_left = 0;
+        Ok(())
+    }
+
     pub fn consumed_bytes(&self) -> usize {
         self.byte_pos
     }
@@ -513,7 +520,7 @@ pub fn parse_lrcp_tile_packets(
                     }
                 }
 
-                reader.byte_align();
+                reader.finish_header()?;
                 let header_bytes = reader.consumed_bytes();
                 for segment in &mut segments {
                     segment.body_offset += packet_start + header_bytes;
@@ -635,7 +642,7 @@ pub fn parse_cprl_tile_packets(
                 }
             }
 
-            reader.byte_align();
+            reader.finish_header()?;
             let header_bytes = reader.consumed_bytes();
             for segment in &mut segments {
                 segment.body_offset += packet_start + header_bytes;
@@ -1105,6 +1112,21 @@ mod tests {
         assert!(!reader.read_bit().expect("bit"));
         assert!(reader.read_bit().expect("bit"));
         assert_eq!(reader.consumed_bytes(), 2);
+    }
+
+    #[test]
+    fn packet_ending_ff_consumes_stuffed_byte_before_body() {
+        let mut reader = PacketHeaderBitReader::new(&[0xff, 0x00, 0xab]);
+        assert_eq!(reader.read_bits(8).unwrap(), 255);
+        reader.finish_header().unwrap();
+        assert_eq!(reader.consumed_bytes(), 2);
+        let mut truncated = PacketHeaderBitReader::new(&[0xff]);
+        truncated.read_bits(8).unwrap();
+        assert!(truncated.finish_header().is_err());
+        let mut ordinary = PacketHeaderBitReader::new(&[0x80, 0xab]);
+        ordinary.read_bit().unwrap();
+        ordinary.finish_header().unwrap();
+        assert_eq!(ordinary.consumed_bytes(), 1);
     }
 
     #[test]

@@ -18,11 +18,14 @@ if (!(Test-Path -LiteralPath $spirvVal)) {
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
 $shaders = @(
+    @{ Source = "shaders\tier1_scatter_dequant.comp.glsl"; Output = "tier1_scatter_dequant.comp.spv" },
     @{ Source = "shaders\dequant.comp.glsl"; Output = "dequant.comp.spv" },
     @{ Source = "shaders\idwt53_1d.comp.glsl"; Output = "idwt53_1d.comp.spv" },
     @{ Source = "shaders\idwt53_offset_1d.comp.glsl"; Output = "idwt53_offset_1d.comp.spv" },
     @{ Source = "shaders\idwt53_fused_2d.comp.glsl"; Output = "idwt53_fused_2d.comp.spv" },
     @{ Source = "shaders\idwt97_1d.comp.glsl"; Output = "idwt97_1d.comp.spv" },
+    @{ Source = "shaders\idwt97_offset_1d.comp.glsl"; Output = "idwt97_offset_1d.comp.spv" },
+    @{ Source = "shaders\color_convert_f32_packed.comp.glsl"; Output = "color_convert_f32_packed.comp.spv" },
     @{ Source = "shaders\color_convert.comp.glsl"; Output = "color_convert.comp.spv" },
     @{ Source = "shaders\color_convert_i32.comp.glsl"; Output = "color_convert_i32.comp.spv" },
     @{ Source = "shaders\tier1_plan_smoke.comp.glsl"; Output = "tier1_plan_smoke.comp.spv" },
@@ -45,6 +48,8 @@ foreach ($shader in $shaders) {
         $extraArgs += $shader.Defines
     }
     & $glslc -fshader-stage=compute @extraArgs $shader.Source -o $output
+    if ($LASTEXITCODE -ne 0) { throw "Shader compilation failed: $($shader.Source)" }
     & $spirvVal $output
+    if ($LASTEXITCODE -ne 0) { throw "SPIR-V validation failed: $output" }
     Write-Host "compiled $($shader.Source) -> $output"
 }

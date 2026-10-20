@@ -73,7 +73,8 @@ impl BatchSizeTuner {
 
     /// Batch size to use for the next submit.
     pub fn current(&self) -> usize {
-        self.chosen.unwrap_or(self.candidates[self.probe_index])
+        self.chosen
+            .unwrap_or_else(|| self.candidates[self.probe_index])
     }
 
     pub fn chosen(&self) -> Option<usize> {
@@ -271,6 +272,20 @@ mod tests {
         }
         run_probe(&mut tuner, 20.0);
         assert_eq!(tuner.results()[0], (2, 20.0));
+    }
+
+    #[test]
+    fn batch_tuner_remains_usable_after_probing_all_candidates() {
+        let mut tuner = BatchSizeTuner::new(8);
+        for _ in 0..4 {
+            run_probe(&mut tuner, 20.0);
+        }
+        assert_eq!(tuner.results().len(), 4);
+        assert_eq!(tuner.chosen(), Some(1));
+        assert_eq!(tuner.current(), 1);
+        tuner.record(1, 20.0);
+        assert_eq!(tuner.current(), 1);
+        assert_eq!(tuner.results().len(), 4);
     }
 
     #[test]

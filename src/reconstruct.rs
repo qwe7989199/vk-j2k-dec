@@ -289,6 +289,20 @@ impl ComponentFloatSubbandPlanes {
         }
     }
 
+    /// Dequantize Tier-1 midpoint coefficients stored with eight fractional bits.
+    pub fn from_component_q8_with_qcd(
+        component: &ComponentSubbandPlanes,
+        qcd: &QcdSegment,
+        precision: u8,
+        decomposition_levels: u8,
+    ) -> Result<Self, Tier1DecodeError> {
+        let mut result = Self::from_component_with_qcd(component, qcd, precision, decomposition_levels)?;
+        for plane in &mut result.planes {
+            for sample in &mut plane.plane.samples { *sample /= 256.0; }
+        }
+        Ok(result)
+    }
+
     pub fn from_component_with_qcd(
         component: &ComponentSubbandPlanes,
         qcd: &QcdSegment,

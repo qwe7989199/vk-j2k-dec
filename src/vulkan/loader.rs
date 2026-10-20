@@ -59,7 +59,7 @@ impl VulkanLoader {
             application_version: 1,
             p_engine_name: app_name.as_ptr(),
             engine_version: 1,
-            api_version: make_api_version(1, 0, 0),
+            api_version: make_api_version(1, 1, 0),
         };
         let create_info = VkInstanceCreateInfo {
             s_type: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -262,6 +262,7 @@ impl VulkanInstance {
         physical_device: VkPhysicalDevice,
         queue_family_index: u32,
         transfer_family: Option<u32>,
+        external_memory: bool,
     ) -> Result<VulkanDevice, VulkanError> {
         let transfer_family = transfer_family.filter(|family| *family != queue_family_index);
         let priority = 1.0f32;
@@ -277,6 +278,7 @@ impl VulkanInstance {
         if let Some(family) = transfer_family {
             queue_create_infos.push(queue_create_info(family));
         }
+        let extensions = [c"VK_KHR_external_memory_win32".as_ptr()];
         let create_info = VkDeviceCreateInfo {
             s_type: VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             p_next: ptr::null(),
@@ -285,8 +287,8 @@ impl VulkanInstance {
             p_queue_create_infos: queue_create_infos.as_ptr(),
             enabled_layer_count: 0,
             pp_enabled_layer_names: ptr::null(),
-            enabled_extension_count: 0,
-            pp_enabled_extension_names: ptr::null(),
+            enabled_extension_count: if external_memory { 1 } else { 0 },
+            pp_enabled_extension_names: if external_memory { extensions.as_ptr() } else { ptr::null() },
             p_enabled_features: ptr::null(),
         };
         let mut device = 0usize;
@@ -373,6 +375,7 @@ impl VulkanInstance {
 
         Ok(VulkanDevice {
             device,
+            external_memory,
             queue,
             transfer_queue,
             functions,
@@ -526,6 +529,7 @@ impl VulkanInstance {
 
         Ok(VulkanDevice {
             device,
+            external_memory: false,
             queue,
             transfer_queue: None,
             functions,

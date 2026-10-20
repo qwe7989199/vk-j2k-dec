@@ -115,6 +115,7 @@ pub fn enumerate_devices() -> Result<Vec<VulkanDeviceSummary>, VulkanError> {
 
 struct VulkanComputeContext {
     device: VulkanDevice,
+    physical_device: VkPhysicalDevice,
     instance: VulkanInstance,
     loader: VulkanLoader,
 }
@@ -130,6 +131,13 @@ fn create_compute_context() -> Result<(VulkanComputeContext, VulkanDeviceSummary
 fn create_compute_context_with_transfer(
     want_transfer: bool,
 ) -> Result<(VulkanComputeContext, VulkanDeviceSummary, u32, Option<u32>), VulkanError> {
+    create_compute_context_options(want_transfer, false)
+}
+
+fn create_compute_context_options(
+    want_transfer: bool,
+    external_memory: bool,
+) -> Result<(VulkanComputeContext, VulkanDeviceSummary, u32, Option<u32>), VulkanError> {
     let loader = VulkanLoader::open()?;
     let instance = loader.create_instance()?;
     let (physical_device, summary) = instance.select_compute_device()?;
@@ -143,10 +151,11 @@ fn create_compute_context_with_transfer(
         None
     };
     let device =
-        instance.create_compute_device(physical_device, queue_family_index, transfer_family)?;
+        instance.create_compute_device(physical_device, queue_family_index, transfer_family, external_memory)?;
     Ok((
         VulkanComputeContext {
             device,
+            physical_device,
             instance,
             loader,
         },
@@ -2629,11 +2638,17 @@ impl ReusableRgb48Packer {
         let pixel_pair_count = sample_count.div_ceil(2);
         let packed_output_count = pixel_pair_count * 3;
         let output_byte_len = bytes_len::<u32>(packed_output_count)?;
-        let output_buffer = device.create_device_local_shared_buffer(
+        let output_buffer = if device.external_memory { device.create_buffer_options(
+            output_byte_len,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            sharing_families,
+            true,
+        )? } else { device.create_device_local_shared_buffer(
             output_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             sharing_families,
-        )?;
+        )? };
         let staging_buffer = device.create_buffer_shared(
             output_byte_len,
             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -2747,6 +2762,10 @@ pub struct VulkanTier1Rgb48PipelineConfig<'a> {
     pub gpu_timestamps: bool,
     /// Copy RGB48 output to host memory on a dedicated transfer queue, when the device has one.
     pub transfer_queue: bool,
+    /// Export RGB48 allocations to CUDA instead of copying frames to host memory.
+    pub export_rgb48: bool,
+    /// Optional Q8 dequantization scale per scatter record (9/7).
+    pub scatter_dequant_scales: Option<&'a [f32]>,
 }
 
 /// GPU time of one submitted batch, split by pipeline stage (whole batch, not per frame).
@@ -2805,6 +2824,10 @@ pub struct Tier1BatchFrame<'a> {
 /// frames per submit. One Tier-1 dispatch over several frames lets the long-tail codeblocks of
 /// one frame overlap the bulk of the others, which a single small frame cannot do.
 pub struct VulkanTier1Rgb48Pipeline {
+    // Drop CUDA imports before the Vulkan allocations and device they alias.
+    nvenc: Option<NvencEncoder>,
+    queue_family_index: u32,
+    export_rgb48: bool,
     device_name: String,
     device_local_heap_bytes: u64,
     setup_ms: f64,
@@ -2823,6 +2846,7 @@ pub struct VulkanTier1Rgb48Pipeline {
     timestamp_period_ns: f64,
     slots: Vec<PipelineSlot>,
     _scatter_records_buffer: HostBuffer,
+    _scatter_scales_buffer: Option<HostBuffer>,
     programs: Tier1PipelinePrograms,
     context: VulkanComputeContext,
 }
@@ -3111,6 +3135,7 @@ enum FrameIdwt {
 /// Per-frame scatter/IDWT/color resources; the frame's Tier-1 coefficients live in the slot's
 /// batched coefficient buffer at `frame_index * flat_stride`.
 struct PipelineFrameStage {
+    external_owned: bool,
     scatter_descriptor_set: VkDescriptorSet,
     rgb48_packer: ReusableRgb48Packer,
     idwt: FrameIdwt,
@@ -3124,6 +3149,7 @@ impl PipelineSlot {
         config: &VulkanTier1Rgb48PipelineConfig<'_>,
         programs: &Tier1PipelinePrograms,
         scatter_records_buffer: &HostBuffer,
+        scatter_scales_buffer: Option<&HostBuffer>,
         batch_frames: usize,
         flat_stride: u64,
         timestamps: bool,
@@ -3175,8 +3201,9 @@ impl PipelineSlot {
             ],
         );
 
+        let scatter_bindings = if scatter_scales_buffer.is_some() { 4 } else { 3 };
         let scatter_descriptor_pool =
-            device.create_descriptor_pool(3 * batch_frames as u32, batch_frames as u32)?;
+            device.create_descriptor_pool(scatter_bindings * batch_frames as u32, batch_frames as u32)?;
         let plane_byte_len = bytes_len::<i32>(config.output_coefficients)?;
         let component_ids = scattered_component_ids(config.scatter_planes);
         let mut frames = Vec::with_capacity(batch_frames);
@@ -3233,16 +3260,15 @@ impl PipelineSlot {
                 scatter_descriptor_pool.handle,
                 programs.scatter.descriptor_set_layout.handle,
             )?;
-            device.update_storage_descriptor_set(
-                scatter_descriptor_set,
-                &[
-                    scatter_records_buffer.descriptor_info(),
-                    flat_coefficient_buffer
-                        .descriptor_info_range(frame_index as u64 * frame_bytes, frame_bytes),
-                    plane_buffer.descriptor_info(),
-                ],
-            );
+            let mut scatter_descriptors = vec![
+                scatter_records_buffer.descriptor_info(),
+                flat_coefficient_buffer.descriptor_info_range(frame_index as u64 * frame_bytes, frame_bytes),
+                plane_buffer.descriptor_info(),
+            ];
+            if let Some(scales) = scatter_scales_buffer { scatter_descriptors.push(scales.descriptor_info()); }
+            device.update_storage_descriptor_set(scatter_descriptor_set, &scatter_descriptors);
             frames.push(PipelineFrameStage {
+                external_owned: false,
                 scatter_descriptor_set,
                 rgb48_packer,
                 idwt,
@@ -3402,7 +3428,7 @@ impl VulkanTier1Rgb48Pipeline {
             .transpose()?;
         let color_spirv = read_spirv(config.color_shader_path)?;
         let (context, summary, queue_family_index, transfer_family) =
-            create_compute_context_with_transfer(config.transfer_queue)?;
+            create_compute_context_options(config.transfer_queue && !config.export_rgb48, config.export_rgb48)?;
         let device = &context.device;
         let setup_start = std::time::Instant::now();
         let programs = Tier1PipelinePrograms {
@@ -3415,7 +3441,7 @@ impl VulkanTier1Rgb48Pipeline {
             scatter: StorageComputeProgram::new(
                 device,
                 &scatter_spirv,
-                3,
+                if config.scatter_dequant_scales.is_some() { 4 } else { 3 },
                 std::mem::size_of::<Tier1ScatterSmokePushConstants>() as u32,
             )?,
             idwt53: StorageComputeProgram::new(
@@ -3448,6 +3474,13 @@ impl VulkanTier1Rgb48Pipeline {
             config.scatter_records,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         )?;
+
+        let scatter_scales_buffer = config.scatter_dequant_scales.map(|scales| {
+            if scales.len() != config.scatter_records.len() {
+                return Err(VulkanError::new("dequant scale count differs from scatter record count"));
+            }
+            create_device_buffer_from_slice(device, queue_family_index, scales, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        }).transpose()?;
 
         let flat_stride = bytes_len::<i32>(config.flat_coefficient_count)?
             .next_multiple_of(TIER1_PIPELINE_FRAME_ALIGNMENT)
@@ -3493,6 +3526,7 @@ impl VulkanTier1Rgb48Pipeline {
                         config,
                         &programs,
                         &scatter_records_buffer,
+                        scatter_scales_buffer.as_ref(),
                         batch_frames,
                         flat_stride,
                         timestamps,
@@ -3516,6 +3550,9 @@ impl VulkanTier1Rgb48Pipeline {
 
         Ok(Self {
             device_name: summary.name.clone(),
+            nvenc: None,
+            queue_family_index,
+            export_rgb48: config.export_rgb48,
             device_local_heap_bytes,
             setup_ms: setup_start.elapsed().as_secs_f64() * 1000.0,
             max_batch_frames: batch_frames,
@@ -3538,6 +3575,7 @@ impl VulkanTier1Rgb48Pipeline {
             timestamp_period_ns: f64::from(summary.timestamp_period),
             slots,
             _scatter_records_buffer: scatter_records_buffer,
+            _scatter_scales_buffer: scatter_scales_buffer,
             programs,
             context,
         })
@@ -3770,6 +3808,7 @@ impl VulkanTier1Rgb48Pipeline {
         }
         let readback_copies = stages
             .iter()
+            .filter(|_| !self.export_rgb48)
             .map(|stage| BufferCopy {
                 source: &stage.rgb48_packer.output_buffer,
                 destination: &stage.rgb48_packer.staging_buffer,
@@ -3800,6 +3839,17 @@ impl VulkanTier1Rgb48Pipeline {
         });
 
         let device = &self.context.device;
+        let external_release = stages.iter()
+            .filter(|_| self.export_rgb48)
+            .map(|stage| &stage.rgb48_packer.output_buffer).collect::<Vec<_>>();
+        let external_acquire = stages.iter()
+            .filter(|stage| self.export_rgb48 && stage.external_owned)
+            .map(|stage| &stage.rgb48_packer.output_buffer).collect::<Vec<_>>();
+        let ownership = ExternalBufferOwnership {
+            acquire: &external_acquire,
+            release: &external_release,
+            queue_family: self.queue_family_index,
+        };
         device.reset_fence(slot.fence.handle)?;
         match (&slot.transfer, device.transfer_queue) {
             (Some(transfer), Some(transfer_queue)) => {
@@ -3809,6 +3859,7 @@ impl VulkanTier1Rgb48Pipeline {
                     &dispatches,
                     &[],
                     marks.as_ref(),
+                    None,
                 )?;
                 let readback_marks = slot
                     .query_pool
@@ -3834,11 +3885,17 @@ impl VulkanTier1Rgb48Pipeline {
                     &dispatches,
                     &readback_copies,
                     marks.as_ref(),
+                    Some(&ownership),
                 )?;
                 device.submit_with_fence(slot.command_buffer, slot.fence.handle)?;
             }
         }
         self.slots[slot_index].pending_frames = frames.len();
+        if self.export_rgb48 {
+            for stage in &mut self.slots[slot_index].frames[..frames.len()] {
+                stage.external_owned = true;
+            }
+        }
         Ok(())
     }
 
@@ -3849,6 +3906,9 @@ impl VulkanTier1Rgb48Pipeline {
         slot_index: usize,
         mut consume: impl FnMut(usize, &[u16]),
     ) -> Result<f64, VulkanError> {
+        if self.export_rgb48 {
+            return Err(VulkanError::new("exported RGB48 must be consumed by wait_and_encode_batch"));
+        }
         let slot = self.slots.get_mut(slot_index).ok_or_else(|| {
             VulkanError::new(format!("GPU Tier-1 pipeline has no slot {slot_index}"))
         })?;

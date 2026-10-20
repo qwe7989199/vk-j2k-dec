@@ -31,6 +31,8 @@ pub struct SubbandCoefficientPlane {
 pub enum CoefficientReconstruction {
     Exact,
     Midpoint,
+    /// Signed Q8 midpoint coefficients for irreversible reconstruction.
+    MidpointQ8,
 }
 
 impl SubbandCoefficientPlane {
@@ -1074,6 +1076,7 @@ fn significance_reconstruction_magnitude(
     reconstruction: CoefficientReconstruction,
 ) -> Result<i32, Tier1DecodeError> {
     match reconstruction {
+        CoefficientReconstruction::MidpointQ8 => coefficient_one_plus_half(bitplane + 8),
         CoefficientReconstruction::Exact => coefficient_bit_value(bitplane),
         CoefficientReconstruction::Midpoint => {
             let magnitude = coefficient_one_plus_half(bitplane)?;
@@ -1098,6 +1101,10 @@ fn refinement_reconstruction_delta(
     reconstruction: CoefficientReconstruction,
 ) -> Result<i32, Tier1DecodeError> {
     match reconstruction {
+        CoefficientReconstruction::MidpointQ8 => {
+            let half = coefficient_positive_half(bitplane + 8)?;
+            Ok(if bit { half } else { -half })
+        }
         CoefficientReconstruction::Exact => {
             if bit {
                 coefficient_bit_value(bitplane)
@@ -1132,3 +1139,21 @@ impl std::fmt::Display for Tier1DecodeError {
 }
 
 impl std::error::Error for Tier1DecodeError {}
+
+#[cfg(test)]
+mod q8_tests {
+    use super::*;
+
+    #[test]
+    fn midpoint_keeps_fractional_refinement_and_has_no_ll_bias() {
+        let id = CodeblockId { component: 0, resolution: 0, subband: SubbandKind::Ll, codeblock_x: 0, codeblock_y: 0 };
+        let mode = CoefficientReconstruction::MidpointQ8;
+        // Significant at bit 1: 3.0, refined at bit 0: 2.5 or 3.5.
+        let initial = significance_reconstruction_magnitude(id, 1, mode).unwrap();
+        assert_eq!(initial, 3 * 256);
+        assert_eq!(initial + refinement_reconstruction_delta(0, false, mode).unwrap(), 640);
+        assert_eq!(initial + refinement_reconstruction_delta(0, true, mode).unwrap(), 896);
+        assert_eq!(significance_reconstruction_magnitude(id, 0, mode).unwrap(), 384);
+        assert_eq!(significance_reconstruction_magnitude(id, -1, mode).unwrap(), 192);
+    }
+}

@@ -5,6 +5,9 @@ use std::process::Command;
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod stream_bench;
+pub use stream_bench::benchmark_mxf_stream;
+
 use vk_j2k_dec::codestream::{CodeblockStyle, Codestream, SubbandKind, WaveletTransform};
 use vk_j2k_dec::decode::{
     DecodeProfile, decode_coefficient_planes, decode_reversible_component_planes_with_discard,
@@ -31,6 +34,27 @@ use vk_j2k_dec::vulkan::{
 
 pub fn decode_rgb48_file(input: &str, output: &str) -> ExitCode {
     decode_rgb48_file_with_discard(input, 0, output)
+}
+
+pub fn decode_rgb48_full_gpu_file(input: &str, output: &str) -> ExitCode {
+    let result = (|| -> Result<(), String> {
+        let data = fs::read(input).map_err(|e| e.to_string())?;
+        let stream = Codestream::parse(&data).map_err(|e| e.to_string())?;
+        let transform = stream.cod.as_ref().ok_or("missing COD")?.transform;
+        let start = Instant::now();
+        let image = vk_j2k_dec::decode::decode_rgb48_full_gpu_97(
+            &data,
+            r"target\shaders\tier1_packed.comp.spv",
+            r"target\shaders\tier1_scatter_smoke.comp.spv",
+            r"target\shaders\dequant.comp.spv",
+            if transform == WaveletTransform::Irreversible97 { r"target\shaders\idwt97_offset_1d.comp.spv" } else { r"target\shaders\idwt53_offset_1d.comp.spv" },
+            if transform == WaveletTransform::Irreversible97 { r"target\shaders\color_convert_f32_packed.comp.spv" } else { r"target\shaders\color_convert_i32.comp.spv" },
+        ).map_err(|e| e.to_string())?;
+        println!("full GPU decode: {}x{} {}-bit {transform}, {:.3} ms -> {output}", image.width, image.height, image.precision, elapsed_ms(start));
+        fs::write(output, samples_to_le_bytes(&image.samples)).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    match result { Ok(()) => ExitCode::SUCCESS, Err(e) => { eprintln!("full GPU decode failed: {e}"); ExitCode::FAILURE } }
 }
 
 pub fn decode_rgb48_file_with_discard(input: &str, discard_levels: u8, output: &str) -> ExitCode {
@@ -361,6 +385,13 @@ pub fn profile_mxf_ffmpeg_file(
     }
     let pattern = work_dir.join("frame_%06d.j2k");
     let demux_start = Instant::now();
+    if std::env::var("VK_J2K_DEMUX").is_ok_and(|v| v == "scan") {
+        if let Err(e) = extract_codestream_frames(input, frame_count, work_dir) {
+            eprintln!("codestream scan failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        println!("  demux codestream scan (container timestamps/audio not used)");
+    } else {
     let status = Command::new(ffmpeg_path)
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -378,7 +409,6 @@ pub fn profile_mxf_ffmpeg_file(
         .arg("image2")
         .arg(&pattern)
         .status();
-    let demux_ms = elapsed_ms(demux_start);
     match status {
         Ok(status) if status.success() => {}
         Ok(status) => {
@@ -390,6 +420,8 @@ pub fn profile_mxf_ffmpeg_file(
             return ExitCode::FAILURE;
         }
     }
+    }
+    let demux_ms = elapsed_ms(demux_start);
 
     if mode == "gpu-tier1" {
         return profile_mxf_ffmpeg_gpu_tier1_file(
@@ -509,6 +541,45 @@ pub fn profile_mxf_ffmpeg_file(
     ExitCode::SUCCESS
 }
 
+/// Explicit essence recovery for MXF files whose header metadata FFmpeg rejects.
+/// JPEG 2000 entropy byte stuffing excludes an embedded EOC marker. Bound memory
+/// to one codestream and validate each frame before exposing it to the decoder.
+fn extract_codestream_frames(input: &str, count: usize, directory: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut file = fs::File::open(input).map_err(|e| e.to_string())?;
+    let mut chunk = vec![0u8; 1024 * 1024];
+    let mut pending = Vec::new();
+    let mut in_frame = false;
+    let mut found = 0;
+    loop {
+        let n = file.read(&mut chunk).map_err(|e| e.to_string())?;
+        if n == 0 { return Err(format!("requested {count} frames, found {found}")); }
+        pending.extend_from_slice(&chunk[..n]);
+        loop {
+            if !in_frame {
+                if let Some(start) = pending.windows(4).position(|w| w == [0xff, 0x4f, 0xff, 0x51]) {
+                    pending.drain(..start);
+                    in_frame = true;
+                } else {
+                    let keep = pending.len().saturating_sub(3);
+                    pending.drain(..keep);
+                    break;
+                }
+            }
+            let Some(end) = pending.windows(2).position(|w| w == [0xff, 0xd9]).map(|p| p + 2) else {
+                if pending.len() > 64 * 1024 * 1024 { return Err("codestream exceeds 64 MiB scan limit".into()); }
+                break;
+            };
+            Codestream::parse(&pending[..end]).map_err(|e| format!("frame {}: {e}", found + 1))?;
+            fs::write(frame_path(directory, found + 1), &pending[..end]).map_err(|e| e.to_string())?;
+            found += 1;
+            if found == count { return Ok(()); }
+            pending.drain(..end);
+            in_frame = false;
+        }
+    }
+}
+
 fn frame_path(work_dir: &Path, one_based_index: usize) -> PathBuf {
     work_dir.join(format!("frame_{one_based_index:06}.j2k"))
 }
@@ -522,6 +593,9 @@ struct FastTier1Rgb48Frame {
     color_transform: u32,
     precision: u8,
     codeblock_style: CodeblockStyle,
+    transform: WaveletTransform,
+    qcd: Option<vk_j2k_dec::codestream::QcdSegment>,
+    qccs: Vec<vk_j2k_dec::codestream::QccSegment>,
 }
 
 fn profile_mxf_ffmpeg_gpu_tier1_file(
@@ -535,6 +609,7 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
     idwt53_shader_path: &str,
     color_shader_path: &str,
 ) -> ExitCode {
+    let profile_start = Instant::now();
     if discard_levels != 0 {
         eprintln!("profile-mxf-ffmpeg gpu-tier1 currently supports discard 0 only");
         return ExitCode::FAILURE;
@@ -624,6 +699,9 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
             || frame.scatter_plan.output_coefficients != scatter_plan.output_coefficients
             || frame.target_resolution != target_resolution
             || frame.color_transform != color_transform
+            || frame.transform != first_frame.transform
+            || frame.qcd != first_frame.qcd
+            || frame.qccs != first_frame.qccs
             || frame.precision != precision
         {
             eprintln!(
@@ -634,15 +712,27 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         }
     }
 
+    let is_97 = first_frame.transform == WaveletTransform::Irreversible97;
+    let dequant_scales = if is_97 {
+        let Some(qcd) = first_frame.qcd.as_ref() else { eprintln!("9/7 requires QCD"); return ExitCode::FAILURE; };
+        match vk_j2k_dec::gpu::build_scatter_dequant_scales(&scatter_plan, qcd, &first_frame.qccs, precision, target_resolution) {
+            Ok(scales) => Some(scales),
+            Err(e) => { eprintln!("dequant setup failed: {e}"); return ExitCode::FAILURE; }
+        }
+    } else { None };
+    let scatter_shader_path = if is_97 { r"target\shaders\tier1_scatter_dequant.comp.spv" } else { scatter_shader_path };
+    let idwt53_shader_path = if is_97 { r"target\shaders\idwt97_offset_1d.comp.spv" } else { idwt53_shader_path };
+    let color_shader_path = if is_97 { r"target\shaders\color_convert_f32_packed.comp.spv" } else { color_shader_path };
+
     // VK_J2K_TIER1_SHADER forces a warp-per-codeblock Tier-1 shader (A/B testing).
     let forced_shader = std::env::var("VK_J2K_TIER1_SHADER").ok();
     // The packed-state warp shader beats thread-per-codeblock even on 16x16 codeblocks; the
     // latter is only a fallback when the packed build is missing.
-    let thread_per_codeblock = forced_shader.is_none()
+    let thread_per_codeblock = !is_97 && forced_shader.is_none()
         && !Path::new(TIER1_WARP_SHADERS[0]).exists()
         && thread_per_codeblock_eligible(&template_records)
         && first_existing(TIER1_THREAD_SHADERS).is_some();
-    let cleanup_shader_path: &str = if let Some(path) = forced_shader.as_deref() {
+    let cleanup_shader_path: &str = if is_97 { TIER1_WARP_SHADERS[0] } else if let Some(path) = forced_shader.as_deref() {
         path
     } else if thread_per_codeblock {
         first_existing(TIER1_THREAD_SHADERS).unwrap_or(TIER1_WARP_SHADERS[TIER1_WARP_SHADERS.len() - 1])
@@ -661,6 +751,7 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
     let cpu_coefficient_capacity = coefficient_counts.iter().take(max_cpu_per_frame).sum();
     let fixed_batch = env_usize("VK_J2K_BATCH").filter(|batch| *batch > 0);
     let fixed_cpu_codeblocks = env_usize("VK_J2K_CPU_CBLKS").map(|k| k.min(max_cpu_per_frame));
+    let nvenc_output = std::env::var("VK_J2K_NVENC_OUTPUT").ok();
 
     let mut pipeline = match VulkanTier1Rgb48Pipeline::new(&VulkanTier1Rgb48PipelineConfig {
         cleanup_shader_path,
@@ -668,7 +759,7 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         scatter_shader_path,
         idwt53_shader_path,
         // VK_J2K_IDWT=separable keeps the three-pass-per-component IDWT (A/B testing).
-        idwt53_fused_shader_path: if std::env::var("VK_J2K_IDWT").is_ok_and(|mode| mode == "separable") {
+        idwt53_fused_shader_path: if is_97 || std::env::var("VK_J2K_IDWT").is_ok_and(|mode| mode == "separable") {
             None
         } else {
             first_existing(&[r"target\shaders\idwt53_fused_2d.comp.spv"])
@@ -691,6 +782,8 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         gpu_timestamps: std::env::var_os("VK_J2K_GPU_TIMING").is_some(),
         // VK_J2K_TRANSFER_QUEUE=0 keeps the readback copy on the compute queue (A/B testing).
         transfer_queue: !std::env::var("VK_J2K_TRANSFER_QUEUE").is_ok_and(|mode| mode == "0"),
+        export_rgb48: nvenc_output.is_some(),
+        scatter_dequant_scales: dequant_scales.as_deref(),
     }) {
         Ok(pipeline) => pipeline,
         Err(err) => {
@@ -711,6 +804,22 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         None => CpuOffloadController::new(max_cpu_per_frame, cpu_threads),
     };
     let hash_frames = std::env::var_os("VK_J2K_HASH_FRAMES").is_some();
+    let encoder_start = Instant::now();
+    let nvenc_preset = std::env::var("VK_J2K_NVENC_PRESET").unwrap_or_else(|_| "p4".to_string());
+    let nvenc_qp = match std::env::var("VK_J2K_NVENC_QP") {
+        Ok(value) => match value.parse::<i32>() {
+            Ok(qp) if (0..=51).contains(&qp) => qp,
+            _ => { eprintln!("VK_J2K_NVENC_QP must be 0..51"); return ExitCode::FAILURE; }
+        },
+        Err(_) => 23,
+    };
+    if let Some(output) = nvenc_output.as_deref() {
+        if let Err(err) = pipeline.start_nvenc(output, &nvenc_preset, nvenc_qp, hash_frames) {
+            eprintln!("NVENC setup failed: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let encoder_setup_ms = elapsed_ms(encoder_start);
 
     let decode_loop_start = Instant::now();
     let outcome = match run_tier1_mxf_decode_loop(
@@ -720,6 +829,7 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         &mut offload,
         cpu_threads,
         hash_frames,
+        nvenc_output.is_some(),
     ) {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -727,6 +837,33 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
             return ExitCode::FAILURE;
         }
     };
+    if let Some(output) = nvenc_output.as_deref() {
+        let encoded = match pipeline.finish_nvenc() {
+            Ok(result) => result,
+            Err(err) => { eprintln!("NVENC flush failed: {err}"); return ExitCode::FAILURE; }
+        };
+        let loop_ms = elapsed_ms(decode_loop_start);
+        let total_ms = demux_ms + elapsed_ms(profile_start);
+        if encoded.frames != frame_count as u64 || encoded.packets != frame_count as u64 {
+            eprintln!("NVENC frame count mismatch: {} submitted / {} packets / {} expected", encoded.frames, encoded.packets, frame_count);
+            return ExitCode::FAILURE;
+        }
+        println!("profile-mxf-nvenc: frames {frame_count} -> {output}");
+        println!("  vulkan_device {}", pipeline.device_name());
+        println!("  tier1_shader {cleanup_shader_path}");
+        println!("  idwt {}", if pipeline.fused_idwt() { "fused 2d" } else { "separable 1d" });
+        println!("  interop opaque Win32 memory -> CUDA UUID-matched device -> GPU RGB48-to-NV12 -> h264_nvenc");
+        println!("  raw_frame_host_readback {}", if hash_frames { "verification only" } else { "disabled" });
+        println!("  encoder preset {nvenc_preset} qp {nvenc_qp} bf 0 lookahead 0 fps 24 color BT709 limited NV12 MP4");
+        println!("  frames_encoded {} packets {}", encoded.frames, encoded.packets);
+        println!("  ffmpeg_demux_ms {demux_ms:.3} pipeline_setup_ms {:.3} encoder_setup_ms {encoder_setup_ms:.3}", pipeline.setup_ms());
+        println!("  autotune batch {} probes {:?} cpu_codeblocks_per_frame {}", tuner.current(), tuner.results(), offload.per_frame());
+        println!("  transcode_loop_ms {loop_ms:.3} avg_ms {:.3} fps {:.2} (includes encoder flush and MP4 finalization)", loop_ms / frame_count as f64, frame_count as f64 * 1000.0 / loop_ms);
+        println!("  total_with_demux_setup_ms {total_ms:.3} fps {:.2}", frame_count as f64 * 1000.0 / total_ms);
+        print_tier1_gpu_stage_average(&outcome.iterations);
+        if let Some(hash) = encoded.frames_hash { println!("  frames_hash {hash:016x}"); }
+        return ExitCode::SUCCESS;
+    }
     let decode_loop_ms = elapsed_ms(decode_loop_start);
     let samples = outcome.last_samples;
     if samples.is_empty() {
@@ -849,6 +986,7 @@ fn run_tier1_mxf_decode_loop(
     offload: &mut CpuOffloadController,
     cpu_threads: usize,
     hash_frames: bool,
+    encode: bool,
 ) -> Result<Tier1DecodeLoopOutcome, String> {
     let frame_total = frame_plans.len();
     let mut in_flight: [Option<(usize, usize)>; 2] = [None, None];
@@ -905,8 +1043,10 @@ fn run_tier1_mxf_decode_loop(
             read_slot.and_then(|read_slot| in_flight[read_slot].take().map(|batch| (read_slot, batch)))
         {
             let read_start = Instant::now();
-            wait_ms = pipeline
-                .wait_and_read_batch(read_slot, |index, samples| {
+            wait_ms = if encode {
+                pipeline.wait_and_encode_batch(read_slot, first_frame)
+            } else {
+                pipeline.wait_and_read_batch(read_slot, |index, samples| {
                     if hash_frames {
                         frames_hash = samples.iter().fold(frames_hash, |hash, sample| {
                             (hash ^ u64::from(*sample)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -916,6 +1056,7 @@ fn run_tier1_mxf_decode_loop(
                         last_samples = samples.to_vec();
                     }
                 })
+            }
                 .map_err(|err| format!("reading frame {}: {err}", first_frame + 1))?;
             read_ms = elapsed_ms(read_start) - wait_ms;
             frames_read = count;
@@ -1129,29 +1270,29 @@ fn build_fast_tier1_rgb48_frame(data: &[u8]) -> Result<FastTier1Rgb48Frame, Stri
         .cod
         .as_ref()
         .ok_or_else(|| "missing COD marker".to_string())?;
-    if cod.transform != WaveletTransform::Reversible53 {
-        return Err(format!(
-            "gpu-tier1 currently requires reversible 5/3, got {}",
-            cod.transform
-        ));
+    if siz.components.len() != 3 || siz.components.iter().any(|c|
+        c.is_signed || c.x_subsampling != 1 || c.y_subsampling != 1
+        || c.precision != siz.components[0].precision || !(1..=16).contains(&c.precision)) {
+        return Err("GPU RGB48 requires three unsigned, equally sized 1..16-bit components".into());
     }
-    if codestream.tile_parts.len() != 1 {
-        return Err(format!(
-            "gpu-tier1 currently supports one tile-part, found {}",
-            codestream.tile_parts.len()
-        ));
+    if siz.x_origin != 0 || siz.y_origin != 0 {
+        return Err("persistent GPU IDWT currently requires a zero image origin".into());
     }
-    let layouts = codestream.tile_layouts().map_err(|err| err.to_string())?;
-    let tile_part = &codestream.tile_parts[0];
-    let layout = layouts
-        .iter()
-        .find(|layout| layout.tile_index == tile_part.tile_index)
-        .ok_or_else(|| format!("missing layout for tile {}", tile_part.tile_index))?;
-    let tile_data = data
-        .get(tile_part.data_start..tile_part.data_end)
-        .ok_or_else(|| "tile payload outside codestream".to_string())?;
-    let packet_summary =
-        parse_lrcp_tile_packets(tile_data, layout, cod.layers).map_err(|err| err.to_string())?;
+    let is_97 = cod.transform == WaveletTransform::Irreversible97;
+    if !is_97 && cod.transform != WaveletTransform::Reversible53 { return Err("unsupported wavelet".into()); }
+    let layouts = codestream.tile_layouts().map_err(|e| e.to_string())?;
+    if layouts.len() != 1 { return Err("persistent GPU pipeline requires one tile".into()); }
+    let layout = &layouts[0];
+    let mut tile_data = Vec::new();
+    for part in &codestream.tile_parts {
+        if part.tile_index != layout.tile_index { return Err("unexpected tile index".into()); }
+        tile_data.extend_from_slice(data.get(part.data_start..part.data_end).ok_or("tile payload outside codestream")?);
+    }
+    let packet_summary = vk_j2k_dec::packet::parse_tile_packets(&tile_data, layout, cod.layers, &cod.progression_order)
+        .map_err(|e| e.to_string())?;
+    if packet_summary.consumed_bytes != tile_data.len() {
+        return Err(format!("packet parser consumed {} of {} tile bytes", packet_summary.consumed_bytes, tile_data.len()));
+    }
     let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
         &packet_summary,
         codestream.qcd.as_ref(),
@@ -1159,7 +1300,7 @@ fn build_fast_tier1_rgb48_frame(data: &[u8]) -> Result<FastTier1Rgb48Frame, Stri
     )
     .map_err(|err| err.to_string())?;
     let bound = work_plan
-        .bind_segment_data(tile_data)
+        .bind_segment_data(&tile_data)
         .map_err(|err| err.to_string())?;
     let plan = GpuTier1Plan::from_bound_work_plan(&bound, cod.codeblock_style_flags())
         .map_err(|err| err.to_string())?;
@@ -1171,13 +1312,18 @@ fn build_fast_tier1_rgb48_frame(data: &[u8]) -> Result<FastTier1Rgb48Frame, Stri
         .first()
         .map(|component| component.precision)
         .unwrap_or(0);
+    let records = plan.codeblock_records_with_reconstruction(if is_97 { 2 } else { 0 });
+    if is_97 { vk_j2k_dec::gpu::validate_q8_records(&records).map_err(|e| e.to_string())?; }
     Ok(FastTier1Rgb48Frame {
-        records: plan.codeblock_records(),
+        records,
         compressed_words: plan.compressed_u32_words(),
         flat_coefficient_count: plan.output_coefficients,
         scatter_plan,
         target_resolution: cod.decomposition_levels,
-        color_transform: u32::from(cod.multiple_component_transform),
+        color_transform: if cod.multiple_component_transform == 0 { 0 } else if is_97 { 2 } else { 1 },
+        transform: cod.transform,
+        qcd: codestream.qcd.clone(),
+        qccs: codestream.qccs.clone(),
         precision,
         codeblock_style: cod.codeblock_style_flags(),
     })

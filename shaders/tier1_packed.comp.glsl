@@ -315,7 +315,10 @@ void make_significant(uint x, uint s, uint r, uint bitplane) {
     uvec2 sc = sign_context(r);
     uint sign_bit = decode_bit(sc.x) ^ sc.y;
     int magnitude;
-    if (recon_mode == 1u) {
+    if (recon_mode == 2u) {
+        uint shifted = bitplane + 8u;
+        magnitude = int((1u << shifted) | ((1u << shifted) >> 1u));
+    } else if (recon_mode == 1u) {
         magnitude = int((1u << bitplane) | ((1u << bitplane) >> 1u));
         if (codeblock.resolution == 0u && codeblock.subband == 0u) {
             magnitude -= 1;
@@ -446,7 +449,10 @@ void decode_refinement_pass(uint bitplane) {
                         uint context = refined ? 16u : (has_neighbor(r) ? 15u : 14u);
                         uint bit = decode_bit(context);
                         int delta;
-                        if (recon_mode == 1u) {
+                        if (recon_mode == 2u) {
+                            int half_step = int((1u << (bitplane + 8u)) >> 1u);
+                            delta = bit != 0u ? half_step : -half_step;
+                        } else if (recon_mode == 1u) {
                             int half_step = int((1u << bitplane) >> 1u);
                             delta = bit != 0u ? half_step : -half_step;
                         } else {
@@ -540,7 +546,7 @@ void main() {
 
                 decode_cleanup_pass(bitplane);
                 pass_index += 1u;
-                if (bitplane > 0u) {
+                if (recon_mode == 2u || bitplane > 0u) {
                     bitplane -= 1u;
                 }
             }

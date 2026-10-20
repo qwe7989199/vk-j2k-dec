@@ -216,7 +216,10 @@ void decode_significant_sample(uint x, uint y, uint bitplane) {
     uvec2 sc = sign_context(x, y);
     uint sign_bit = decode_bit(sc.x) ^ sc.y;
     int magnitude;
-    if (cb.reconstruction_mode == 1u) {
+    if (cb.reconstruction_mode == 2u) {
+        uint shifted = bitplane + 8u;
+        magnitude = int((1u << shifted) | ((1u << shifted) >> 1u));
+    } else if (cb.reconstruction_mode == 1u) {
         magnitude = int((1u << bitplane) | ((1u << bitplane) >> 1u));
         if (cb.resolution == 0u && cb.subband == 0u) magnitude -= 1;
     } else {
@@ -358,7 +361,10 @@ void main() {
                     uint context = state_is_refined(st) ? 16u : (((st & STATE_NEIGHBOR_MASK) != 0u) ? 15u : 14u);
                     uint bit = decode_bit(context);
                     int delta;
-                    if (cb.reconstruction_mode == 1u) {
+                    if (cb.reconstruction_mode == 2u) {
+                        int half_step = int((1u << (bitplane + 8u)) >> 1u);
+                        delta = bit != 0u ? half_step : -half_step;
+                    } else if (cb.reconstruction_mode == 1u) {
                         int half_step = int((1u << bitplane) >> 1u);
                         delta = bit != 0u ? half_step : -half_step;
                     } else {
@@ -415,7 +421,7 @@ void main() {
             stripe_y += 4u;
         }
         pass_index += 1u;
-        if (bitplane > 0u) bitplane -= 1u;
+        if (cb.reconstruction_mode == 2u || bitplane > 0u) bitplane -= 1u;
     }
 
     // Write summary and zero non-significant coefficients

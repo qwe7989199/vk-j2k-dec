@@ -19,6 +19,24 @@ pub fn run() -> ExitCode {
     let program = args.next().unwrap_or_else(|| "vk-j2k-dec".to_string());
 
     match (args.next().as_deref(), args.next()) {
+        (Some("bench-mxf-stream"), Some(path)) => {
+            let backend = args.next().unwrap_or_else(|| "vulkan".into());
+            let frames = args.next().unwrap_or_else(|| "0".into());
+            let batch = args.next().unwrap_or_else(|| "2".into());
+            let output = args.next().unwrap_or_else(|| "NUL".into());
+            let (Ok(frames), Ok(batch)) = (frames.parse::<usize>(), batch.parse::<usize>()) else {
+                eprintln!("usage: {program} bench-mxf-stream <input.mxf> <vulkan|nvj2k> [frames: 0=all] [batch] [output: NUL]");
+                return ExitCode::FAILURE;
+            };
+            raw::benchmark_mxf_stream(&path, &backend, frames, batch, &output)
+        }
+        (Some("decode-rgb48-full-gpu"), Some(path)) => {
+            let Some(output) = args.next() else {
+                eprintln!("usage: {program} decode-rgb48-full-gpu <input.j2k> <output.rgb48le>");
+                return ExitCode::FAILURE;
+            };
+            raw::decode_rgb48_full_gpu_file(&path, &output)
+        }
         (Some("dump"), Some(path)) => dump_codestream(&path),
         (Some("scan"), Some(path)) => {
             let max_hits = args
@@ -492,6 +510,7 @@ pub fn run() -> ExitCode {
             );
             eprintln!("  {program} reconstruct-smoke <input.j2k>");
             eprintln!("  {program} decode-rgb48 <input.j2k> <output.rgb48le>");
+            eprintln!("  {program} decode-rgb48-full-gpu <input.j2k> <output.rgb48le>");
             eprintln!(
                 "  {program} decode-rgb48-lowres <input.j2k> <discard-levels> <output.rgb48le>"
             );
@@ -511,6 +530,7 @@ pub fn run() -> ExitCode {
                 "  {program} profile-mxf-ffmpeg <input.mxf> <frames> <discard-levels> <cpu|gpu-dwt|gpu|gpu-tier1> <output.rgb48le> [ffmpeg.exe] [work-dir] [idwt53.comp.spv] [color.comp.spv]"
             );
             eprintln!("  {program} diff-rgb48 <actual.rgb48le> <reference.rgb48le>");
+            eprintln!("  {program} bench-mxf-stream <input.mxf> <vulkan|nvj2k> [frames: 0=all] [batch: 2] [output: NUL]");
             eprintln!("  {program} diff-component-plane <actual.i32le> <reference.i32le>");
             eprintln!(
                 "  {program} diff-component-rgb48 <actual.i32le> <reference.rgb48le> <component> <precision>"

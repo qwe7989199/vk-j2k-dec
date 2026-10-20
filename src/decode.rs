@@ -232,7 +232,7 @@ pub fn decode_rgb48_full_gpu_97(
     color_shader_path: &str,
 ) -> Result<DecodedRgb48, DecodeError> {
     use crate::gpu::{GpuTier1Plan, sort_codeblock_records_by_descending_work};
-    use crate::packet::{parse_lrcp_tile_packets, parse_tile_packets};
+    use crate::packet::parse_tile_packets;
     use crate::tier1::Tier1WorkPlan;
 
     let codestream = Codestream::parse(data).map_err(|e| DecodeError::new(e.to_string()))?;
@@ -292,9 +292,10 @@ pub fn decode_rgb48_full_gpu_97(
     let merged = GpuTier1Plan::merge(&all_plans);
     let reconstruction_mode = match cod.transform {
         WaveletTransform::Reversible53 => 0u32,
-        _ => 1u32,
+        _ => 2u32,
     };
     let mut records = merged.codeblock_records_with_reconstruction(reconstruction_mode);
+    if reconstruction_mode == 2 { crate::gpu::validate_q8_records(&records).map_err(|e| DecodeError::new(e.to_string()))?; }
     sort_codeblock_records_by_descending_work(&mut records);
     let compressed_words = merged.compressed_u32_words();
 
@@ -328,7 +329,7 @@ pub fn decode_rgb48_full_gpu_97(
             .qcd
             .as_ref()
             .ok_or_else(|| DecodeError::new("missing QCD for 9/7 dequantization"))?;
-        let dequant_plan = crate::gpu::build_dequant_plan(
+        let mut dequant_plan = crate::gpu::build_dequant_plan(
             &scatter_plan.planes,
             scatter_plan.output_coefficients,
             qcd,
@@ -336,6 +337,8 @@ pub fn decode_rgb48_full_gpu_97(
             cod.decomposition_levels,
         )
         .map_err(|e| DecodeError::new(e.to_string()))?;
+
+        for step in &mut dequant_plan.steps { *step /= 256.0; }
 
         let result = crate::vulkan::run_tier1_cleanup_scatter_rgb48_bench_97(
             cleanup_shader_path,
@@ -743,7 +746,7 @@ fn decode_rgb48_with_backends_profiled(
                                         "missing QCD/QCC for component {comp_idx}"
                                     ))
                                 })?;
-                        let float_comp = ComponentFloatSubbandPlanes::from_component_with_qcd(
+                        let float_comp = ComponentFloatSubbandPlanes::from_component_q8_with_qcd(
                             comp,
                             qcd,
                             siz.components[0].precision,
@@ -1081,7 +1084,7 @@ fn reconstruct_float_components(
                         component.component
                     ))
                 })?;
-            ComponentFloatSubbandPlanes::from_component_with_qcd(
+            ComponentFloatSubbandPlanes::from_component_q8_with_qcd(
                 component,
                 qcd,
                 precision,
@@ -1335,7 +1338,7 @@ fn coefficient_reconstruction_for_transform(
     match transform {
         WaveletTransform::Reversible53 => CoefficientReconstruction::Exact,
         WaveletTransform::Irreversible97 | WaveletTransform::Unknown(_) => {
-            CoefficientReconstruction::Midpoint
+            CoefficientReconstruction::MidpointQ8
         }
     }
 }

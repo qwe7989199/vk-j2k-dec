@@ -52,6 +52,7 @@ struct VulkanDeviceFunctions {
 
 struct VulkanDevice {
     device: VkDevice,
+    external_memory: bool,
     queue: VkQueue,
     /// Queue of a dedicated transfer family, when one was requested at device creation.
     transfer_queue: Option<VkQueue>,
@@ -73,6 +74,12 @@ struct BufferCopy<'a> {
     source: &'a HostBuffer,
     destination: &'a HostBuffer,
     byte_len: u64,
+}
+
+struct ExternalBufferOwnership<'a> {
+    acquire: &'a [&'a HostBuffer],
+    release: &'a [&'a HostBuffer],
+    queue_family: u32,
 }
 
 struct RegionCopy<'a> {
@@ -99,6 +106,29 @@ impl TimestampMarks<'_> {
 }
 
 impl VulkanDevice {
+    fn external_buffer_barriers(&self, command: VkCommandBuffer, buffers: &[&HostBuffer], family: u32, acquire: bool) {
+        if buffers.is_empty() { return; }
+        let barriers = buffers.iter().map(|buffer| VkBufferMemoryBarrier {
+            s_type: 44, // VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER
+            p_next: ptr::null(),
+            src_access_mask: if acquire { 0 } else { VK_ACCESS_SHADER_WRITE_BIT },
+            dst_access_mask: if acquire { VK_ACCESS_SHADER_WRITE_BIT } else { 0 },
+            src_queue_family_index: if acquire { 0xffff_fffe } else { family },
+            dst_queue_family_index: if acquire { family } else { 0xffff_fffe },
+            buffer: buffer.buffer,
+            offset: 0,
+            size: buffer.size,
+        }).collect::<Vec<_>>();
+        unsafe {
+            (self.functions.cmd_pipeline_barrier)(
+                command,
+                if acquire { VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT } else { VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT },
+                if acquire { VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT } else { VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT },
+                0, 0, ptr::null(), barriers.len() as u32, barriers.as_ptr() as *const c_void,
+                0, ptr::null(),
+            );
+        }
+    }
     /// Size of the largest device-local memory heap (VRAM on discrete GPUs).
     fn device_local_heap_bytes(&self) -> u64 {
         let heap_count = (self.memory_properties.memory_heap_count as usize)
@@ -164,10 +194,26 @@ impl VulkanDevice {
         memory_properties: VkFlags,
         families: &[u32],
     ) -> Result<HostBuffer, VulkanError> {
+        self.create_buffer_options(size, usage, memory_properties, families, false)
+    }
+
+    fn create_buffer_options(
+        &self,
+        size: u64,
+        usage: VkFlags,
+        memory_properties: VkFlags,
+        families: &[u32],
+        export: bool,
+    ) -> Result<HostBuffer, VulkanError> {
         let concurrent = families.len() > 1;
+        let external = VkExternalMemoryBufferCreateInfo {
+            s_type: 1000072000,
+            p_next: ptr::null(),
+            handle_types: 2, // VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+        };
         let create_info = VkBufferCreateInfo {
             s_type: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            p_next: ptr::null(),
+            p_next: if export { &external as *const _ as *const c_void } else { ptr::null() },
             flags: 0,
             size,
             usage,
@@ -187,18 +233,35 @@ impl VulkanDevice {
         unsafe {
             (self.functions.get_buffer_memory_requirements)(self.device, buffer, &mut requirements);
         }
-        let memory_type_index = self.find_memory_type(
+        let memory_type_index = match self.find_memory_type(
             requirements.memory_type_bits,
             memory_properties,
-        )?;
+        ) {
+            Ok(index) => index,
+            Err(err) => {
+                unsafe { (self.functions.destroy_buffer)(self.device, buffer, ptr::null()); }
+                return Err(err);
+            }
+        };
+        let dedicated = VkMemoryDedicatedAllocateInfo {
+            s_type: 1000127001,
+            p_next: ptr::null(),
+            image: 0,
+            buffer,
+        };
+        let export_info = VkExportMemoryAllocateInfo {
+            s_type: 1000072002,
+            p_next: &dedicated as *const _ as *const c_void,
+            handle_types: 2,
+        };
         let allocate_info = VkMemoryAllocateInfo {
             s_type: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            p_next: ptr::null(),
+            p_next: if export { &export_info as *const _ as *const c_void } else { ptr::null() },
             allocation_size: requirements.size,
             memory_type_index,
         };
         let mut memory = 0usize;
-        vk_check(
+        let allocation = vk_check(
             unsafe {
                 (self.functions.allocate_memory)(
                     self.device,
@@ -208,11 +271,22 @@ impl VulkanDevice {
                 )
             },
             "vkAllocateMemory",
-        )?;
-        vk_check(
+        );
+        if let Err(err) = allocation {
+            unsafe { (self.functions.destroy_buffer)(self.device, buffer, ptr::null()); }
+            return Err(err);
+        }
+        let binding = vk_check(
             unsafe { (self.functions.bind_buffer_memory)(self.device, buffer, memory, 0) },
             "vkBindBufferMemory",
-        )?;
+        );
+        if let Err(err) = binding {
+            unsafe {
+                (self.functions.destroy_buffer)(self.device, buffer, ptr::null());
+                (self.functions.free_memory)(self.device, memory, ptr::null());
+            }
+            return Err(err);
+        }
 
         Ok(HostBuffer {
             device: self.device,
@@ -220,6 +294,7 @@ impl VulkanDevice {
             buffer,
             memory,
             size,
+            allocation_size: requirements.size,
             memory_properties,
         })
     }
@@ -560,6 +635,7 @@ impl VulkanDevice {
             dispatches,
             trailing_copies,
             None,
+            None,
         )
     }
 
@@ -573,6 +649,7 @@ impl VulkanDevice {
         dispatches: &[StorageDispatch<'_>],
         trailing_copies: &[BufferCopy<'_>],
         timestamps: Option<&TimestampMarks<'_>>,
+        external: Option<&ExternalBufferOwnership<'_>>,
     ) -> Result<(), VulkanError> {
         let begin_info = VkCommandBufferBeginInfo {
             s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -591,6 +668,9 @@ impl VulkanDevice {
                 }
             }
         };
+        if let Some(external) = external {
+            self.external_buffer_barriers(command_buffer, external.acquire, external.queue_family, true);
+        }
         // Query 1 + i is written once `after_dispatches[i]` dispatches have been recorded.
         let write_marks_after = |recorded: usize| {
             if let Some(marks) = timestamps {
@@ -787,6 +867,9 @@ impl VulkanDevice {
         }
         if let Some(marks) = timestamps {
             write_timestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, marks.query_count() - 1);
+        }
+        if let Some(external) = external {
+            self.external_buffer_barriers(command_buffer, external.release, external.queue_family, false);
         }
         vk_check(
             unsafe { (self.functions.end_command_buffer)(command_buffer) },
@@ -1145,6 +1228,7 @@ struct HostBuffer {
     buffer: VkBuffer,
     memory: VkDeviceMemory,
     size: u64,
+    allocation_size: u64,
     memory_properties: VkFlags,
 }
 
