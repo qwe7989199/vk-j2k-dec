@@ -30,13 +30,14 @@ $shaders = @(
     @{ Source = "shaders\tier1_cleanup_smoke.comp.glsl"; Output = "tier1_cleanup_nostats.comp.spv"; Defines = @("-DTIER1_NO_STATS") },
     @{ Source = "shaders\tier1_thread_per_codeblock.comp.glsl"; Output = "tier1_cleanup_smoke_16.comp.spv" },
     @{ Source = "shaders\tier1_thread_per_codeblock.comp.glsl"; Output = "tier1_thread_per_codeblock_nostats.comp.spv"; Defines = @("-DTIER1_NO_STATS") },
+    @{ Source = "shaders\tier1_packed.comp.glsl"; Output = "tier1_packed.comp.spv" },
     @{ Source = "shaders\tier1_scatter_smoke.comp.glsl"; Output = "tier1_scatter_smoke.comp.spv" }
 )
 
 foreach ($shader in $shaders) {
     $output = Join-Path $OutputDir $shader.Output
     $extraArgs = @()
-    if ($shader.Source -match "tier1_cleanup_smoke|tier1_thread_per_codeblock") {
+    if ($shader.Source -match "tier1_cleanup_smoke|tier1_thread_per_codeblock|tier1_packed") {
         $extraArgs = @("--target-env=vulkan1.1")
     }
     if ($shader.Defines) {

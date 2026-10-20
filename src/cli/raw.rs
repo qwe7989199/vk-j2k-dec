@@ -633,14 +633,21 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         }
     }
 
-    let thread_per_codeblock = thread_per_codeblock_eligible(&template_records)
+    // VK_J2K_TIER1_SHADER forces a warp-per-codeblock Tier-1 shader (A/B testing).
+    let forced_shader = std::env::var("VK_J2K_TIER1_SHADER").ok();
+    // The packed-state warp shader beats thread-per-codeblock even on 16x16 codeblocks; the
+    // latter is only a fallback when the packed build is missing.
+    let thread_per_codeblock = forced_shader.is_none()
+        && !Path::new(TIER1_WARP_SHADERS[0]).exists()
+        && thread_per_codeblock_eligible(&template_records)
         && first_existing(TIER1_THREAD_SHADERS).is_some();
-    let cleanup_shader_path = if thread_per_codeblock {
-        first_existing(TIER1_THREAD_SHADERS)
+    let cleanup_shader_path: &str = if let Some(path) = forced_shader.as_deref() {
+        path
+    } else if thread_per_codeblock {
+        first_existing(TIER1_THREAD_SHADERS).unwrap_or(TIER1_WARP_SHADERS[TIER1_WARP_SHADERS.len() - 1])
     } else {
-        first_existing(TIER1_WARP_SHADERS)
-    }
-    .unwrap_or(TIER1_WARP_SHADERS[TIER1_WARP_SHADERS.len() - 1]);
+        first_existing(TIER1_WARP_SHADERS).unwrap_or(TIER1_WARP_SHADERS[TIER1_WARP_SHADERS.len() - 1])
+    };
 
     // The CPU may take up to a quarter of a frame's codeblocks; size its upload region for the
     // largest codeblocks so any choice the controller makes fits.
@@ -780,6 +787,7 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
 
 /// Production Tier-1 shaders without diagnostic counters first, then the validation builds.
 const TIER1_WARP_SHADERS: &[&str] = &[
+    r"target\shaders\tier1_packed.comp.spv",
     r"target\shaders\tier1_cleanup_nostats.comp.spv",
     r"target\shaders\tier1_cleanup_smoke.comp.spv",
 ];
