@@ -4,9 +4,11 @@
 //
 // Each workgroup reconstructs a 32x32 output tile of one component (gl_WorkGroupID.z): it stages
 // the LL/HL/LH/HH samples the tile depends on (including the one-sample halo) in shared memory,
-// runs the horizontal lifting for every row the tile needs, then the vertical lifting. The
-// integer formulas and edge clamping are those of idwt53_offset_1d.comp.glsl, so the result is
-// bit-identical to its horizontal-then-vertical three-dispatch sequence.
+// runs the horizontal lifting for every row the tile needs, then the vertical lifting. Each
+// lifting runs as two steps: the low (update) samples are computed once in place, then the
+// outputs read them. The integer formulas and edge clamping are those of
+// idwt53_offset_1d.comp.glsl, so the result is bit-identical to its horizontal-then-vertical
+// three-dispatch sequence.
 //
 // Subbands start at even coordinates (low sample first), as in idwt53_offset_1d.
 
@@ -66,7 +68,6 @@ shared int s_hh[HIGH_SLOTS * HIGH_SLOTS];
 shared int s_row_low[LOW_SLOTS * TILE];
 shared int s_row_high[HIGH_SLOTS * TILE];
 
-uint component;
 // First low sample of the tile along x / y; high slots start one sample earlier.
 uint ax;
 uint ay;
@@ -94,86 +95,16 @@ uint high_row(uint slot) {
     return uint(clamp(hy_base + int(slot), 0, int(pc.high_height) - 1));
 }
 
-// Horizontal lifting of staged row `r` (an LL/HL row, or an LH/HH row when `high_row_band`).
-
-int h_low(bool high_row_band, uint r, uint index) {
-    uint slot = r * LOW_SLOTS + (index - ax);
-    return high_row_band ? s_lh[slot] : s_ll[slot];
-}
-
-int h_high(bool high_row_band, uint r, uint index) {
-    if (pc.high_width == 0u) {
-        return 0;
-    }
-    uint slot = r * HIGH_SLOTS + uint(int(index) - hx_base);
-    return high_row_band ? s_hh[slot] : s_hl[slot];
-}
-
-int h_high_at(bool high_row_band, uint r, uint index) {
-    if (pc.high_width == 0u) {
-        return 0;
-    }
-    return h_high(high_row_band, r, min(index, pc.high_width - 1u));
-}
-
-int h_updated_low(bool high_row_band, uint r, uint index) {
-    int low = h_low(high_row_band, r, index);
-    int left = index == 0u ? h_high_at(high_row_band, r, 0u) : h_high_at(high_row_band, r, index - 1u);
-    int right = h_high_at(high_row_band, r, index);
-    return low - ((left + right + 2) >> 2);
-}
-
-int horizontal(bool high_row_band, uint r, uint x) {
-    if ((x & 1u) == 0u) {
-        return h_updated_low(high_row_band, r, x >> 1u);
-    }
-    uint high_index = x >> 1u;
-    int high = h_high(high_row_band, r, high_index);
-    int left = h_updated_low(high_row_band, r, high_index);
-    int right = h_updated_low(high_row_band, r, min(high_index + 1u, pc.low_width - 1u));
-    return high + ((left + right) >> 1);
-}
-
-// Vertical lifting over the horizontally reconstructed rows, for tile column `col`.
-
-int v_low(uint index, uint col) {
-    return s_row_low[(index - ay) * TILE + col];
-}
-
-int v_high(uint index, uint col) {
-    if (pc.high_height == 0u) {
-        return 0;
-    }
-    return s_row_high[uint(int(index) - hy_base) * TILE + col];
-}
-
-int v_high_at(uint index, uint col) {
-    if (pc.high_height == 0u) {
-        return 0;
-    }
-    return v_high(min(index, pc.high_height - 1u), col);
-}
-
-int v_updated_low(uint index, uint col) {
-    int low = v_low(index, col);
-    int left = index == 0u ? v_high_at(0u, col) : v_high_at(index - 1u, col);
-    int right = v_high_at(index, col);
-    return low - ((left + right + 2) >> 2);
-}
-
-int vertical(uint y, uint col) {
-    if ((y & 1u) == 0u) {
-        return v_updated_low(y >> 1u, col);
-    }
-    uint high_index = y >> 1u;
-    int high = v_high(high_index, col);
-    int top = v_updated_low(high_index, col);
-    int bottom = v_updated_low(min(high_index + 1u, pc.low_height - 1u), col);
-    return high + ((top + bottom) >> 1);
+// Slot of the high neighbours of low sample `index` along an axis: index-1 (index 0 uses 0)
+// and index, both clamped to the band, as in idwt53_offset_1d's high_at.
+uvec2 high_neighbor_slots(uint index, uint high_count, int base) {
+    uint left = index == 0u ? 0u : min(index - 1u, high_count - 1u);
+    uint right = min(index, high_count - 1u);
+    return uvec2(uint(int(left) - base), uint(int(right) - base));
 }
 
 void main() {
-    component = gl_WorkGroupID.z;
+    uint component = gl_WorkGroupID.z;
     uint x0 = gl_WorkGroupID.x * TILE;
     uint y0 = gl_WorkGroupID.y * TILE;
     uint out_width = pc.low_width + pc.high_width;
@@ -221,18 +152,84 @@ void main() {
     }
     barrier();
 
-    for (uint i = lid; i < LOW_SLOTS * TILE; i += THREADS) {
-        uint x = x0 + i % TILE;
-        s_row_low[i] = x < out_width ? horizontal(false, i / TILE, x) : 0;
+    // Horizontal update step, in place: low samples become updated lows. Only slots holding
+    // their own index are updated; clamped duplicates past the band edge are never read.
+    for (uint i = lid; i < LOW_SLOTS * LOW_SLOTS; i += THREADS) {
+        uint c = i % LOW_SLOTS;
+        uint index = ax + c;
+        if (index < pc.low_width && has_high_x) {
+            uint r = i / LOW_SLOTS;
+            uvec2 h = high_neighbor_slots(index, pc.high_width, hx_base);
+            s_ll[i] -= (s_hl[r * HIGH_SLOTS + h.x] + s_hl[r * HIGH_SLOTS + h.y] + 2) >> 2;
+        }
     }
     if (has_high_y) {
-        for (uint i = lid; i < HIGH_SLOTS * TILE; i += THREADS) {
-            uint x = x0 + i % TILE;
-            s_row_high[i] = x < out_width ? horizontal(true, i / TILE, x) : 0;
+        for (uint i = lid; i < HIGH_SLOTS * LOW_SLOTS; i += THREADS) {
+            uint c = i % LOW_SLOTS;
+            uint index = ax + c;
+            if (index < pc.low_width && has_high_x) {
+                uint r = i / LOW_SLOTS;
+                uvec2 h = high_neighbor_slots(index, pc.high_width, hx_base);
+                s_lh[i] -= (s_hh[r * HIGH_SLOTS + h.x] + s_hh[r * HIGH_SLOTS + h.y] + 2) >> 2;
+            }
         }
     }
     barrier();
 
+    // Horizontal predict step: every tile column of each staged row.
+    for (uint i = lid; i < LOW_SLOTS * TILE; i += THREADS) {
+        uint r = i / TILE;
+        uint x = x0 + i % TILE;
+        int value = 0;
+        if (x < out_width) {
+            uint index = x >> 1u;
+            if ((x & 1u) == 0u) {
+                value = s_ll[r * LOW_SLOTS + (index - ax)];
+            } else {
+                int high = has_high_x ? s_hl[r * HIGH_SLOTS + uint(int(index) - hx_base)] : 0;
+                int left = s_ll[r * LOW_SLOTS + (index - ax)];
+                int right = s_ll[r * LOW_SLOTS + (min(index + 1u, pc.low_width - 1u) - ax)];
+                value = high + ((left + right) >> 1);
+            }
+        }
+        s_row_low[i] = value;
+    }
+    if (has_high_y) {
+        for (uint i = lid; i < HIGH_SLOTS * TILE; i += THREADS) {
+            uint r = i / TILE;
+            uint x = x0 + i % TILE;
+            int value = 0;
+            if (x < out_width) {
+                uint index = x >> 1u;
+                if ((x & 1u) == 0u) {
+                    value = s_lh[r * LOW_SLOTS + (index - ax)];
+                } else {
+                    int high = has_high_x ? s_hh[r * HIGH_SLOTS + uint(int(index) - hx_base)] : 0;
+                    int left = s_lh[r * LOW_SLOTS + (index - ax)];
+                    int right = s_lh[r * LOW_SLOTS + (min(index + 1u, pc.low_width - 1u) - ax)];
+                    value = high + ((left + right) >> 1);
+                }
+            }
+            s_row_high[i] = value;
+        }
+    }
+    barrier();
+
+    // Vertical update step, in place on the low rows (same slot rule as horizontally).
+    if (has_high_y) {
+        for (uint i = lid; i < LOW_SLOTS * TILE; i += THREADS) {
+            uint r = i / TILE;
+            uint index = ay + r;
+            if (index < pc.low_height) {
+                uint col = i % TILE;
+                uvec2 h = high_neighbor_slots(index, pc.high_height, hy_base);
+                s_row_low[i] -= (s_row_high[h.x * TILE + col] + s_row_high[h.y * TILE + col] + 2) >> 2;
+            }
+        }
+    }
+    barrier();
+
+    // Vertical predict step and output.
     uint tx = gl_LocalInvocationID.x;
     uint ty = gl_LocalInvocationID.y;
     for (uint dy = 0u; dy < TILE; dy += 16u) {
@@ -241,7 +238,17 @@ void main() {
             uint col = tx + dx;
             uint x = x0 + col;
             if (x < out_width && y < out_height) {
-                output_band[out_offset + y * out_width + x] = vertical(y, col);
+                uint index = y >> 1u;
+                int value;
+                if ((y & 1u) == 0u) {
+                    value = s_row_low[(index - ay) * TILE + col];
+                } else {
+                    int high = has_high_y ? s_row_high[uint(int(index) - hy_base) * TILE + col] : 0;
+                    int top = s_row_low[(index - ay) * TILE + col];
+                    int bottom = s_row_low[(min(index + 1u, pc.low_height - 1u) - ay) * TILE + col];
+                    value = high + ((top + bottom) >> 1);
+                }
+                output_band[out_offset + y * out_width + x] = value;
             }
         }
     }
