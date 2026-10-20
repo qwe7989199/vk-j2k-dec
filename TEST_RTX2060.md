@@ -58,6 +58,9 @@ larger than the loop time per frame.
 | Skip stripes with no significant sample (refinement) or no significant neighbour (significance) | Tier-1 7.78-7.91 -> 6.84-6.97 ms, 112.0-114.7 -> 126.3-128.3 fps (4-round interleaved) |
 | Tried, not adopted: unconditional byte loads (no word cache) | within noise, slower in 2 of 4 rounds |
 | Tried, not adopted: 2 or 8 warps per workgroup (vs 4) | 2 slower in all rounds, 8 mixed |
+| Two-step lifting in the fused IDWT (update lows once in shared memory, then predict) | IDWT 0.533-0.557 -> 0.461-0.468 ms/frame (3 clean rounds) |
+| Tried, not adopted: `glslc -O` on the MXF shaders | Tier-1 ~5% slower in all 4 rounds (e.g. 7.27 -> 8.04 ms) |
+| Tried, not adopted: Tier-1 writes subband planes directly, no scatter pass | bit-exact, scatter 0.14 ms gone, but Tier-1 got slower by about as much; batch 8 and auto within noise over 4 + 3 rounds |
 
 The computed significance/sign contexts were checked exhaustively against the old lookup tables
 (all 189 input cases).
