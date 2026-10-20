@@ -41,6 +41,11 @@ struct VulkanDeviceFunctions {
     wait_for_fences: VkWaitForFences,
     reset_fences: VkResetFences,
     device_wait_idle: VkDeviceWaitIdle,
+    create_query_pool: VkCreateQueryPool,
+    destroy_query_pool: VkDestroyQueryPool,
+    cmd_reset_query_pool: VkCmdResetQueryPool,
+    cmd_write_timestamp: VkCmdWriteTimestamp,
+    get_query_pool_results: VkGetQueryPoolResults,
 }
 
 struct VulkanDevice {
@@ -70,6 +75,20 @@ struct RegionCopy<'a> {
     source: &'a HostBuffer,
     destination: &'a HostBuffer,
     regions: &'a [VkBufferCopy],
+}
+
+/// GPU timestamps recorded into a command buffer: query 0 when it starts, one query per entry
+/// of `after_dispatches` (written once that many dispatches have been recorded; 0 means right
+/// after the leading copies), and a last query after the trailing copies.
+struct TimestampMarks<'a> {
+    pool: &'a QueryPoolHandle,
+    after_dispatches: &'a [usize],
+}
+
+impl TimestampMarks<'_> {
+    fn query_count(&self) -> u32 {
+        self.after_dispatches.len() as u32 + 2
+    }
 }
 
 impl VulkanDevice {
@@ -511,17 +530,20 @@ impl VulkanDevice {
             &[],
             dispatches,
             trailing_copies,
+            None,
         )
     }
 
     /// Like `record_storage_dispatches_with_copies`, but first records buffer-region copies
-    /// (e.g. host-staged data into a device buffer) that the dispatches depend on.
+    /// (e.g. host-staged data into a device buffer) that the dispatches depend on, and
+    /// optionally GPU timestamps around them.
     fn record_storage_dispatches_with_region_copies(
         &self,
         command_buffer: VkCommandBuffer,
         leading_copies: &[RegionCopy<'_>],
         dispatches: &[StorageDispatch<'_>],
         trailing_copies: &[BufferCopy<'_>],
+        timestamps: Option<&TimestampMarks<'_>>,
     ) -> Result<(), VulkanError> {
         let begin_info = VkCommandBufferBeginInfo {
             s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -533,6 +555,41 @@ impl VulkanDevice {
             unsafe { (self.functions.begin_command_buffer)(command_buffer, &begin_info) },
             "vkBeginCommandBuffer",
         )?;
+        let write_timestamp = |stage: u32, query: u32| {
+            if let Some(marks) = timestamps {
+                unsafe {
+                    (self.functions.cmd_write_timestamp)(command_buffer, stage, marks.pool.handle, query);
+                }
+            }
+        };
+        // Query 1 + i is written once `after_dispatches[i]` dispatches have been recorded.
+        let write_marks_after = |recorded: usize| {
+            if let Some(marks) = timestamps {
+                for (index, after) in marks.after_dispatches.iter().enumerate() {
+                    if *after == recorded {
+                        write_timestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 1 + index as u32);
+                    }
+                }
+            }
+        };
+        if let Some(marks) = timestamps {
+            if marks.query_count() > marks.pool.query_count {
+                return Err(VulkanError::new(format!(
+                    "{} timestamps exceed query pool of {}",
+                    marks.query_count(),
+                    marks.pool.query_count
+                )));
+            }
+            unsafe {
+                (self.functions.cmd_reset_query_pool)(
+                    command_buffer,
+                    marks.pool.handle,
+                    0,
+                    marks.query_count(),
+                );
+            }
+            write_timestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0);
+        }
         for copy_request in leading_copies {
             if copy_request.regions.is_empty() {
                 continue;
@@ -547,7 +604,12 @@ impl VulkanDevice {
                 );
             }
         }
+        write_marks_after(0);
         if dispatches.is_empty() && trailing_copies.is_empty() {
+            // Every query must be written, or reading results with WAIT_BIT never returns.
+            if let Some(marks) = timestamps {
+                write_timestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, marks.query_count() - 1);
+            }
             return vk_check(
                 unsafe { (self.functions.end_command_buffer)(command_buffer) },
                 "vkEndCommandBuffer",
@@ -611,6 +673,7 @@ impl VulkanDevice {
                     dispatch.groups[2],
                 );
             }
+            write_marks_after(index + 1);
             if index + 1 < dispatches.len() && !dispatches[index + 1].no_barrier_before {
                 let barrier = VkMemoryBarrier {
                     s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -693,10 +756,58 @@ impl VulkanDevice {
                 );
             }
         }
+        if let Some(marks) = timestamps {
+            write_timestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, marks.query_count() - 1);
+        }
         vk_check(
             unsafe { (self.functions.end_command_buffer)(command_buffer) },
             "vkEndCommandBuffer",
         )
+    }
+
+    fn create_timestamp_query_pool(&self, query_count: u32) -> Result<QueryPoolHandle, VulkanError> {
+        let create_info = VkQueryPoolCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: 0,
+            query_type: VK_QUERY_TYPE_TIMESTAMP,
+            query_count,
+            pipeline_statistics: 0,
+        };
+        let mut handle = 0usize;
+        vk_check(
+            unsafe {
+                (self.functions.create_query_pool)(self.device, &create_info, ptr::null(), &mut handle)
+            },
+            "vkCreateQueryPool",
+        )?;
+        Ok(QueryPoolHandle {
+            device: self.device,
+            functions: self.functions,
+            handle,
+            query_count,
+        })
+    }
+
+    /// Raw timestamp ticks of the first `count` queries, waiting until they are available.
+    fn read_timestamps(&self, pool: &QueryPoolHandle, count: u32) -> Result<Vec<u64>, VulkanError> {
+        let mut values = vec![0u64; count.min(pool.query_count) as usize];
+        vk_check(
+            unsafe {
+                (self.functions.get_query_pool_results)(
+                    self.device,
+                    pool.handle,
+                    0,
+                    values.len() as u32,
+                    values.len() * std::mem::size_of::<u64>(),
+                    values.as_mut_ptr() as *mut c_void,
+                    std::mem::size_of::<u64>() as u64,
+                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT,
+                )
+            },
+            "vkGetQueryPoolResults",
+        )?;
+        Ok(values)
     }
 
     fn record_copy_buffer(
@@ -1139,6 +1250,21 @@ pub(crate) struct FenceHandle {
     device: VkDevice,
     functions: VulkanDeviceFunctions,
     pub(crate) handle: VkFence,
+}
+
+struct QueryPoolHandle {
+    device: VkDevice,
+    functions: VulkanDeviceFunctions,
+    handle: VkQueryPool,
+    query_count: u32,
+}
+
+impl Drop for QueryPoolHandle {
+    fn drop(&mut self) {
+        unsafe {
+            (self.functions.destroy_query_pool)(self.device, self.handle, ptr::null());
+        }
+    }
 }
 
 impl Drop for FenceHandle {

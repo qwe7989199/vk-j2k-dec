@@ -16,6 +16,7 @@ mod tests {
             device_id: 0,
             device_type: VulkanDeviceType::DiscreteGpu,
             max_storage_buffer_range: 0,
+            timestamp_period: 0.0,
             queue_families: vec![
                 VulkanQueueFamilySummary {
                     index: 0,
@@ -23,6 +24,7 @@ mod tests {
                     graphics: true,
                     compute: true,
                     transfer: true,
+                    timestamp_valid_bits: 0,
                 },
                 VulkanQueueFamilySummary {
                     index: 1,
@@ -30,6 +32,7 @@ mod tests {
                     graphics: false,
                     compute: true,
                     transfer: true,
+                    timestamp_valid_bits: 0,
                 },
             ],
         };

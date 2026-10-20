@@ -6,6 +6,8 @@ pub struct VulkanDeviceSummary {
     pub device_type: VulkanDeviceType,
     /// `VkPhysicalDeviceLimits::maxStorageBufferRange`, in bytes.
     pub max_storage_buffer_range: u32,
+    /// `VkPhysicalDeviceLimits::timestampPeriod`: nanoseconds per timestamp tick.
+    pub timestamp_period: f32,
     pub queue_families: Vec<VulkanQueueFamilySummary>,
 }
 
@@ -61,6 +63,8 @@ pub struct VulkanQueueFamilySummary {
     pub graphics: bool,
     pub compute: bool,
     pub transfer: bool,
+    /// Meaningful bits in timestamps written on this family; 0 means no timestamp support.
+    pub timestamp_valid_bits: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2640,6 +2644,8 @@ const TIER1_PIPELINE_FRAME_ALIGNMENT: u64 = 256;
 const TIER1_THREAD_PER_CODEBLOCK_GROUP_SIZE: u32 = 128;
 /// Guaranteed minimum of `maxComputeWorkGroupCount[0]`.
 const MIN_MAX_COMPUTE_WORKGROUP_COUNT: usize = 65_535;
+/// Start, after upload, after Tier-1, after scatter, after IDWT, after color, after readback.
+const TIER1_PIPELINE_TIMESTAMP_QUERIES: u32 = 7;
 
 pub struct VulkanTier1Rgb48PipelineConfig<'a> {
     pub cleanup_shader_path: &'a str,
@@ -2662,6 +2668,43 @@ pub struct VulkanTier1Rgb48PipelineConfig<'a> {
     pub max_batch_frames: usize,
     /// Most CPU-decoded coefficients a single frame may hand to `submit_batch`.
     pub cpu_coefficient_capacity: usize,
+    /// Record GPU timestamps around each pipeline stage (ignored if the queue lacks them).
+    pub gpu_timestamps: bool,
+}
+
+/// GPU time of one submitted batch, split by pipeline stage (whole batch, not per frame).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Tier1GpuStageTimes {
+    /// Staged records, compressed words and CPU-decoded coefficients copied to device memory.
+    pub upload_ms: f64,
+    pub tier1_ms: f64,
+    pub scatter_ms: f64,
+    pub idwt_ms: f64,
+    pub color_ms: f64,
+    /// RGB48 output copied to host-visible memory.
+    pub readback_copy_ms: f64,
+}
+
+impl Tier1GpuStageTimes {
+    pub fn total_ms(&self) -> f64 {
+        self.upload_ms + self.tier1_ms + self.scatter_ms + self.idwt_ms + self.color_ms
+            + self.readback_copy_ms
+    }
+
+    /// `ticks` holds the `TIER1_PIPELINE_TIMESTAMP_QUERIES` stage boundaries in order.
+    fn from_ticks(ticks: &[u64], valid_mask: u64, period_ns: f64) -> Self {
+        let ms = |index: usize| {
+            (ticks[index + 1].wrapping_sub(ticks[index]) & valid_mask) as f64 * period_ns / 1e6
+        };
+        Self {
+            upload_ms: ms(0),
+            tier1_ms: ms(1),
+            scatter_ms: ms(2),
+            idwt_ms: ms(3),
+            color_ms: ms(4),
+            readback_copy_ms: ms(5),
+        }
+    }
 }
 
 /// A codeblock the host already decoded; the pipeline copies its coefficients into place.
@@ -2693,6 +2736,8 @@ pub struct VulkanTier1Rgb48Pipeline {
     flat_stride: u64,
     scatter_push: Tier1ScatterSmokePushConstants,
     scatter_groups: [u32; 3],
+    timestamp_mask: u64,
+    timestamp_period_ns: f64,
     slots: Vec<PipelineSlot>,
     _scatter_records_buffer: HostBuffer,
     programs: Tier1PipelinePrograms,
@@ -2742,6 +2787,8 @@ struct PipelineSlot {
     command_buffer: VkCommandBuffer,
     fence: FenceHandle,
     pending_frames: usize,
+    query_pool: Option<QueryPoolHandle>,
+    last_stage_times: Option<Tier1GpuStageTimes>,
 }
 
 /// Per-frame scatter/IDWT/color resources; the frame's Tier-1 coefficients live in the slot's
@@ -2762,6 +2809,7 @@ impl PipelineSlot {
         scatter_records_buffer: &HostBuffer,
         batch_frames: usize,
         flat_stride: u64,
+        timestamps: bool,
     ) -> Result<Self, VulkanError> {
         let record_count = batch_frames * config.codeblock_count;
         let records_bytes = bytes_len::<crate::gpu::GpuTier1CodeblockRecord>(record_count)?;
@@ -2857,6 +2905,11 @@ impl PipelineSlot {
         let command_pool = device.create_resettable_command_pool(queue_family_index)?;
         let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
         let fence = device.create_fence()?;
+        let query_pool = if timestamps {
+            Some(device.create_timestamp_query_pool(TIER1_PIPELINE_TIMESTAMP_QUERIES)?)
+        } else {
+            None
+        };
         Ok(Self {
             staging,
             staging_layout,
@@ -2873,6 +2926,8 @@ impl PipelineSlot {
             command_buffer,
             fence,
             pending_frames: 0,
+            query_pool,
+            last_stage_times: None,
         })
     }
 }
@@ -3028,6 +3083,22 @@ impl VulkanTier1Rgb48Pipeline {
             frame_device_bytes,
             flat_stride,
         );
+        let timestamp_valid_bits = summary
+            .queue_families
+            .iter()
+            .find(|family| family.index == queue_family_index)
+            .map(|family| family.timestamp_valid_bits)
+            .unwrap_or(0);
+        let timestamps =
+            config.gpu_timestamps && timestamp_valid_bits > 0 && summary.timestamp_period > 0.0;
+        if config.gpu_timestamps && !timestamps {
+            eprintln!("GPU Tier-1 pipeline: queue family has no timestamp support, timing disabled");
+        }
+        let timestamp_mask = if timestamp_valid_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << timestamp_valid_bits).wrapping_sub(1)
+        };
         let slots = loop {
             let attempt = (0..2)
                 .map(|_| {
@@ -3039,6 +3110,7 @@ impl VulkanTier1Rgb48Pipeline {
                         &scatter_records_buffer,
                         batch_frames,
                         flat_stride,
+                        timestamps,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>();
@@ -3075,6 +3147,8 @@ impl VulkanTier1Rgb48Pipeline {
                 config.scatter_records.len() as u32,
                 1,
             ],
+            timestamp_mask,
+            timestamp_period_ns: f64::from(summary.timestamp_period),
             slots,
             _scatter_records_buffer: scatter_records_buffer,
             programs,
@@ -3101,6 +3175,11 @@ impl VulkanTier1Rgb48Pipeline {
 
     pub fn slot_count(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Per-stage GPU time of the batch last read from `slot_index`, when timestamps are on.
+    pub fn last_gpu_stage_times(&self, slot_index: usize) -> Option<Tier1GpuStageTimes> {
+        self.slots.get(slot_index)?.last_stage_times
     }
 
     /// Uploads and submits one batch to `slot_index`, which must not have a batch in flight.
@@ -3241,6 +3320,7 @@ impl VulkanTier1Rgb48Pipeline {
             codeblock_offset: 0,
         };
         let mut dispatches = Vec::new();
+        let tier1_dispatches = usize::from(!records.is_empty());
         if !records.is_empty() {
             let groups = if self.thread_per_codeblock {
                 (records.len() as u32).div_ceil(TIER1_THREAD_PER_CODEBLOCK_GROUP_SIZE)
@@ -3295,12 +3375,28 @@ impl VulkanTier1Rgb48Pipeline {
             })
             .collect::<Vec<_>>();
 
+        // Stage boundaries in dispatch counts: chain step 0 is scatter, the last step is color,
+        // everything in between is IDWT.
+        let chain_len = chains[0].len();
+        let stage_ends = [
+            0,
+            tier1_dispatches,
+            tier1_dispatches + frames.len(),
+            tier1_dispatches + frames.len() * (chain_len - 1),
+            tier1_dispatches + frames.len() * chain_len,
+        ];
+        let marks = slot.query_pool.as_ref().map(|pool| TimestampMarks {
+            pool,
+            after_dispatches: &stage_ends,
+        });
+
         let device = &self.context.device;
         device.record_storage_dispatches_with_region_copies(
             slot.command_buffer,
             &leading_copies,
             &dispatches,
             &readback_copies,
+            marks.as_ref(),
         )?;
         device.reset_fence(slot.fence.handle)?;
         device.submit_with_fence(slot.command_buffer, slot.fence.handle)?;
@@ -3326,6 +3422,20 @@ impl VulkanTier1Rgb48Pipeline {
         let wait_start = std::time::Instant::now();
         self.context.device.wait_fence(slot.fence.handle)?;
         let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
+        slot.last_stage_times = match slot.query_pool.as_ref() {
+            Some(pool) => {
+                let ticks = self
+                    .context
+                    .device
+                    .read_timestamps(pool, TIER1_PIPELINE_TIMESTAMP_QUERIES)?;
+                Some(Tier1GpuStageTimes::from_ticks(
+                    &ticks,
+                    self.timestamp_mask,
+                    self.timestamp_period_ns,
+                ))
+            }
+            None => None,
+        };
         let pending_frames = std::mem::take(&mut slot.pending_frames);
         for (frame_index, stage) in slot.frames[..pending_frames].iter().enumerate() {
             let packer = &stage.rgb48_packer;

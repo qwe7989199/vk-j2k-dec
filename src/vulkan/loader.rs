@@ -183,6 +183,9 @@ impl VulkanInstance {
             max_storage_buffer_range: u32::from_ne_bytes(
                 properties.limits.bytes[28..32].try_into().expect("4-byte slice"),
             ),
+            timestamp_period: f32::from_ne_bytes(
+                properties.limits.bytes[424..428].try_into().expect("4-byte slice"),
+            ),
             queue_families: queue_families
                 .into_iter()
                 .take(queue_count as usize)
@@ -193,6 +196,7 @@ impl VulkanInstance {
                     graphics: family.queue_flags & VK_QUEUE_GRAPHICS_BIT != 0,
                     compute: family.queue_flags & VK_QUEUE_COMPUTE_BIT != 0,
                     transfer: family.queue_flags & VK_QUEUE_TRANSFER_BIT != 0,
+                    timestamp_valid_bits: family.timestamp_valid_bits,
                 })
                 .collect(),
         })
@@ -317,6 +321,11 @@ impl VulkanInstance {
             wait_for_fences: self.load_device(device, "vkWaitForFences")?,
             reset_fences: self.load_device(device, "vkResetFences")?,
             device_wait_idle: self.load_device(device, "vkDeviceWaitIdle")?,
+            create_query_pool: self.load_device(device, "vkCreateQueryPool")?,
+            destroy_query_pool: self.load_device(device, "vkDestroyQueryPool")?,
+            cmd_reset_query_pool: self.load_device(device, "vkCmdResetQueryPool")?,
+            cmd_write_timestamp: self.load_device(device, "vkCmdWriteTimestamp")?,
+            get_query_pool_results: self.load_device(device, "vkGetQueryPoolResults")?,
         };
 
         let mut queue = 0usize;

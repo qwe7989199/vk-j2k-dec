@@ -46,6 +46,12 @@ const VK_COMMAND_BUFFER_LEVEL_PRIMARY: u32 = 0;
 const VK_WHOLE_SIZE: u64 = !0;
 const VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT: u32 = 0x0000_0002;
 const VK_MEMORY_HEAP_DEVICE_LOCAL_BIT: u32 = 0x0000_0001;
+const VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO: u32 = 11;
+const VK_QUERY_TYPE_TIMESTAMP: u32 = 2;
+const VK_QUERY_RESULT_64_BIT: u32 = 0x0000_0001;
+const VK_QUERY_RESULT_WAIT_BIT: u32 = 0x0000_0002;
+const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: u32 = 0x0000_0001;
+const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: u32 = 0x0000_2000;
 
 type VkInstance = usize;
 type VkPhysicalDevice = usize;
@@ -62,6 +68,7 @@ type VkDescriptorSet = usize;
 type VkCommandPool = usize;
 type VkCommandBuffer = usize;
 type VkFence = usize;
+type VkQueryPool = usize;
 type VkFlags = u32;
 type VkBool32 = u32;
 
@@ -212,6 +219,25 @@ type VkWaitForFences =
     unsafe extern "system" fn(VkDevice, u32, *const VkFence, VkBool32, u64) -> i32;
 type VkResetFences = unsafe extern "system" fn(VkDevice, u32, *const VkFence) -> i32;
 type VkDeviceWaitIdle = unsafe extern "system" fn(VkDevice) -> i32;
+type VkCreateQueryPool = unsafe extern "system" fn(
+    VkDevice,
+    *const VkQueryPoolCreateInfo,
+    *const c_void,
+    *mut VkQueryPool,
+) -> i32;
+type VkDestroyQueryPool = unsafe extern "system" fn(VkDevice, VkQueryPool, *const c_void);
+type VkCmdResetQueryPool = unsafe extern "system" fn(VkCommandBuffer, VkQueryPool, u32, u32);
+type VkCmdWriteTimestamp = unsafe extern "system" fn(VkCommandBuffer, u32, VkQueryPool, u32);
+type VkGetQueryPoolResults = unsafe extern "system" fn(
+    VkDevice,
+    VkQueryPool,
+    u32,
+    u32,
+    usize,
+    *mut c_void,
+    u64,
+    VkFlags,
+) -> i32;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -503,6 +529,16 @@ struct VkFenceCreateInfo {
     s_type: u32,
     p_next: *const c_void,
     flags: VkFlags,
+}
+
+#[repr(C)]
+struct VkQueryPoolCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: VkFlags,
+    query_type: u32,
+    query_count: u32,
+    pipeline_statistics: VkFlags,
 }
 
 // VkPhysicalDeviceLimits contains VkDeviceSize fields, so it is 8-byte aligned: without

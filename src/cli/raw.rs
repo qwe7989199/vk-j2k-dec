@@ -24,7 +24,8 @@ use vk_j2k_dec::tier1::{
 };
 use vk_j2k_dec::tune::{BatchSizeTuner, CpuOffloadController};
 use vk_j2k_dec::vulkan::{
-    TIER1_PIPELINE_MAX_BATCH_FRAMES, Tier1BatchFrame, Tier1CpuCodeblock, VulkanRgb48Pipeline,
+    TIER1_PIPELINE_MAX_BATCH_FRAMES, Tier1BatchFrame, Tier1CpuCodeblock, Tier1GpuStageTimes,
+    VulkanRgb48Pipeline,
     VulkanTier1Rgb48Pipeline, VulkanTier1Rgb48PipelineConfig,
 };
 
@@ -680,6 +681,8 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
             .unwrap_or(TIER1_PIPELINE_MAX_BATCH_FRAMES)
             .min(frame_plans.len()),
         cpu_coefficient_capacity,
+        // VK_J2K_GPU_TIMING=1 records per-stage GPU timestamps.
+        gpu_timestamps: std::env::var_os("VK_J2K_GPU_TIMING").is_some(),
     }) {
         Ok(pipeline) => pipeline,
         Err(err) => {
@@ -778,6 +781,7 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
     );
     print_tier1_iteration_average("tuning", &outcome.iterations, |it| !it.steady);
     print_tier1_iteration_average("steady", &outcome.iterations, |it| it.steady);
+    print_tier1_gpu_stage_average(&outcome.iterations);
     if let Some(hash) = outcome.frames_hash {
         println!("  frames_hash {hash:016x}");
     }
@@ -813,6 +817,8 @@ struct Tier1DecodeIteration {
     read_ms: f64,
     /// Batch size was settled (and offload adapting) when this iteration ran.
     steady: bool,
+    /// GPU stage times of the batch read in this iteration, with VK_J2K_GPU_TIMING.
+    gpu: Option<Tier1GpuStageTimes>,
 }
 
 struct Tier1DecodeLoopOutcome {
@@ -881,6 +887,7 @@ fn run_tier1_mxf_decode_loop(
         let mut wait_ms = 0.0;
         let mut read_ms = 0.0;
         let mut frames_read = 0;
+        let mut gpu = None;
         if let Some((read_slot, (first_frame, count))) =
             read_slot.and_then(|read_slot| in_flight[read_slot].take().map(|batch| (read_slot, batch)))
         {
@@ -899,6 +906,7 @@ fn run_tier1_mxf_decode_loop(
                 .map_err(|err| format!("reading frame {}: {err}", first_frame + 1))?;
             read_ms = elapsed_ms(read_start) - wait_ms;
             frames_read = count;
+            gpu = pipeline.last_gpu_stage_times(read_slot);
         }
         slot = 1 - slot;
 
@@ -913,6 +921,7 @@ fn run_tier1_mxf_decode_loop(
                 wait_ms,
                 read_ms,
                 steady,
+                gpu,
             });
             tuner.record(frames_read, wall_ms);
             offload.update(cpu_ms, wait_ms, wall_ms, frames_submitted);
@@ -1031,6 +1040,44 @@ fn decode_heaviest_codeblocks_cpu(
                 .ok_or_else(|| "CPU Tier-1 decode skipped a codeblock".to_string())
         })
         .collect()
+}
+
+/// Per-frame GPU stage times over steady iterations (all timed iterations if none are steady).
+fn print_tier1_gpu_stage_average(iterations: &[Tier1DecodeIteration]) {
+    let timed = |steady_only: bool| {
+        iterations
+            .iter()
+            .filter(|it| it.gpu.is_some() && (!steady_only || it.steady))
+            .collect::<Vec<_>>()
+    };
+    let mut selected = timed(true);
+    if selected.is_empty() {
+        selected = timed(false);
+    }
+    let frames = selected.iter().map(|it| it.frames_read).sum::<usize>();
+    if frames == 0 {
+        return;
+    }
+    let per_frame = |value: fn(&Tier1GpuStageTimes) -> f64| {
+        selected
+            .iter()
+            .filter_map(|it| it.gpu.as_ref())
+            .map(value)
+            .sum::<f64>()
+            / frames as f64
+    };
+    println!(
+        "  gpu_stage_ms_per_frame total {:.3} upload {:.3} tier1 {:.3} scatter {:.3} idwt {:.3} color {:.3} readback_copy {:.3} (batches {}, frames {})",
+        per_frame(Tier1GpuStageTimes::total_ms),
+        per_frame(|t| t.upload_ms),
+        per_frame(|t| t.tier1_ms),
+        per_frame(|t| t.scatter_ms),
+        per_frame(|t| t.idwt_ms),
+        per_frame(|t| t.color_ms),
+        per_frame(|t| t.readback_copy_ms),
+        selected.len(),
+        frames
+    );
 }
 
 fn print_tier1_iteration_average(
