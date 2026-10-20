@@ -138,6 +138,7 @@ uint next_byte;
 uint col_left;
 uint col_cur;
 uint col_right;
+uint recon_mode;
 
 uint byte_at(uint index) {
     uint absolute = codeblock.byte_offset + index;
@@ -250,19 +251,33 @@ uint significance_context(uint r) {
     uint n_y = (cw & 1u) + ((cw >> 2u) & 1u);
     uint n_z = (lw & 1u) + ((lw >> 2u) & 1u) + (rw & 1u) + ((rw >> 2u) & 1u);
 
-    uint diagonal = min(n_z, 4u);
+    // Same values as HH_LUT_FAST / LH_LL_LUT_FAST, computed instead of looked up.
     if (codeblock.subband == 3u) {
-        uint hv = min(n_x + n_y, 4u);
-        return HH_LUT_FAST[(hv << 3u) | diagonal];
+        uint hv = min(n_x + n_y, 2u);
+        if (n_z >= 3u) {
+            return 8u;
+        }
+        if (n_z == 2u) {
+            return hv == 0u ? 6u : 7u;
+        }
+        return n_z * 3u + hv;
     }
-    uint primary = min(n_x, 2u);
-    uint secondary = min(n_y, 2u);
+    uint primary = n_x;
+    uint secondary = n_y;
     if (codeblock.subband == 1u) {
-        uint temp = primary;
-        primary = secondary;
-        secondary = temp;
+        primary = n_y;
+        secondary = n_x;
     }
-    return LH_LL_LUT_FAST[(primary << 5u) | (secondary << 3u) | diagonal];
+    if (primary == 2u) {
+        return 8u;
+    }
+    if (primary == 1u) {
+        return secondary != 0u ? 7u : (n_z != 0u ? 6u : 5u);
+    }
+    if (secondary != 0u) {
+        return secondary + 2u;
+    }
+    return min(n_z, 2u);
 }
 
 uvec2 sign_context(uint r) {
@@ -283,15 +298,17 @@ uvec2 sign_context(uint r) {
     uint has_neg_v = ((state_top == 3u) || (state_bottom == 3u)) ? 1u : 0u;
     int contrib_v = int(has_pos_v) - int(has_neg_v);
 
-    uint index = uint((contrib_h + 1) * 3 + (contrib_v + 1));
-    return SIGN_LUT[index];
+    // Same values as SIGN_LUT[(h + 1) * 3 + (v + 1)].
+    uint context = contrib_h == 0 ? 9u + uint(abs(contrib_v)) : uint(12 + contrib_h * contrib_v);
+    uint flip = (contrib_h < 0 || (contrib_h == 0 && contrib_v < 0)) ? 1u : 0u;
+    return uvec2(context, flip);
 }
 
 void make_significant(uint x, uint s, uint r, uint bitplane) {
     uvec2 sc = sign_context(r);
     uint sign_bit = decode_bit(sc.x) ^ sc.y;
     int magnitude;
-    if (codeblocks[0].reconstruction_mode == 1u) {
+    if (recon_mode == 1u) {
         magnitude = int((1u << bitplane) | ((1u << bitplane) >> 1u));
         if (codeblock.resolution == 0u && codeblock.subband == 0u) {
             magnitude -= 1;
@@ -304,11 +321,11 @@ void make_significant(uint x, uint s, uint r, uint bitplane) {
     col_cur |= (2u << r) | (sign_bit << (COL_SIGN_SHIFT + 1u + r));
     // Mirror into the adjacent stripe: row 0 is that stripe's row 4, row 3 its row -1.
     if (r == 0u && s > 0u) {
-        state_data[state_base + (s - 1u) * codeblock.width + x] |=
-            (1u << 5u) | (sign_bit << (COL_SIGN_SHIFT + 5u));
+        atomicOr(state_data[state_base + (s - 1u) * codeblock.width + x],
+            (1u << 5u) | (sign_bit << (COL_SIGN_SHIFT + 5u)));
     }
     if (r == 3u && s + 1u < stripe_count) {
-        state_data[state_base + (s + 1u) * codeblock.width + x] |= 1u | (sign_bit << COL_SIGN_SHIFT);
+        atomicOr(state_data[state_base + (s + 1u) * codeblock.width + x], 1u | (sign_bit << COL_SIGN_SHIFT));
     }
 }
 
@@ -410,7 +427,7 @@ void decode_refinement_pass(uint bitplane) {
                         uint context = refined ? 16u : (has_neighbor(r) ? 15u : 14u);
                         uint bit = decode_bit(context);
                         int delta;
-                        if (codeblocks[0].reconstruction_mode == 1u) {
+                        if (recon_mode == 1u) {
                             int half_step = int((1u << bitplane) >> 1u);
                             delta = bit != 0u ? half_step : -half_step;
                         } else {
@@ -418,7 +435,9 @@ void decode_refinement_pass(uint bitplane) {
                         }
                         bool negative = ((col_cur >> (COL_SIGN_SHIFT + 1u + r)) & 1u) != 0u;
                         uint offset = codeblock.coefficient_offset + (s * 4u + r) * codeblock.width + x;
-                        output_coefficients[offset] += negative ? -delta : delta;
+                        if (delta != 0) {
+                            atomicAdd(output_coefficients[offset], negative ? -delta : delta);
+                        }
                         col_cur |= (1u << (COL_REFINED_SHIFT + r)) | (1u << (COL_VISITED_SHIFT + r));
                     }
                 }
@@ -445,6 +464,7 @@ void main() {
     codeblock = codeblocks[codeblock_index];
     state_base = codeblock.coefficient_offset;
     stripe_count = (codeblock.height + 3u) >> 2u;
+    recon_mode = codeblocks[0].reconstruction_mode;
 
     // All 32 lanes clear the column words and the coefficients; only significant samples are
     // written afterwards.

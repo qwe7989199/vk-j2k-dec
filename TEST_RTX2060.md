@@ -1,6 +1,6 @@
 # RTX 2060 Performance Results
 
-Test date: 2026-10-19
+Test date: 2026-10-20 (earlier sections: 2026-10-19)
 Machine: NVIDIA GeForce RTX 2060 (6 GB, driver 581.29, Vulkan queue family 2), 8 host threads
 Sample: `test_j2k_rgb12_1080p24_3min.mxf`, 1920x1080 RGB12, reversible 5/3, 1 tile, 64x64 codeblocks (~879 per frame)
 FFmpeg: `C:/Users/zhangqingxuan/Desktop/Tools/ffmpeg/bin/ffmpeg.exe`
@@ -12,16 +12,51 @@ FFmpeg: `C:/Users/zhangqingxuan/Desktop/Tools/ffmpeg/bin/ffmpeg.exe`
 | vk-j2k-dec cpu (10 frames) | 212.3 | 4.71 |
 | FFmpeg native (240 frames, multi-thread) | 37.3 | 26.8 |
 | gpu-tier1 before batching (main @ 88fd8ee, 30 frames) | 29.2 | 34.2 |
-| gpu-tier1, batch 1, no CPU offload | 14.5 | 69.0 |
-| gpu-tier1, batch 8, no CPU offload (pure GPU) | 10.5 | 95.4 |
-| gpu-tier1, fully auto (3 runs) | 9.5-9.6 | 104.4-104.8 |
+| gpu-tier1, batch 1, no CPU offload | 13.0 | 77.1 |
+| gpu-tier1, batch 8, no CPU offload (pure GPU, 6 runs) | 9.0-10.1 | 99.3-111.6 |
+| gpu-tier1, fully auto (7 runs) | 8.6-9.2 | 108.2-116.5 |
 | nvjpeg2000, 1 worker (reference) | 12.9 | 77.6 |
 | nvjpeg2000, 8 workers, decode only (reference) | 6.9 | 146.0 |
 
-gpu-tier1 rows use the packed-state Tier-1 shader (`tier1_packed.comp.glsl`) and are whole-loop
-averages over 240 frames. Every gpu-tier1 configuration produces the same 240-frame hash
-(`VK_J2K_HASH_FRAMES=1` -> `47d938a71bb308e5`), and the last frame matches FFmpeg's decode
-bit-exactly (`diff-rgb48`: 0 differing samples).
+gpu-tier1 rows are whole-loop averages over 240 frames with the current defaults: packed-state
+Tier-1 shader (`tier1_packed.comp.glsl`), fused 2D IDWT (`idwt53_fused_2d.comp.glsl`) and
+readback on the dedicated transfer queue. Every gpu-tier1 configuration produces the same
+240-frame hash (`VK_J2K_HASH_FRAMES=1` -> `47d938a71bb308e5`), and the last frame matches
+FFmpeg's decode bit-exactly (`diff-rgb48`: 0 differing samples).
+
+Run-to-run spread on this machine is large: two identical shader builds measured back to back
+differed by up to ~10 fps in one round, and the same build ranged 88-109 fps at batch 8 over
+the day. The GPU idles at ~1050 MHz and boosts to ~1830 MHz during runs, and the desktop has
+other GPU clients. Compare changes with interleaved multi-round A/B, not single runs.
+
+## GPU stage breakdown
+
+`VK_J2K_GPU_TIMING=1`, ms per frame:
+
+| stage | batch 1 | batch 8 | auto (batch 8 + CPU offload) |
+| --- | ---: | ---: | ---: |
+| upload | 0.03 | 0.02 | 0.26 |
+| Tier-1 | 11.94 | 8.81 | 7.31 |
+| scatter | 0.14 | 0.14 | 0.14 |
+| IDWT | 0.59 | 0.52 | 0.52 |
+| color + pack | 0.13 | 0.13 | 0.13 |
+| readback copy (transfer queue) | 1.21 | 1.20 | 1.23 |
+
+The readback copy runs on the transfer queue and mostly overlaps compute, so the stage sum is
+larger than the loop time per frame.
+
+## Optimization history (pure GPU, batch 8, no CPU offload)
+
+| change | effect on this machine |
+| --- | --- |
+| Packed stripe-column Tier-1 state | 52.8 -> 95.4 fps |
+| Per-stage GPU timestamps | no throughput change (A/B vs previous build) |
+| Fused 2D IDWT, one dispatch per level for all components | IDWT 1.37 -> 0.52 ms/frame, 90.9 -> 96.5 fps |
+| Readback on dedicated transfer queue | 88.8 -> 93.5 fps (5-round mean) |
+| Tier-1 micro-optimizations (hoisted reconstruction mode, atomic refinement/mirror writes, computed contexts) | Tier-1 8.25-8.59 -> 8.04-8.15 ms, 105.1-109.0 -> 110.0-111.4 fps (4-round interleaved) |
+
+The computed significance/sign contexts were checked exhaustively against the old lookup tables
+(all 189 input cases).
 
 ## Tier-1 shader comparison
 
@@ -38,35 +73,29 @@ thread-per-codeblock 66.2 fps, packed 124.4 fps, both with hash `459b94164d4f7e2
 The packed shader is therefore the default for both codeblock sizes; thread-per-codeblock is
 only a fallback when `tier1_packed.comp.spv` is missing.
 
-## gpu-tier1, fully auto
+## gpu-tier1, fully auto (2026-10-20)
 
 ```
 profile-mxf-ffmpeg test_j2k_rgb12_1080p24_3min.mxf 240 0 gpu-tier1 ...
-  tier1_shader target\shaders\tier1_packed.comp.spv (warp-per-codeblock)
-  autotune batch 8 (max 8) probes [8:9.07ms 4:9.38ms] cpu_codeblocks_per_frame 100 (max 239)
-  loop_avg_ms_per_frame total 9.541 fps 104.81
-  steady_ms_per_frame total 9.398 fps 106.41 cpu_tier1 6.422 gpu_wait 1.747 readback 0.001 (iterations 16, frames 124)
+  autotune batch 8 (max 8) probes [8:8.17ms 4:8.59ms] cpu_codeblocks_per_frame 80 (max 239)
+  loop_avg_ms_per_frame total 9.239 fps 108.24
 ```
 
-| run | chosen batch | CPU codeblocks/frame | steady fps | whole-loop fps |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 8 | 100 | 106.41 | 104.81 |
-| 2 | 8 | 101 | 106.11 | 104.59 |
-| 3 | 8 | 99 | 105.95 | 104.37 |
+Whole-loop fps over 7 auto runs: 116.53, 111.55, 115.68, 116.44, 113.80, 109.77, 108.24.
+The tuner settled on batch 8 with 71-84 CPU-decoded codeblocks per frame.
 
-## Fixed configurations
+## Fixed configurations (2026-10-20)
 
 ```
 VK_J2K_BATCH=8 VK_J2K_CPU_CBLKS=0
-  loop_avg_ms_per_frame total 10.482 fps 95.40
-  steady_ms_per_frame total 10.483 fps 95.39 cpu_tier1 0.000 gpu_wait 10.352 readback 0.001
+  loop_avg_ms_per_frame total 10.074 fps 99.26
+  (5 more runs: 106.86, 111.55, 110.90, 110.98, 110.98 fps)
 
 VK_J2K_BATCH=1 VK_J2K_CPU_CBLKS=0
-  loop_avg_ms_per_frame total 14.504 fps 68.95
-  steady_ms_per_frame total 14.496 fps 68.98 cpu_tier1 0.002 gpu_wait 14.353 readback 0.002
+  loop_avg_ms_per_frame total 12.964 fps 77.14
 ```
 
-## Where the gains come from
+## Where the gains come from (2026-10-19, older pipeline)
 
 | change | effect on this machine |
 | --- | --- |
