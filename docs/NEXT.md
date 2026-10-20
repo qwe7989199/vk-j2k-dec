@@ -222,3 +222,59 @@ optimization broke bit-exactness and must be rolled back.
 | Fused scatter+IDWT | 0.5-1ms | 2 days | Medium |
 | Async transfer queue for readback | 1-2ms | 1 day | Low |
 | IDWT shared memory tiling | 0.5-1ms | 2 days | Medium |
+
+The table above is from May 2025. Packed column state, the transfer-queue readback and IDWT
+tiling have since been done; see below.
+
+## Status (Oct 2026)
+
+The MXF `gpu-tier1` path now runs batched frames with auto-tuning and CPU offload, the
+packed stripe-column Tier-1 shader (`shaders/tier1_packed.comp.glsl`), the fused 2D IDWT
+(`shaders/idwt53_fused_2d.comp.glsl`) and readback on a dedicated transfer queue. Results and
+the full optimization history are in `TEST_RTX2060.md`.
+
+RTX 2060, batch 8, no CPU offload (ms/frame, `VK_J2K_GPU_TIMING=1`):
+
+| stage | ms |
+| --- | ---: |
+| Tier-1 | 6.82 |
+| IDWT | 0.46 |
+| scatter | 0.14 |
+| color + pack | 0.13 |
+| readback copy (transfer queue, mostly overlapped) | 1.17 |
+
+That is ~129 fps pure GPU; nvjpeg2000 on the same machine reaches 146 fps.
+
+### Future directions
+
+| Optimization | Expected gain | Notes |
+|---|---|---|
+| Fuse color convert + RGB48 pack into the last IDWT level | ~0.15 ms/frame (~2%) | Skips writing and re-reading the R5 output (25 MB/frame). One workgroup must hold all three components (~28 KB shared), which may cut occupancy. |
+| IDWT closer to the bandwidth floor | up to ~0.25 ms/frame | Floor is ~0.2 ms (66 MB/frame at 336 GB/s); nvjpeg2000 is at 0.22 ms. The cost is mostly in R5/R4 (halo reads, shared-memory staging). |
+| Merge low IDWT levels into one dispatch | ~0.03 ms/frame | R1-R3 are 6% of the IDWT data; not worth it alone. |
+| Tier-1 below ~6.4 ms | the remaining gap to nvjpeg2000 | Needs control GLSL doesn't give (register budget, instruction selection). Check registers/occupancy with `VK_KHR_pipeline_executable_properties` first. |
+
+### Tried and rejected (Oct 2026)
+
+| Optimization | Result |
+|---|---|
+| `glslc -O` on the MXF shaders | Tier-1 ~5% slower |
+| Tier-1 writes subband planes directly (no scatter pass) | bit-exact, but Tier-1 slowed by about the 0.14 ms saved |
+| Unconditional byte loads (no word cache) | within noise |
+| 2 or 8 warps per workgroup (vs 4) | no gain |
+
+### Re-testing on another machine
+
+```powershell
+git pull
+powershell -ExecutionPolicy Bypass -File scripts\compile-shaders.ps1 -VulkanSdk <path-to-VulkanSDK>
+cargo build --release
+$env:VK_J2K_HASH_FRAMES=1
+target\release\vk-j2k-dec.exe profile-mxf-ffmpeg <test_j2k_rgb12_1080p24_3min.mxf> 240 0 gpu-tier1 target\samples\mxf_out.rgb48le <ffmpeg.exe> target\samples\ffmpeg_demux target\shaders\idwt53_offset_1d.comp.spv target\shaders\color_convert_i32.comp.spv
+```
+
+`target/shaders` is not in git, so the shader script must run first; the decoder silently falls
+back to older shaders when a `.spv` is missing (check the `tier1_shader`, `idwt` and `readback`
+lines of the output). The 240-frame `frames_hash` must be `47d938a71bb308e5` on any GPU. Useful
+knobs: `VK_J2K_GPU_TIMING=1` (per-stage GPU time), `VK_J2K_BATCH=8 VK_J2K_CPU_CBLKS=0` (pure
+GPU, fixed batch). Compare changes with interleaved multi-round runs; single runs are noisy.
