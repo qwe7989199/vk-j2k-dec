@@ -19,6 +19,12 @@ impl VulkanDeviceSummary {
             .min_by_key(|family| family.graphics)
     }
 
+    pub fn first_graphics_compute_queue_family(&self) -> Option<&VulkanQueueFamilySummary> {
+        self.queue_families
+            .iter()
+            .find(|family| family.graphics && family.compute)
+    }
+
     /// A transfer-only family (the copy engine on discrete GPUs), preferring ones with
     /// timestamp support.
     pub fn dedicated_transfer_queue_family(&self) -> Option<&VulkanQueueFamilySummary> {
@@ -2608,9 +2614,9 @@ impl ReusableRgb48Packer {
                 component_outputs.len()
             )));
         }
-        if color_transform > 1 {
+        if color_transform > 2 {
             return Err(VulkanError::new(format!(
-                "GPU integer color conversion supports only none/RCT, got mode {color_transform}"
+                "GPU color conversion supports only none/RCT/ICT, got mode {color_transform}"
             )));
         }
         if precision == 0 || precision > 16 {
@@ -5052,6 +5058,8 @@ fn idwt97_smoke_component() -> Result<ComponentSubbandPlanes, VulkanError> {
                 height: 2,
                 precincts_x: 1,
                 precincts_y: 1,
+                precinct_width: 32768,
+                precinct_height: 32768,
                 subbands: vec![SubbandLayout {
                     kind: SubbandKind::Ll,
                     width: 3,
@@ -5068,6 +5076,8 @@ fn idwt97_smoke_component() -> Result<ComponentSubbandPlanes, VulkanError> {
                 height: 4,
                 precincts_x: 1,
                 precincts_y: 1,
+                precinct_width: 32768,
+                precinct_height: 32768,
                 subbands: vec![
                     SubbandLayout {
                         kind: SubbandKind::Hl,

@@ -146,7 +146,8 @@ pub fn tier1_gpu_plan(path: &str) -> ExitCode {
         }
         let shader_path = "target\\shaders\\tier1_plan_smoke.comp.spv";
         if std::path::Path::new(shader_path).exists() {
-            let records = plan.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
+            let records =
+                plan.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
             let compressed_words = plan.compressed_u32_words();
             let smoke = match vk_j2k_dec::vulkan::run_tier1_plan_smoke(
                 shader_path,
@@ -898,7 +899,8 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
         );
         print_codeblock_parallelism_stats(&plan, "    ");
 
-        let original_records = plan.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
+        let original_records =
+            plan.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
         let mut records = original_records.clone();
         sort_codeblock_records_by_descending_work(&mut records);
         let compressed_words = plan.compressed_u32_words();
@@ -1172,7 +1174,11 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
                     &dequant_plan.step_indices,
                     &dequant_plan.steps,
                     cod.decomposition_levels,
-                    if cod.multiple_component_transform != 0 { 2u32 } else { 0u32 },
+                    if cod.multiple_component_transform != 0 {
+                        2u32
+                    } else {
+                        0u32
+                    },
                     precision,
                     iterations,
                 ) {
@@ -1221,23 +1227,34 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
     let mut all_plans = Vec::new();
     let mut all_plans_discard1 = Vec::new();
     for tile_part in &codestream.tile_parts {
-        let layout = layouts.iter().find(|l| l.tile_index == tile_part.tile_index).unwrap();
+        let layout = layouts
+            .iter()
+            .find(|l| l.tile_index == tile_part.tile_index)
+            .unwrap();
         let tile_data = &data[tile_part.data_start..tile_part.data_end];
         let packet_summary = parse_lrcp_tile_packets(tile_data, layout, cod.layers).unwrap();
         let work_plan = Tier1WorkPlan::from_packet_summary_with_quantization(
-            &packet_summary, codestream.qcd.as_ref(), &codestream.qccs,
-        ).unwrap();
+            &packet_summary,
+            codestream.qcd.as_ref(),
+            &codestream.qccs,
+        )
+        .unwrap();
         let bound = work_plan.bind_segment_data(tile_data).unwrap();
         let plan = GpuTier1Plan::from_bound_work_plan(&bound, cod.codeblock_style_flags()).unwrap();
         all_plans.push(plan);
 
         // Also build discard-1 plan
         let mut work_plan_d1 = Tier1WorkPlan::from_packet_summary_with_quantization(
-            &packet_summary, codestream.qcd.as_ref(), &codestream.qccs,
-        ).unwrap();
+            &packet_summary,
+            codestream.qcd.as_ref(),
+            &codestream.qccs,
+        )
+        .unwrap();
         work_plan_d1.retain_max_resolution(cod.decomposition_levels.saturating_sub(1));
         let bound_d1 = work_plan_d1.bind_segment_data(tile_data).unwrap();
-        if let Ok(plan_d1) = GpuTier1Plan::from_bound_work_plan(&bound_d1, cod.codeblock_style_flags()) {
+        if let Ok(plan_d1) =
+            GpuTier1Plan::from_bound_work_plan(&bound_d1, cod.codeblock_style_flags())
+        {
             all_plans_discard1.push(plan_d1);
         }
     }
@@ -1245,21 +1262,28 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
     let merged_d1 = GpuTier1Plan::merge(&all_plans_discard1);
     println!(
         "  merged full-res: {} cblk, {} bytes | discard-1: {} cblk, {} bytes",
-        merged.codeblocks.len(), merged.compressed_bytes.len(),
-        merged_d1.codeblocks.len(), merged_d1.compressed_bytes.len(),
+        merged.codeblocks.len(),
+        merged.compressed_bytes.len(),
+        merged_d1.codeblocks.len(),
+        merged_d1.compressed_bytes.len(),
     );
 
     // Bench full resolution
-    let mut records = merged.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
+    let mut records =
+        merged.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
     sort_codeblock_records_by_descending_work(&mut records);
     let compressed_words = merged.compressed_u32_words();
     if let Ok(bench) = vk_j2k_dec::vulkan::run_tier1_cleanup_bench(
-        cleanup_shader_path, &records, &compressed_words, iterations,
+        cleanup_shader_path,
+        &records,
+        &compressed_words,
+        iterations,
         gpu_reconstruction_mode(cod.transform),
     ) {
         println!(
             "    full-res Tier-1: {:.3} ms avg ({:.1} fps)",
-            bench.dispatch_average_ms, 1000.0 / bench.dispatch_average_ms
+            bench.dispatch_average_ms,
+            1000.0 / bench.dispatch_average_ms
         );
     }
 
@@ -1268,43 +1292,58 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
     if std::path::Path::new(fast_shader).exists() {
         // Thread-per-codeblock: dispatch ceil(codeblocks/128) workgroups of 128 threads
         if let Ok(bench) = vk_j2k_dec::vulkan::run_tier1_cleanup_bench(
-            fast_shader, &records, &compressed_words, iterations,
+            fast_shader,
+            &records,
+            &compressed_words,
+            iterations,
             gpu_reconstruction_mode(cod.transform),
         ) {
             println!(
                 "    thread-per-cblk Tier-1: {:.3} ms avg ({:.1} fps)",
-                bench.dispatch_average_ms, 1000.0 / bench.dispatch_average_ms
+                bench.dispatch_average_ms,
+                1000.0 / bench.dispatch_average_ms
             );
         }
 
         // Adaptive: partition by codeblock size, use best shader for each
-        let mut adaptive_records = merged.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
+        let mut adaptive_records =
+            merged.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
         let thread_count = partition_records_by_shader_affinity(&mut adaptive_records);
         if let Ok(bench) = vk_j2k_dec::vulkan::run_tier1_adaptive_bench(
-            cleanup_shader_path, fast_shader,
-            &adaptive_records, &compressed_words,
-            thread_count, iterations,
+            cleanup_shader_path,
+            fast_shader,
+            &adaptive_records,
+            &compressed_words,
+            thread_count,
+            iterations,
             gpu_reconstruction_mode(cod.transform),
         ) {
             println!(
                 "    adaptive Tier-1: {:.3} ms avg ({:.1} fps) [thread-per-cblk: {}, warp-per-cblk: {}]",
-                bench.dispatch_average_ms, 1000.0 / bench.dispatch_average_ms,
-                thread_count, adaptive_records.len() - thread_count
+                bench.dispatch_average_ms,
+                1000.0 / bench.dispatch_average_ms,
+                thread_count,
+                adaptive_records.len() - thread_count
             );
         }
     }
 
     // Bench discard-1
-    let mut records_d1 = merged_d1.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
+    let mut records_d1 =
+        merged_d1.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
     sort_codeblock_records_by_descending_work(&mut records_d1);
     let compressed_words_d1 = merged_d1.compressed_u32_words();
     if let Ok(bench) = vk_j2k_dec::vulkan::run_tier1_cleanup_bench(
-        cleanup_shader_path, &records_d1, &compressed_words_d1, iterations,
+        cleanup_shader_path,
+        &records_d1,
+        &compressed_words_d1,
+        iterations,
         gpu_reconstruction_mode(cod.transform),
     ) {
         println!(
             "    discard-1 Tier-1: {:.3} ms avg ({:.1} fps)",
-            bench.dispatch_average_ms, 1000.0 / bench.dispatch_average_ms
+            bench.dispatch_average_ms,
+            1000.0 / bench.dispatch_average_ms
         );
     }
 
@@ -1319,7 +1358,8 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
     {
         let scatter_shader_path = "target\\shaders\\tier1_scatter_smoke.comp.spv";
         if std::path::Path::new(scatter_shader_path).exists() {
-            let mut adaptive_records = merged.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
+            let mut adaptive_records = merged
+                .codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
             let thread_count = partition_records_by_shader_affinity(&mut adaptive_records);
             let actual_cleanup_shader = if thread_count == adaptive_records.len() {
                 "target\\shaders\\tier1_cleanup_smoke_16.comp.spv"
@@ -1327,11 +1367,21 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
                 cleanup_shader_path
             };
             let full_image_layouts = if let Some(siz) = codestream.siz.as_ref() {
-                Some(siz.components.iter().map(|comp| {
-                    vk_j2k_dec::codestream::component_layout(
-                        comp, cod, siz.x_origin, siz.y_origin, siz.width, siz.height,
-                    )
-                }).collect::<Vec<_>>())
+                Some(
+                    siz.components
+                        .iter()
+                        .map(|comp| {
+                            vk_j2k_dec::codestream::component_layout(
+                                comp,
+                                cod,
+                                siz.x_origin,
+                                siz.y_origin,
+                                siz.width,
+                                siz.height,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
             } else {
                 None
             };
@@ -1339,34 +1389,61 @@ pub fn tier1_gpu_bench(path: &str, iterations: usize) -> ExitCode {
                 merged.scatter_plan(&layouts[0].components)
             } else if let Some(ref full_layouts) = full_image_layouts {
                 vk_j2k_dec::gpu::GpuTier1Plan::scatter_plan_multi_tile(
-                    &merged, &all_plans, &layouts, full_layouts,
+                    &merged,
+                    &all_plans,
+                    &layouts,
+                    full_layouts,
                 )
             } else {
-                Err(vk_j2k_dec::tier1::Tier1DecodeError::new("no SIZ for multi-tile scatter"))
+                Err(vk_j2k_dec::tier1::Tier1DecodeError::new(
+                    "no SIZ for multi-tile scatter",
+                ))
             };
             if let Ok(scatter_plan) = scatter_plan_result {
-                let precision = codestream.siz.as_ref()
+                let precision = codestream
+                    .siz
+                    .as_ref()
                     .and_then(|siz| siz.components.first())
-                    .map(|c| c.precision).unwrap_or(0);
+                    .map(|c| c.precision)
+                    .unwrap_or(0);
                 if let Some(qcd) = codestream.qcd.as_ref() {
                     if let Ok(dequant_plan) = vk_j2k_dec::gpu::build_dequant_plan(
-                        &scatter_plan.planes, scatter_plan.output_coefficients,
-                        qcd, precision, cod.decomposition_levels,
+                        &scatter_plan.planes,
+                        scatter_plan.output_coefficients,
+                        qcd,
+                        precision,
+                        cod.decomposition_levels,
                     ) {
-                        let color_transform = if cod.multiple_component_transform != 0 { 2u32 } else { 0u32 };
+                        let color_transform = if cod.multiple_component_transform != 0 {
+                            2u32
+                        } else {
+                            0u32
+                        };
                         let compressed_words = merged.compressed_u32_words();
-                        if let Ok(bench) = vk_j2k_dec::vulkan::run_tier1_cleanup_scatter_rgb48_bench_97(
-                            actual_cleanup_shader, scatter_shader_path,
-                            dequant_shader_path, idwt97_offset_shader_path, color_float_shader_path,
-                            &adaptive_records, &compressed_words,
-                            &scatter_plan.records, &scatter_plan.planes,
-                            scatter_plan.output_coefficients,
-                            &dequant_plan.step_indices, &dequant_plan.steps,
-                            cod.decomposition_levels, color_transform, precision, iterations,
-                        ) {
+                        if let Ok(bench) =
+                            vk_j2k_dec::vulkan::run_tier1_cleanup_scatter_rgb48_bench_97(
+                                actual_cleanup_shader,
+                                scatter_shader_path,
+                                dequant_shader_path,
+                                idwt97_offset_shader_path,
+                                color_float_shader_path,
+                                &adaptive_records,
+                                &compressed_words,
+                                &scatter_plan.records,
+                                &scatter_plan.planes,
+                                scatter_plan.output_coefficients,
+                                &dequant_plan.step_indices,
+                                &dequant_plan.steps,
+                                cod.decomposition_levels,
+                                color_transform,
+                                precision,
+                                iterations,
+                            )
+                        {
                             println!(
                                 "    full pipeline 9/7: {:.3} ms avg ({:.1} fps)",
-                                bench.decode_average_ms, 1000.0 / bench.decode_average_ms
+                                bench.decode_average_ms,
+                                1000.0 / bench.decode_average_ms
                             );
                         }
                     }
@@ -1707,7 +1784,8 @@ pub fn tier1_gpu_pipeline_bench(path: &str, iterations: usize, pipeline_depth: u
         );
         print_codeblock_parallelism_stats(&plan, "    ");
 
-        let original_records = plan.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
+        let original_records =
+            plan.codeblock_records_with_reconstruction(gpu_reconstruction_mode(cod.transform));
         let mut records = original_records.clone();
         sort_codeblock_records_by_descending_work(&mut records);
         let compressed_words = plan.compressed_u32_words();

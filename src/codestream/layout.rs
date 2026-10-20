@@ -206,6 +206,8 @@ pub fn component_layout(
             height: resolution_height,
             precincts_x: ceil_div_u32(resolution_width.max(1), precinct_width),
             precincts_y: ceil_div_u32(resolution_height.max(1), precinct_height),
+            precinct_width,
+            precinct_height,
             subbands,
         });
     }

@@ -735,6 +735,8 @@ pub struct ResolutionLayout {
     pub height: u32,
     pub precincts_x: u32,
     pub precincts_y: u32,
+    pub precinct_width: u32,
+    pub precinct_height: u32,
     pub subbands: Vec<SubbandLayout>,
 }
 

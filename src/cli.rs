@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use vk_j2k_dec::codestream::{Codestream, WaveletTransform, scan_codestreams};
 use vk_j2k_dec::gpu::{GpuDwtDispatchPlan, GpuPipelinePlan};
-use vk_j2k_dec::packet::{TilePacketHeaderState, parse_lrcp_tile_packets};
+use vk_j2k_dec::packet::{TilePacketHeaderState, parse_lrcp_tile_packets, parse_tile_packets};
 use vk_j2k_dec::reconstruct::TileCoefficientPlanes;
 use vk_j2k_dec::tier1::{CoefficientReconstruction, Tier1WorkPlan};
 
@@ -484,7 +484,9 @@ pub fn run() -> ExitCode {
             eprintln!("  {program} tier1-gpu-plan <input.j2k>");
             eprintln!("  {program} tier1-gpu-bench <input.j2k> [iterations]");
             eprintln!("  {program} tier1-gpu-batch-bench <input.j2k> [iterations] [batch-frames]");
-            eprintln!("  {program} tier1-gpu-pipeline-bench <input.j2k> [iterations] [pipeline-depth]");
+            eprintln!(
+                "  {program} tier1-gpu-pipeline-bench <input.j2k> [iterations] [pipeline-depth]"
+            );
             eprintln!(
                 "  {program} tier1-codeblock-trace <input.j2k> <component> <resolution> <LL|HL|LH|HH> <codeblock-x> <codeblock-y>"
             );
@@ -1264,7 +1266,7 @@ fn print_packet_parse_summary(codestream: &Codestream, data: &[u8]) {
             continue;
         };
 
-        match parse_lrcp_tile_packets(tile_data, layout, cod.layers) {
+        match parse_tile_packets(tile_data, layout, cod.layers, &cod.progression_order) {
             Ok(summary) => {
                 let status = if summary.consumed_bytes == tile_data.len() {
                     "complete"
