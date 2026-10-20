@@ -22,8 +22,13 @@ pub fn print_vulkan_info() -> ExitCode {
         );
         for family in &device.queue_families {
             println!(
-                "  queue family {}: count {}, graphics {}, compute {}, transfer {}",
-                family.index, family.queue_count, family.graphics, family.compute, family.transfer
+                "  queue family {}: count {}, graphics {}, compute {}, transfer {}, timestamp bits {}",
+                family.index,
+                family.queue_count,
+                family.graphics,
+                family.compute,
+                family.transfer,
+                family.timestamp_valid_bits
             );
         }
         match device.first_compute_queue_family() {

@@ -23,6 +23,8 @@ const VK_STRUCTURE_TYPE_MEMORY_BARRIER: u32 = 44;
 const VK_QUEUE_GRAPHICS_BIT: u32 = 0x0000_0001;
 const VK_QUEUE_COMPUTE_BIT: u32 = 0x0000_0002;
 const VK_QUEUE_TRANSFER_BIT: u32 = 0x0000_0004;
+const VK_QUEUE_VIDEO_DECODE_BIT_KHR: u32 = 0x0000_0020;
+const VK_QUEUE_VIDEO_ENCODE_BIT_KHR: u32 = 0x0000_0040;
 const VK_BUFFER_USAGE_TRANSFER_SRC_BIT: u32 = 0x0000_0001;
 const VK_BUFFER_USAGE_TRANSFER_DST_BIT: u32 = 0x0000_0002;
 const VK_BUFFER_USAGE_STORAGE_BUFFER_BIT: u32 = 0x0000_0020;
@@ -45,6 +47,8 @@ const VK_PIPELINE_BIND_POINT_COMPUTE: u32 = 1;
 const VK_COMMAND_BUFFER_LEVEL_PRIMARY: u32 = 0;
 const VK_WHOLE_SIZE: u64 = !0;
 const VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT: u32 = 0x0000_0002;
+const VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO: u32 = 9;
+const VK_SHARING_MODE_CONCURRENT: u32 = 1;
 const VK_MEMORY_HEAP_DEVICE_LOCAL_BIT: u32 = 0x0000_0001;
 const VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO: u32 = 11;
 const VK_QUERY_TYPE_TIMESTAMP: u32 = 2;
@@ -69,6 +73,7 @@ type VkCommandPool = usize;
 type VkCommandBuffer = usize;
 type VkFence = usize;
 type VkQueryPool = usize;
+type VkSemaphore = usize;
 type VkFlags = u32;
 type VkBool32 = u32;
 
@@ -219,6 +224,13 @@ type VkWaitForFences =
     unsafe extern "system" fn(VkDevice, u32, *const VkFence, VkBool32, u64) -> i32;
 type VkResetFences = unsafe extern "system" fn(VkDevice, u32, *const VkFence) -> i32;
 type VkDeviceWaitIdle = unsafe extern "system" fn(VkDevice) -> i32;
+type VkCreateSemaphore = unsafe extern "system" fn(
+    VkDevice,
+    *const VkSemaphoreCreateInfo,
+    *const c_void,
+    *mut VkSemaphore,
+) -> i32;
+type VkDestroySemaphore = unsafe extern "system" fn(VkDevice, VkSemaphore, *const c_void);
 type VkCreateQueryPool = unsafe extern "system" fn(
     VkDevice,
     *const VkQueryPoolCreateInfo,
@@ -526,6 +538,13 @@ struct VkBufferCopy {
 
 #[repr(C)]
 struct VkFenceCreateInfo {
+    s_type: u32,
+    p_next: *const c_void,
+    flags: VkFlags,
+}
+
+#[repr(C)]
+struct VkSemaphoreCreateInfo {
     s_type: u32,
     p_next: *const c_void,
     flags: VkFlags,

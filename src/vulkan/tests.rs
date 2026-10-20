@@ -24,6 +24,7 @@ mod tests {
                     graphics: true,
                     compute: true,
                     transfer: true,
+                    video: false,
                     timestamp_valid_bits: 0,
                 },
                 VulkanQueueFamilySummary {
@@ -32,6 +33,7 @@ mod tests {
                     graphics: false,
                     compute: true,
                     transfer: true,
+                    video: false,
                     timestamp_valid_bits: 0,
                 },
             ],

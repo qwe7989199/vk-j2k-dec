@@ -689,6 +689,8 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         cpu_coefficient_capacity,
         // VK_J2K_GPU_TIMING=1 records per-stage GPU timestamps.
         gpu_timestamps: std::env::var_os("VK_J2K_GPU_TIMING").is_some(),
+        // VK_J2K_TRANSFER_QUEUE=0 keeps the readback copy on the compute queue (A/B testing).
+        transfer_queue: !std::env::var("VK_J2K_TRANSFER_QUEUE").is_ok_and(|mode| mode == "0"),
     }) {
         Ok(pipeline) => pipeline,
         Err(err) => {
@@ -760,6 +762,10 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         if thread_per_codeblock { "thread-per-codeblock" } else { "warp-per-codeblock" }
     );
     println!("  idwt {}", if pipeline.fused_idwt() { "fused 2d" } else { "separable 1d" });
+    println!(
+        "  readback {}",
+        if pipeline.transfer_readback() { "transfer queue" } else { "compute queue" }
+    );
     println!("  ffmpeg_demux_ms {:.3}", demux_ms);
     println!("  read_frames_ms {:.3}", read_total_ms);
     println!("  pipeline_setup_ms {:.3}", pipeline.setup_ms());

@@ -46,11 +46,15 @@ struct VulkanDeviceFunctions {
     cmd_reset_query_pool: VkCmdResetQueryPool,
     cmd_write_timestamp: VkCmdWriteTimestamp,
     get_query_pool_results: VkGetQueryPoolResults,
+    create_semaphore: VkCreateSemaphore,
+    destroy_semaphore: VkDestroySemaphore,
 }
 
 struct VulkanDevice {
     device: VkDevice,
     queue: VkQueue,
+    /// Queue of a dedicated transfer family, when one was requested at device creation.
+    transfer_queue: Option<VkQueue>,
     functions: VulkanDeviceFunctions,
     memory_properties: VkPhysicalDeviceMemoryProperties,
 }
@@ -83,6 +87,9 @@ struct RegionCopy<'a> {
 struct TimestampMarks<'a> {
     pool: &'a QueryPoolHandle,
     after_dispatches: &'a [usize],
+    /// Queries reset at the start, at least `query_count()`; more when another command buffer
+    /// (e.g. on a transfer queue, which cannot reset queries) writes the remaining ones.
+    reset_queries: u32,
 }
 
 impl TimestampMarks<'_> {
@@ -130,21 +137,43 @@ impl VulkanDevice {
         self.create_buffer(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
     }
 
+    /// Device-local buffer usable concurrently by `families` (no ownership transfers needed);
+    /// with fewer than two families it is an ordinary exclusive buffer.
+    fn create_device_local_shared_buffer(
+        &self,
+        size: u64,
+        usage: VkFlags,
+        families: &[u32],
+    ) -> Result<HostBuffer, VulkanError> {
+        self.create_buffer_shared(size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, families)
+    }
+
     fn create_buffer(
         &self,
         size: u64,
         usage: VkFlags,
         memory_properties: VkFlags,
     ) -> Result<HostBuffer, VulkanError> {
+        self.create_buffer_shared(size, usage, memory_properties, &[])
+    }
+
+    fn create_buffer_shared(
+        &self,
+        size: u64,
+        usage: VkFlags,
+        memory_properties: VkFlags,
+        families: &[u32],
+    ) -> Result<HostBuffer, VulkanError> {
+        let concurrent = families.len() > 1;
         let create_info = VkBufferCreateInfo {
             s_type: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             p_next: ptr::null(),
             flags: 0,
             size,
             usage,
-            sharing_mode: 0,
-            queue_family_index_count: 0,
-            p_queue_family_indices: ptr::null(),
+            sharing_mode: if concurrent { VK_SHARING_MODE_CONCURRENT } else { 0 },
+            queue_family_index_count: if concurrent { families.len() as u32 } else { 0 },
+            p_queue_family_indices: if concurrent { families.as_ptr() } else { ptr::null() },
         };
         let mut buffer = 0usize;
         vk_check(
@@ -573,10 +602,10 @@ impl VulkanDevice {
             }
         };
         if let Some(marks) = timestamps {
-            if marks.query_count() > marks.pool.query_count {
+            let reset_queries = marks.reset_queries.max(marks.query_count());
+            if reset_queries > marks.pool.query_count {
                 return Err(VulkanError::new(format!(
-                    "{} timestamps exceed query pool of {}",
-                    marks.query_count(),
+                    "{reset_queries} timestamps exceed query pool of {}",
                     marks.pool.query_count
                 )));
             }
@@ -585,7 +614,7 @@ impl VulkanDevice {
                     command_buffer,
                     marks.pool.handle,
                     0,
-                    marks.query_count(),
+                    reset_queries,
                 );
             }
             write_timestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0);
@@ -913,6 +942,139 @@ impl VulkanDevice {
             functions: self.functions,
             handle,
         })
+    }
+
+    fn create_semaphore(&self) -> Result<SemaphoreHandle, VulkanError> {
+        let create_info = VkSemaphoreCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: 0,
+        };
+        let mut handle = 0usize;
+        vk_check(
+            unsafe {
+                (self.functions.create_semaphore)(self.device, &create_info, ptr::null(), &mut handle)
+            },
+            "vkCreateSemaphore",
+        )?;
+        Ok(SemaphoreHandle {
+            device: self.device,
+            functions: self.functions,
+            handle,
+        })
+    }
+
+    /// Submits one command buffer to `queue`, optionally waiting on a semaphore at `wait.1`
+    /// and signalling `signal`; `fence` may be 0.
+    fn submit_on(
+        &self,
+        queue: VkQueue,
+        command_buffer: VkCommandBuffer,
+        wait: Option<(VkSemaphore, VkFlags)>,
+        signal: Option<VkSemaphore>,
+        fence: VkFence,
+    ) -> Result<(), VulkanError> {
+        let wait_semaphore = wait.map(|(semaphore, _)| semaphore).unwrap_or(0);
+        let wait_stage = wait.map(|(_, stage)| stage).unwrap_or(0);
+        let signal_semaphore = signal.unwrap_or(0);
+        let submit_info = VkSubmitInfo {
+            s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            p_next: ptr::null(),
+            wait_semaphore_count: u32::from(wait.is_some()),
+            p_wait_semaphores: &wait_semaphore,
+            p_wait_dst_stage_mask: &wait_stage,
+            command_buffer_count: 1,
+            p_command_buffers: &command_buffer,
+            signal_semaphore_count: u32::from(signal.is_some()),
+            p_signal_semaphores: &signal_semaphore,
+        };
+        vk_check(
+            unsafe { (self.functions.queue_submit)(queue, 1, &submit_info, fence) },
+            "vkQueueSubmit",
+        )
+    }
+
+    /// Records buffer copies for host readback, ending with a host-read barrier. Optional
+    /// timestamps `(pool, start query, end query)` bracket the copies; the queries must have
+    /// been reset beforehand, since transfer queues cannot reset queries.
+    fn record_readback_copies(
+        &self,
+        command_buffer: VkCommandBuffer,
+        copies: &[BufferCopy<'_>],
+        timestamps: Option<(&QueryPoolHandle, u32, u32)>,
+    ) -> Result<(), VulkanError> {
+        let begin_info = VkCommandBufferBeginInfo {
+            s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            p_next: ptr::null(),
+            flags: 0,
+            p_inheritance_info: ptr::null(),
+        };
+        vk_check(
+            unsafe { (self.functions.begin_command_buffer)(command_buffer, &begin_info) },
+            "vkBeginCommandBuffer",
+        )?;
+        if let Some((pool, start, _)) = timestamps {
+            // TRANSFER rather than TOP_OF_PIPE: the semaphore wait guarding these copies only
+            // blocks the transfer stage, and the write must follow the query reset it waits on.
+            unsafe {
+                (self.functions.cmd_write_timestamp)(
+                    command_buffer,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    pool.handle,
+                    start,
+                );
+            }
+        }
+        for copy_request in copies {
+            let copy = VkBufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: copy_request.byte_len,
+            };
+            unsafe {
+                (self.functions.cmd_copy_buffer)(
+                    command_buffer,
+                    copy_request.source.buffer,
+                    copy_request.destination.buffer,
+                    1,
+                    &copy,
+                );
+            }
+        }
+        let host_barrier = VkMemoryBarrier {
+            s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            p_next: ptr::null(),
+            src_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT,
+            dst_access_mask: VK_ACCESS_HOST_READ_BIT,
+        };
+        unsafe {
+            (self.functions.cmd_pipeline_barrier)(
+                command_buffer,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT,
+                0,
+                1,
+                &host_barrier,
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+            );
+        }
+        if let Some((pool, _, end)) = timestamps {
+            unsafe {
+                (self.functions.cmd_write_timestamp)(
+                    command_buffer,
+                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                    pool.handle,
+                    end,
+                );
+            }
+        }
+        vk_check(
+            unsafe { (self.functions.end_command_buffer)(command_buffer) },
+            "vkEndCommandBuffer",
+        )
     }
 
     fn submit_with_fence(&self, command_buffer: VkCommandBuffer, fence: VkFence) -> Result<(), VulkanError> {
@@ -1263,6 +1425,20 @@ impl Drop for QueryPoolHandle {
     fn drop(&mut self) {
         unsafe {
             (self.functions.destroy_query_pool)(self.device, self.handle, ptr::null());
+        }
+    }
+}
+
+struct SemaphoreHandle {
+    device: VkDevice,
+    functions: VulkanDeviceFunctions,
+    handle: VkSemaphore,
+}
+
+impl Drop for SemaphoreHandle {
+    fn drop(&mut self) {
+        unsafe {
+            (self.functions.destroy_semaphore)(self.device, self.handle, ptr::null());
         }
     }
 }

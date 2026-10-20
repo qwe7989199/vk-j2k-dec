@@ -196,6 +196,9 @@ impl VulkanInstance {
                     graphics: family.queue_flags & VK_QUEUE_GRAPHICS_BIT != 0,
                     compute: family.queue_flags & VK_QUEUE_COMPUTE_BIT != 0,
                     transfer: family.queue_flags & VK_QUEUE_TRANSFER_BIT != 0,
+                    video: family.queue_flags
+                        & (VK_QUEUE_VIDEO_DECODE_BIT_KHR | VK_QUEUE_VIDEO_ENCODE_BIT_KHR)
+                        != 0,
                     timestamp_valid_bits: family.timestamp_valid_bits,
                 })
                 .collect(),
@@ -239,13 +242,17 @@ impl VulkanInstance {
             .ok_or_else(|| VulkanError::new("no Vulkan device with compute queue found"))
     }
 
+    /// Creates a device with one queue of `queue_family_index`, plus one queue of
+    /// `transfer_family` when given (and different).
     fn create_compute_device(
         &self,
         physical_device: VkPhysicalDevice,
         queue_family_index: u32,
+        transfer_family: Option<u32>,
     ) -> Result<VulkanDevice, VulkanError> {
+        let transfer_family = transfer_family.filter(|family| *family != queue_family_index);
         let priority = 1.0f32;
-        let queue_create_info = VkDeviceQueueCreateInfo {
+        let queue_create_info = |queue_family_index| VkDeviceQueueCreateInfo {
             s_type: VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
             p_next: ptr::null(),
             flags: 0,
@@ -253,12 +260,16 @@ impl VulkanInstance {
             queue_count: 1,
             p_queue_priorities: &priority,
         };
+        let mut queue_create_infos = vec![queue_create_info(queue_family_index)];
+        if let Some(family) = transfer_family {
+            queue_create_infos.push(queue_create_info(family));
+        }
         let create_info = VkDeviceCreateInfo {
             s_type: VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             p_next: ptr::null(),
             flags: 0,
-            queue_create_info_count: 1,
-            p_queue_create_infos: &queue_create_info,
+            queue_create_info_count: queue_create_infos.len() as u32,
+            p_queue_create_infos: queue_create_infos.as_ptr(),
             enabled_layer_count: 0,
             pp_enabled_layer_names: ptr::null(),
             enabled_extension_count: 0,
@@ -326,12 +337,21 @@ impl VulkanInstance {
             cmd_reset_query_pool: self.load_device(device, "vkCmdResetQueryPool")?,
             cmd_write_timestamp: self.load_device(device, "vkCmdWriteTimestamp")?,
             get_query_pool_results: self.load_device(device, "vkGetQueryPoolResults")?,
+            create_semaphore: self.load_device(device, "vkCreateSemaphore")?,
+            destroy_semaphore: self.load_device(device, "vkDestroySemaphore")?,
         };
 
         let mut queue = 0usize;
         unsafe {
             (functions.get_device_queue)(device, queue_family_index, 0, &mut queue);
         }
+        let transfer_queue = transfer_family.map(|family| {
+            let mut transfer_queue = 0usize;
+            unsafe {
+                (functions.get_device_queue)(device, family, 0, &mut transfer_queue);
+            }
+            transfer_queue
+        });
         let mut memory_properties =
             unsafe { std::mem::zeroed::<VkPhysicalDeviceMemoryProperties>() };
         unsafe {
@@ -341,6 +361,7 @@ impl VulkanInstance {
         Ok(VulkanDevice {
             device,
             queue,
+            transfer_queue,
             functions,
             memory_properties,
         })

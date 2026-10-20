@@ -18,6 +18,15 @@ impl VulkanDeviceSummary {
             .filter(|family| family.compute)
             .min_by_key(|family| family.graphics)
     }
+
+    /// A transfer-only family (the copy engine on discrete GPUs), preferring ones with
+    /// timestamp support.
+    pub fn dedicated_transfer_queue_family(&self) -> Option<&VulkanQueueFamilySummary> {
+        self.queue_families
+            .iter()
+            .filter(|family| family.transfer && !family.compute && !family.graphics && !family.video)
+            .min_by_key(|family| family.timestamp_valid_bits == 0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +72,8 @@ pub struct VulkanQueueFamilySummary {
     pub graphics: bool,
     pub compute: bool,
     pub transfer: bool,
+    /// Video decode or encode queue.
+    pub video: bool,
     /// Meaningful bits in timestamps written on this family; 0 means no timestamp support.
     pub timestamp_valid_bits: u32,
 }
@@ -104,6 +115,15 @@ struct VulkanComputeContext {
 
 fn create_compute_context() -> Result<(VulkanComputeContext, VulkanDeviceSummary, u32), VulkanError>
 {
+    let (context, summary, queue_family_index, _) = create_compute_context_with_transfer(false)?;
+    Ok((context, summary, queue_family_index))
+}
+
+/// Like `create_compute_context`; with `want_transfer`, also creates a queue on a dedicated
+/// transfer family when the device has one, and returns that family.
+fn create_compute_context_with_transfer(
+    want_transfer: bool,
+) -> Result<(VulkanComputeContext, VulkanDeviceSummary, u32, Option<u32>), VulkanError> {
     let loader = VulkanLoader::open()?;
     let instance = loader.create_instance()?;
     let (physical_device, summary) = instance.select_compute_device()?;
@@ -111,7 +131,13 @@ fn create_compute_context() -> Result<(VulkanComputeContext, VulkanDeviceSummary
         .first_compute_queue_family()
         .ok_or_else(|| VulkanError::new("selected Vulkan device has no compute queue"))?
         .index;
-    let device = instance.create_compute_device(physical_device, queue_family_index)?;
+    let transfer_family = if want_transfer {
+        summary.dedicated_transfer_queue_family().map(|family| family.index)
+    } else {
+        None
+    };
+    let device =
+        instance.create_compute_device(physical_device, queue_family_index, transfer_family)?;
     Ok((
         VulkanComputeContext {
             device,
@@ -120,6 +146,7 @@ fn create_compute_context() -> Result<(VulkanComputeContext, VulkanDeviceSummary
         },
         summary,
         queue_family_index,
+        transfer_family,
     ))
 }
 
@@ -2524,6 +2551,7 @@ impl ReusableRgb48Packer {
         component_planes: &[ReusableScatteredIdwt53Component],
         color_transform: u32,
         precision: u8,
+        sharing_families: &[u32],
     ) -> Result<Self, VulkanError> {
         if component_planes.len() != 3 {
             return Err(VulkanError::new(format!(
@@ -2550,10 +2578,20 @@ impl ReusableRgb48Packer {
             };
             outputs.push(output.descriptor_info());
         }
-        Self::from_component_outputs(device, program, &outputs, width, height, color_transform, precision)
+        Self::from_component_outputs(
+            device,
+            program,
+            &outputs,
+            width,
+            height,
+            color_transform,
+            precision,
+            sharing_families,
+        )
     }
 
-    /// Packs three `width x height` row-major i32 component planes, bound as given.
+    /// Packs three `width x height` row-major i32 component planes, bound as given. The output
+    /// and staging buffers are shared by `sharing_families` (e.g. compute and transfer queues).
     fn from_component_outputs(
         device: &VulkanDevice,
         program: &StorageComputeProgram,
@@ -2562,6 +2600,7 @@ impl ReusableRgb48Packer {
         height: u32,
         color_transform: u32,
         precision: u8,
+        sharing_families: &[u32],
     ) -> Result<Self, VulkanError> {
         if component_outputs.len() != 3 {
             return Err(VulkanError::new(format!(
@@ -2584,12 +2623,17 @@ impl ReusableRgb48Packer {
         let pixel_pair_count = sample_count.div_ceil(2);
         let packed_output_count = pixel_pair_count * 3;
         let output_byte_len = bytes_len::<u32>(packed_output_count)?;
-        let output_buffer = device.create_device_local_buffer(
+        let output_buffer = device.create_device_local_shared_buffer(
             output_byte_len,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            sharing_families,
         )?;
-        let staging_buffer =
-            device.create_host_cached_buffer(output_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+        let staging_buffer = device.create_buffer_shared(
+            output_byte_len,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+            sharing_families,
+        )?;
         let mut descriptors = component_outputs.to_vec();
         descriptors.push(output_buffer.descriptor_info());
         let descriptor_pool = device.create_descriptor_pool(4, 1)?;
@@ -2666,6 +2710,8 @@ const TIER1_THREAD_PER_CODEBLOCK_GROUP_SIZE: u32 = 128;
 const MIN_MAX_COMPUTE_WORKGROUP_COUNT: usize = 65_535;
 /// Start, after upload, after Tier-1, after scatter, after IDWT, after color, after readback.
 const TIER1_PIPELINE_TIMESTAMP_QUERIES: u32 = 7;
+/// Plus start and end of the readback on the transfer queue, when it runs there.
+const TIER1_PIPELINE_TRANSFER_TIMESTAMP_QUERIES: u32 = 9;
 
 pub struct VulkanTier1Rgb48PipelineConfig<'a> {
     pub cleanup_shader_path: &'a str,
@@ -2693,6 +2739,8 @@ pub struct VulkanTier1Rgb48PipelineConfig<'a> {
     pub cpu_coefficient_capacity: usize,
     /// Record GPU timestamps around each pipeline stage (ignored if the queue lacks them).
     pub gpu_timestamps: bool,
+    /// Copy RGB48 output to host memory on a dedicated transfer queue, when the device has one.
+    pub transfer_queue: bool,
 }
 
 /// GPU time of one submitted batch, split by pipeline stage (whole batch, not per frame).
@@ -2714,18 +2762,22 @@ impl Tier1GpuStageTimes {
             + self.readback_copy_ms
     }
 
-    /// `ticks` holds the `TIER1_PIPELINE_TIMESTAMP_QUERIES` stage boundaries in order.
-    fn from_ticks(ticks: &[u64], valid_mask: u64, period_ns: f64) -> Self {
-        let ms = |index: usize| {
-            (ticks[index + 1].wrapping_sub(ticks[index]) & valid_mask) as f64 * period_ns / 1e6
+    /// `ticks` holds the stage boundaries in query order. With `transfer_mask`, the readback ran
+    /// on the transfer queue and is timed by queries 7 and 8 (masked by that family's bits).
+    fn from_ticks(ticks: &[u64], valid_mask: u64, period_ns: f64, transfer_mask: Option<u64>) -> Self {
+        let ms = |index: usize, mask: u64| {
+            (ticks[index + 1].wrapping_sub(ticks[index]) & mask) as f64 * period_ns / 1e6
         };
         Self {
-            upload_ms: ms(0),
-            tier1_ms: ms(1),
-            scatter_ms: ms(2),
-            idwt_ms: ms(3),
-            color_ms: ms(4),
-            readback_copy_ms: ms(5),
+            upload_ms: ms(0, valid_mask),
+            tier1_ms: ms(1, valid_mask),
+            scatter_ms: ms(2, valid_mask),
+            idwt_ms: ms(3, valid_mask),
+            color_ms: ms(4, valid_mask),
+            readback_copy_ms: match transfer_mask {
+                Some(mask) => ms(7, mask),
+                None => ms(5, valid_mask),
+            },
         }
     }
 }
@@ -2760,6 +2812,8 @@ pub struct VulkanTier1Rgb48Pipeline {
     scatter_push: Tier1ScatterSmokePushConstants,
     scatter_groups: [u32; 3],
     timestamp_mask: u64,
+    /// Set when readback runs on the transfer queue and that queue records timestamps.
+    transfer_timestamp_mask: Option<u64>,
     timestamp_period_ns: f64,
     slots: Vec<PipelineSlot>,
     _scatter_records_buffer: HostBuffer,
@@ -2814,6 +2868,15 @@ struct PipelineSlot {
     pending_frames: usize,
     query_pool: Option<QueryPoolHandle>,
     last_stage_times: Option<Tier1GpuStageTimes>,
+    transfer: Option<SlotTransfer>,
+}
+
+/// Readback on a dedicated transfer queue: its own command buffer, started by a semaphore the
+/// compute submission signals, so the copy overlaps the next batch's compute work.
+struct SlotTransfer {
+    _command_pool: CommandPoolHandle,
+    command_buffer: VkCommandBuffer,
+    semaphore: SemaphoreHandle,
 }
 
 #[repr(C)]
@@ -3058,7 +3121,12 @@ impl PipelineSlot {
         batch_frames: usize,
         flat_stride: u64,
         timestamps: bool,
+        transfer_family: Option<u32>,
     ) -> Result<Self, VulkanError> {
+        // Buffers the transfer queue reads or writes are shared with the compute family.
+        let sharing_families = transfer_family
+            .map(|family| vec![queue_family_index, family])
+            .unwrap_or_default();
         let record_count = batch_frames * config.codeblock_count;
         let records_bytes = bytes_len::<crate::gpu::GpuTier1CodeblockRecord>(record_count)?;
         let compressed_bytes = bytes_len::<u32>(batch_frames * config.compressed_word_capacity)?;
@@ -3126,6 +3194,7 @@ impl PipelineSlot {
                         fused.height,
                         config.color_transform,
                         config.precision,
+                        &sharing_families,
                     )?;
                     (FrameIdwt::Fused(fused), packer)
                 }
@@ -3149,6 +3218,7 @@ impl PipelineSlot {
                         &components,
                         config.color_transform,
                         config.precision,
+                        &sharing_families,
                     )?;
                     (FrameIdwt::Separable(components), packer)
                 }
@@ -3178,9 +3248,21 @@ impl PipelineSlot {
         let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
         let fence = device.create_fence()?;
         let query_pool = if timestamps {
-            Some(device.create_timestamp_query_pool(TIER1_PIPELINE_TIMESTAMP_QUERIES)?)
+            Some(device.create_timestamp_query_pool(TIER1_PIPELINE_TRANSFER_TIMESTAMP_QUERIES)?)
         } else {
             None
+        };
+        let transfer = match transfer_family {
+            Some(family) => {
+                let command_pool = device.create_resettable_command_pool(family)?;
+                let command_buffer = device.allocate_command_buffer(command_pool.handle)?;
+                Some(SlotTransfer {
+                    _command_pool: command_pool,
+                    command_buffer,
+                    semaphore: device.create_semaphore()?,
+                })
+            }
+            None => None,
         };
         Ok(Self {
             staging,
@@ -3200,6 +3282,7 @@ impl PipelineSlot {
             pending_frames: 0,
             query_pool,
             last_stage_times: None,
+            transfer,
         })
     }
 }
@@ -3312,7 +3395,8 @@ impl VulkanTier1Rgb48Pipeline {
             .map(read_spirv)
             .transpose()?;
         let color_spirv = read_spirv(config.color_shader_path)?;
-        let (context, summary, queue_family_index) = create_compute_context()?;
+        let (context, summary, queue_family_index, transfer_family) =
+            create_compute_context_with_transfer(config.transfer_queue)?;
         let device = &context.device;
         let setup_start = std::time::Instant::now();
         let programs = Tier1PipelinePrograms {
@@ -3382,11 +3466,18 @@ impl VulkanTier1Rgb48Pipeline {
         if config.gpu_timestamps && !timestamps {
             eprintln!("GPU Tier-1 pipeline: queue family has no timestamp support, timing disabled");
         }
-        let timestamp_mask = if timestamp_valid_bits >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << timestamp_valid_bits).wrapping_sub(1)
-        };
+        let mask_for_bits = |bits: u32| if bits >= 64 { u64::MAX } else { (1u64 << bits).wrapping_sub(1) };
+        let timestamp_mask = mask_for_bits(timestamp_valid_bits);
+        // Readback on the transfer queue is only timed when that family supports timestamps.
+        let transfer_timestamp_mask = transfer_family.filter(|_| timestamps).and_then(|family| {
+            let bits = summary
+                .queue_families
+                .iter()
+                .find(|candidate| candidate.index == family)
+                .map(|candidate| candidate.timestamp_valid_bits)
+                .unwrap_or(0);
+            (bits > 0).then(|| mask_for_bits(bits))
+        });
         let slots = loop {
             let attempt = (0..2)
                 .map(|_| {
@@ -3399,6 +3490,7 @@ impl VulkanTier1Rgb48Pipeline {
                         batch_frames,
                         flat_stride,
                         timestamps,
+                        transfer_family,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>();
@@ -3436,6 +3528,7 @@ impl VulkanTier1Rgb48Pipeline {
                 1,
             ],
             timestamp_mask,
+            transfer_timestamp_mask,
             timestamp_period_ns: f64::from(summary.timestamp_period),
             slots,
             _scatter_records_buffer: scatter_records_buffer,
@@ -3468,6 +3561,11 @@ impl VulkanTier1Rgb48Pipeline {
     /// Whether frames use the fused 2D IDWT rather than the separable one.
     pub fn fused_idwt(&self) -> bool {
         self.programs.idwt53_fused.is_some()
+    }
+
+    /// Whether RGB48 readback runs on a dedicated transfer queue.
+    pub fn transfer_readback(&self) -> bool {
+        self.slots.iter().any(|slot| slot.transfer.is_some())
     }
 
     /// Per-stage GPU time of the batch last read from `slot_index`, when timestamps are on.
@@ -3683,21 +3781,57 @@ impl VulkanTier1Rgb48Pipeline {
             tier1_dispatches + frames.len() * (chain_len - 1),
             tier1_dispatches + frames.len() * chain_len,
         ];
+        let transfer_timestamps = slot.transfer.is_some() && self.transfer_timestamp_mask.is_some();
         let marks = slot.query_pool.as_ref().map(|pool| TimestampMarks {
             pool,
             after_dispatches: &stage_ends,
+            // The transfer queue cannot reset queries, so its two are reset here.
+            reset_queries: if transfer_timestamps {
+                TIER1_PIPELINE_TRANSFER_TIMESTAMP_QUERIES
+            } else {
+                TIER1_PIPELINE_TIMESTAMP_QUERIES
+            },
         });
 
         let device = &self.context.device;
-        device.record_storage_dispatches_with_region_copies(
-            slot.command_buffer,
-            &leading_copies,
-            &dispatches,
-            &readback_copies,
-            marks.as_ref(),
-        )?;
         device.reset_fence(slot.fence.handle)?;
-        device.submit_with_fence(slot.command_buffer, slot.fence.handle)?;
+        match (&slot.transfer, device.transfer_queue) {
+            (Some(transfer), Some(transfer_queue)) => {
+                device.record_storage_dispatches_with_region_copies(
+                    slot.command_buffer,
+                    &leading_copies,
+                    &dispatches,
+                    &[],
+                    marks.as_ref(),
+                )?;
+                let readback_marks = slot
+                    .query_pool
+                    .as_ref()
+                    .filter(|_| transfer_timestamps)
+                    .map(|pool| (pool, TIER1_PIPELINE_TIMESTAMP_QUERIES, TIER1_PIPELINE_TIMESTAMP_QUERIES + 1));
+                device.record_readback_copies(transfer.command_buffer, &readback_copies, readback_marks)?;
+                // The semaphore makes the color pass's writes visible to the copies; buffers are
+                // shared concurrently, so no ownership transfer is needed.
+                device.submit_on(device.queue, slot.command_buffer, None, Some(transfer.semaphore.handle), 0)?;
+                device.submit_on(
+                    transfer_queue,
+                    transfer.command_buffer,
+                    Some((transfer.semaphore.handle, VK_PIPELINE_STAGE_TRANSFER_BIT)),
+                    None,
+                    slot.fence.handle,
+                )?;
+            }
+            _ => {
+                device.record_storage_dispatches_with_region_copies(
+                    slot.command_buffer,
+                    &leading_copies,
+                    &dispatches,
+                    &readback_copies,
+                    marks.as_ref(),
+                )?;
+                device.submit_with_fence(slot.command_buffer, slot.fence.handle)?;
+            }
+        }
         self.slots[slot_index].pending_frames = frames.len();
         Ok(())
     }
@@ -3722,14 +3856,18 @@ impl VulkanTier1Rgb48Pipeline {
         let wait_ms = wait_start.elapsed().as_secs_f64() * 1000.0;
         slot.last_stage_times = match slot.query_pool.as_ref() {
             Some(pool) => {
-                let ticks = self
-                    .context
-                    .device
-                    .read_timestamps(pool, TIER1_PIPELINE_TIMESTAMP_QUERIES)?;
+                let transfer_mask = self.transfer_timestamp_mask.filter(|_| slot.transfer.is_some());
+                let query_count = if transfer_mask.is_some() {
+                    TIER1_PIPELINE_TRANSFER_TIMESTAMP_QUERIES
+                } else {
+                    TIER1_PIPELINE_TIMESTAMP_QUERIES
+                };
+                let ticks = self.context.device.read_timestamps(pool, query_count)?;
                 Some(Tier1GpuStageTimes::from_ticks(
                     &ticks,
                     self.timestamp_mask,
                     self.timestamp_period_ns,
+                    transfer_mask,
                 ))
             }
             None => None,
@@ -3873,6 +4011,7 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench(
             &idwt_components,
             color_transform,
             precision,
+            &[],
         )?;
         let cleanup_push = Tier1CleanupSmokePushConstants {
             codeblock_count: cleanup_records.len() as u32,
@@ -4106,7 +4245,7 @@ pub fn run_tier1_cleanup_scatter_rgb48_bench_97(
 
         // Color packer (float version)
         let rgb48_packer = ReusableRgb48Packer::new(
-            device, &color_program, &idwt_components, color_transform, precision,
+            device, &color_program, &idwt_components, color_transform, precision, &[],
         )?;
 
         // Descriptor sets for cleanup, scatter, dequant
