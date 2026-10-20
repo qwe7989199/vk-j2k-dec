@@ -2531,6 +2531,44 @@ impl ReusableRgb48Packer {
                 component_planes.len()
             )));
         }
+        let width = component_planes[0].width;
+        let height = component_planes[0].height;
+        for (index, plane) in component_planes.iter().enumerate() {
+            if plane.width != width || plane.height != height {
+                return Err(VulkanError::new(format!(
+                    "GPU integer color component {index} has {}x{}, expected {}x{}",
+                    plane.width, plane.height, width, height
+                )));
+            }
+        }
+        let mut outputs = Vec::with_capacity(3);
+        for (index, plane) in component_planes.iter().enumerate() {
+            let Some(output) = plane.levels.last().map(|level| &level.output_buffer) else {
+                return Err(VulkanError::new(format!(
+                    "GPU integer color component {index} has no IDWT output buffer"
+                )));
+            };
+            outputs.push(output.descriptor_info());
+        }
+        Self::from_component_outputs(device, program, &outputs, width, height, color_transform, precision)
+    }
+
+    /// Packs three `width x height` row-major i32 component planes, bound as given.
+    fn from_component_outputs(
+        device: &VulkanDevice,
+        program: &StorageComputeProgram,
+        component_outputs: &[VkDescriptorBufferInfo],
+        width: u32,
+        height: u32,
+        color_transform: u32,
+        precision: u8,
+    ) -> Result<Self, VulkanError> {
+        if component_outputs.len() != 3 {
+            return Err(VulkanError::new(format!(
+                "GPU integer color conversion requires 3 component planes, got {}",
+                component_outputs.len()
+            )));
+        }
         if color_transform > 1 {
             return Err(VulkanError::new(format!(
                 "GPU integer color conversion supports only none/RCT, got mode {color_transform}"
@@ -2541,17 +2579,7 @@ impl ReusableRgb48Packer {
                 "GPU integer color conversion cannot pack precision {precision}"
             )));
         }
-        let width = component_planes[0].width;
-        let height = component_planes[0].height;
         let sample_count = checked_plane_len(width, height)?;
-        for (index, plane) in component_planes.iter().enumerate() {
-            if plane.width != width || plane.height != height {
-                return Err(VulkanError::new(format!(
-                    "GPU integer color component {index} has {}x{}, expected {}x{}",
-                    plane.width, plane.height, width, height
-                )));
-            }
-        }
         let output_count = sample_count * 3;
         let pixel_pair_count = sample_count.div_ceil(2);
         let packed_output_count = pixel_pair_count * 3;
@@ -2562,15 +2590,7 @@ impl ReusableRgb48Packer {
         )?;
         let staging_buffer =
             device.create_host_cached_buffer(output_byte_len, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
-        let mut descriptors = Vec::with_capacity(4);
-        for (index, plane) in component_planes.iter().enumerate() {
-            let Some(output) = plane.levels.last().map(|level| &level.output_buffer) else {
-                return Err(VulkanError::new(format!(
-                    "GPU integer color component {index} has no IDWT output buffer"
-                )));
-            };
-            descriptors.push(output.descriptor_info());
-        }
+        let mut descriptors = component_outputs.to_vec();
         descriptors.push(output_buffer.descriptor_info());
         let descriptor_pool = device.create_descriptor_pool(4, 1)?;
         let descriptor_set =
@@ -2654,6 +2674,9 @@ pub struct VulkanTier1Rgb48PipelineConfig<'a> {
     pub thread_per_codeblock: bool,
     pub scatter_shader_path: &'a str,
     pub idwt53_shader_path: &'a str,
+    /// One-dispatch-per-level 2D IDWT; used instead of `idwt53_shader_path` when all
+    /// components share subband geometry.
+    pub idwt53_fused_shader_path: Option<&'a str>,
     pub color_shader_path: &'a str,
     pub codeblock_count: usize,
     pub compressed_word_capacity: usize,
@@ -2748,6 +2771,8 @@ struct Tier1PipelinePrograms {
     cleanup: StorageComputeProgram,
     scatter: StorageComputeProgram,
     idwt53: StorageComputeProgram,
+    /// Set when a fused shader was given and the subband layout allows it.
+    idwt53_fused: Option<StorageComputeProgram>,
     color: StorageComputeProgram,
 }
 
@@ -2791,12 +2816,235 @@ struct PipelineSlot {
     last_stage_times: Option<Tier1GpuStageTimes>,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Idwt53FusedPushConstants {
+    low_width: u32,
+    low_height: u32,
+    high_width: u32,
+    high_height: u32,
+    ll_stride: u32,
+    hl_stride: u32,
+    lh_stride: u32,
+    hh_stride: u32,
+    ll_offsets: [u32; 3],
+    hl_offsets: [u32; 3],
+    lh_offsets: [u32; 3],
+    hh_offsets: [u32; 3],
+    out_offsets: [u32; 3],
+}
+
+/// Output tile edge of `idwt53_fused_2d.comp.glsl`.
+const IDWT53_FUSED_TILE: u32 = 32;
+
+/// Whether all three components share subband geometry at every level, as the fused 5/3 IDWT
+/// (one dispatch per level for all components) requires.
+fn fused_idwt53_eligible(planes: &[crate::gpu::GpuTier1ScatterPlane], target_resolution: u8) -> bool {
+    let components = scattered_component_ids(planes);
+    if components.len() != 3 || target_resolution == 0 {
+        return false;
+    }
+    let extent = |component: u16, resolution: u8, subband: SubbandKind| {
+        require_scattered_plane(planes, component, resolution, subband)
+            .ok()
+            .map(|plane| (plane.width, plane.height))
+    };
+    (0..=target_resolution).all(|resolution| {
+        let subbands: &[SubbandKind] = if resolution == 0 {
+            &[SubbandKind::Ll]
+        } else {
+            &[SubbandKind::Hl, SubbandKind::Lh, SubbandKind::Hh]
+        };
+        subbands.iter().all(|subband| {
+            let first = extent(components[0], resolution, *subband);
+            first.is_some()
+                && components
+                    .iter()
+                    .all(|component| extent(*component, resolution, *subband) == first)
+        })
+    })
+}
+
+/// Every level of the 5/3 IDWT for one frame as one dispatch per level over all three
+/// components. Levels ping-pong between two buffers holding the components at
+/// `component * component_stride`.
+struct FusedIdwt53Levels {
+    width: u32,
+    height: u32,
+    component_stride: u64,
+    final_buffer: usize,
+    pipeline: VkPipeline,
+    pipeline_layout: VkPipelineLayout,
+    descriptor_sets: Vec<VkDescriptorSet>,
+    pushes: Vec<Idwt53FusedPushConstants>,
+    groups: Vec<[u32; 3]>,
+    buffers: [HostBuffer; 2],
+    _descriptor_pool: DescriptorPoolHandle,
+}
+
+impl FusedIdwt53Levels {
+    fn new(
+        device: &VulkanDevice,
+        program: &StorageComputeProgram,
+        plane_buffer: &HostBuffer,
+        planes: &[crate::gpu::GpuTier1ScatterPlane],
+        target_resolution: u8,
+    ) -> Result<Self, VulkanError> {
+        if !fused_idwt53_eligible(planes, target_resolution) {
+            return Err(VulkanError::new(
+                "fused GPU IDWT requires three components with identical subband geometry",
+            ));
+        }
+        let components = scattered_component_ids(planes);
+        let plane = |component: u16, resolution: u8, subband: SubbandKind| {
+            require_scattered_plane(planes, component, resolution, subband)
+        };
+        let ll = components
+            .iter()
+            .map(|component| plane(*component, 0, SubbandKind::Ll))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // (low width, low height, [HL, LH, HH] per component) for each level.
+        let mut levels = Vec::with_capacity(target_resolution as usize);
+        let (mut width, mut height) = (ll[0].width, ll[0].height);
+        for resolution in 1..=target_resolution {
+            let bands = components
+                .iter()
+                .map(|component| {
+                    Ok([
+                        plane(*component, resolution, SubbandKind::Hl)?,
+                        plane(*component, resolution, SubbandKind::Lh)?,
+                        plane(*component, resolution, SubbandKind::Hh)?,
+                    ])
+                })
+                .collect::<Result<Vec<_>, VulkanError>>()?;
+            let [hl, lh, hh] = bands[0];
+            if lh.width != width || hl.height != height {
+                return Err(VulkanError::new(format!(
+                    "GPU fused IDWT r{resolution} low/high dimensions do not match current {width}x{height}: HL {}x{}, LH {}x{}",
+                    hl.width, hl.height, lh.width, lh.height
+                )));
+            }
+            if hh.width != hl.width || hh.height != lh.height {
+                return Err(VulkanError::new(format!(
+                    "GPU fused IDWT r{resolution} HH dimensions {}x{} do not match HL/LH high extents {}x{}",
+                    hh.width, hh.height, hl.width, lh.height
+                )));
+            }
+            levels.push((width, height, bands));
+            width += hl.width;
+            height += lh.height;
+        }
+
+        // Component regions start on 256-byte boundaries so the color pass can bind each one
+        // through a descriptor offset.
+        let component_stride = checked_plane_len(width, height)?.next_multiple_of(64);
+        let stride = u32::try_from(component_stride)
+            .ok()
+            .filter(|stride| stride.checked_mul(3).is_some())
+            .ok_or_else(|| VulkanError::new("GPU fused IDWT planes exceed u32 offsets"))?;
+        let out_offsets = [0, stride, 2 * stride];
+        let buffers = [
+            create_empty_device_buffer::<i32>(device, 3 * component_stride)?,
+            create_empty_device_buffer::<i32>(device, 3 * component_stride)?,
+        ];
+        let descriptor_pool =
+            device.create_descriptor_pool(3 * levels.len() as u32, levels.len() as u32)?;
+        let mut descriptor_sets = Vec::with_capacity(levels.len());
+        let mut pushes = Vec::with_capacity(levels.len());
+        let mut groups = Vec::with_capacity(levels.len());
+        for (index, (low_width, low_height, bands)) in levels.iter().enumerate() {
+            let [hl, lh, hh] = bands[0];
+            let offsets = |band: usize| [bands[0][band].plane_offset, bands[1][band].plane_offset, bands[2][band].plane_offset];
+            let ll_source = if index == 0 { plane_buffer } else { &buffers[(index - 1) % 2] };
+            pushes.push(Idwt53FusedPushConstants {
+                low_width: *low_width,
+                low_height: *low_height,
+                high_width: hl.width,
+                high_height: lh.height,
+                ll_stride: *low_width,
+                hl_stride: hl.width,
+                lh_stride: lh.width,
+                hh_stride: hh.width,
+                ll_offsets: if index == 0 {
+                    [ll[0].plane_offset, ll[1].plane_offset, ll[2].plane_offset]
+                } else {
+                    out_offsets
+                },
+                hl_offsets: offsets(0),
+                lh_offsets: offsets(1),
+                hh_offsets: offsets(2),
+                out_offsets,
+            });
+            let descriptor_set = device
+                .allocate_descriptor_set(descriptor_pool.handle, program.descriptor_set_layout.handle)?;
+            device.update_storage_descriptor_set(
+                descriptor_set,
+                &[
+                    ll_source.descriptor_info(),
+                    plane_buffer.descriptor_info(),
+                    buffers[index % 2].descriptor_info(),
+                ],
+            );
+            descriptor_sets.push(descriptor_set);
+            groups.push([
+                (low_width + hl.width).div_ceil(IDWT53_FUSED_TILE),
+                (low_height + lh.height).div_ceil(IDWT53_FUSED_TILE),
+                3,
+            ]);
+        }
+        Ok(Self {
+            width,
+            height,
+            component_stride: component_stride as u64,
+            final_buffer: (levels.len() - 1) % 2,
+            pipeline: program.pipeline.handle,
+            pipeline_layout: program.pipeline_layout.handle,
+            descriptor_sets,
+            pushes,
+            groups,
+            buffers,
+            _descriptor_pool: descriptor_pool,
+        })
+    }
+
+    /// Reconstructed plane of `component` (0..3), `width x height` row-major.
+    fn output(&self, component: usize) -> VkDescriptorBufferInfo {
+        self.buffers[self.final_buffer].descriptor_info_range(
+            component as u64 * self.component_stride * 4,
+            u64::from(self.width) * u64::from(self.height) * 4,
+        )
+    }
+
+    fn extend_storage_dispatches<'a>(&'a self, dispatches: &mut Vec<StorageDispatch<'a>>) {
+        for ((push, descriptor_set), groups) in
+            self.pushes.iter().zip(&self.descriptor_sets).zip(&self.groups)
+        {
+            dispatches.push(StorageDispatch {
+                pipeline: self.pipeline,
+                pipeline_layout: self.pipeline_layout,
+                descriptor_set: *descriptor_set,
+                push_constants: bytes_of(push),
+                groups: *groups,
+                no_barrier_before: false,
+            });
+        }
+    }
+}
+
+enum FrameIdwt {
+    /// Three 1D passes per component and level (`idwt53_offset_1d`).
+    Separable(Vec<ReusableScatteredIdwt53Component>),
+    /// One 2D pass per level for all components (`idwt53_fused_2d`).
+    Fused(FusedIdwt53Levels),
+}
+
 /// Per-frame scatter/IDWT/color resources; the frame's Tier-1 coefficients live in the slot's
 /// batched coefficient buffer at `frame_index * flat_stride`.
 struct PipelineFrameStage {
     scatter_descriptor_set: VkDescriptorSet,
     rgb48_packer: ReusableRgb48Packer,
-    idwt_components: Vec<ReusableScatteredIdwt53Component>,
+    idwt: FrameIdwt,
     _plane_buffer: HostBuffer,
 }
 
@@ -2861,26 +3109,50 @@ impl PipelineSlot {
         for frame_index in 0..batch_frames {
             let plane_buffer =
                 device.create_device_local_buffer(plane_byte_len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)?;
-            let idwt_components = component_ids
-                .iter()
-                .map(|component| {
-                    ReusableScatteredIdwt53Component::new(
+            let (idwt, rgb48_packer) = match programs.idwt53_fused.as_ref() {
+                Some(fused_program) => {
+                    let fused = FusedIdwt53Levels::new(
                         device,
-                        &programs.idwt53,
+                        fused_program,
                         &plane_buffer,
                         config.scatter_planes,
-                        *component,
                         config.target_resolution,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let rgb48_packer = ReusableRgb48Packer::new(
-                device,
-                &programs.color,
-                &idwt_components,
-                config.color_transform,
-                config.precision,
-            )?;
+                    )?;
+                    let packer = ReusableRgb48Packer::from_component_outputs(
+                        device,
+                        &programs.color,
+                        &[fused.output(0), fused.output(1), fused.output(2)],
+                        fused.width,
+                        fused.height,
+                        config.color_transform,
+                        config.precision,
+                    )?;
+                    (FrameIdwt::Fused(fused), packer)
+                }
+                None => {
+                    let components = component_ids
+                        .iter()
+                        .map(|component| {
+                            ReusableScatteredIdwt53Component::new(
+                                device,
+                                &programs.idwt53,
+                                &plane_buffer,
+                                config.scatter_planes,
+                                *component,
+                                config.target_resolution,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let packer = ReusableRgb48Packer::new(
+                        device,
+                        &programs.color,
+                        &components,
+                        config.color_transform,
+                        config.precision,
+                    )?;
+                    (FrameIdwt::Separable(components), packer)
+                }
+            };
             let scatter_descriptor_set = device.allocate_descriptor_set(
                 scatter_descriptor_pool.handle,
                 programs.scatter.descriptor_set_layout.handle,
@@ -2897,7 +3169,7 @@ impl PipelineSlot {
             frames.push(PipelineFrameStage {
                 scatter_descriptor_set,
                 rgb48_packer,
-                idwt_components,
+                idwt,
                 _plane_buffer: plane_buffer,
             });
         }
@@ -3034,6 +3306,11 @@ impl VulkanTier1Rgb48Pipeline {
         let cleanup_spirv = read_spirv(config.cleanup_shader_path)?;
         let scatter_spirv = read_spirv(config.scatter_shader_path)?;
         let idwt53_spirv = read_spirv(config.idwt53_shader_path)?;
+        let idwt53_fused_spirv = config
+            .idwt53_fused_shader_path
+            .filter(|_| fused_idwt53_eligible(config.scatter_planes, config.target_resolution))
+            .map(read_spirv)
+            .transpose()?;
         let color_spirv = read_spirv(config.color_shader_path)?;
         let (context, summary, queue_family_index) = create_compute_context()?;
         let device = &context.device;
@@ -3057,6 +3334,17 @@ impl VulkanTier1Rgb48Pipeline {
                 3,
                 std::mem::size_of::<Idwt53OffsetPushConstants>() as u32,
             )?,
+            idwt53_fused: idwt53_fused_spirv
+                .as_ref()
+                .map(|spirv| {
+                    StorageComputeProgram::new(
+                        device,
+                        spirv,
+                        3,
+                        std::mem::size_of::<Idwt53FusedPushConstants>() as u32,
+                    )
+                })
+                .transpose()?,
             color: StorageComputeProgram::new(
                 device,
                 &color_spirv,
@@ -3175,6 +3463,11 @@ impl VulkanTier1Rgb48Pipeline {
 
     pub fn slot_count(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Whether frames use the fused 2D IDWT rather than the separable one.
+    pub fn fused_idwt(&self) -> bool {
+        self.programs.idwt53_fused.is_some()
     }
 
     /// Per-stage GPU time of the batch last read from `slot_index`, when timestamps are on.
@@ -3350,8 +3643,13 @@ impl VulkanTier1Rgb48Pipeline {
                     groups: self.scatter_groups,
                     no_barrier_before: false,
                 }];
-                for component in &stage.idwt_components {
-                    component.extend_storage_dispatches(&self.programs.idwt53, &mut chain);
+                match &stage.idwt {
+                    FrameIdwt::Separable(components) => {
+                        for component in components {
+                            component.extend_storage_dispatches(&self.programs.idwt53, &mut chain);
+                        }
+                    }
+                    FrameIdwt::Fused(levels) => levels.extend_storage_dispatches(&mut chain),
                 }
                 stage
                     .rgb48_packer

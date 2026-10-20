@@ -667,6 +667,12 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         thread_per_codeblock,
         scatter_shader_path,
         idwt53_shader_path,
+        // VK_J2K_IDWT=separable keeps the three-pass-per-component IDWT (A/B testing).
+        idwt53_fused_shader_path: if std::env::var("VK_J2K_IDWT").is_ok_and(|mode| mode == "separable") {
+            None
+        } else {
+            first_existing(&[r"target\shaders\idwt53_fused_2d.comp.spv"])
+        },
         color_shader_path,
         codeblock_count,
         compressed_word_capacity,
@@ -753,6 +759,7 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         cleanup_shader_path,
         if thread_per_codeblock { "thread-per-codeblock" } else { "warp-per-codeblock" }
     );
+    println!("  idwt {}", if pipeline.fused_idwt() { "fused 2d" } else { "separable 1d" });
     println!("  ffmpeg_demux_ms {:.3}", demux_ms);
     println!("  read_frames_ms {:.3}", read_total_ms);
     println!("  pipeline_setup_ms {:.3}", pipeline.setup_ms());

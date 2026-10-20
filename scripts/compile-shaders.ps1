@@ -21,6 +21,7 @@ $shaders = @(
     @{ Source = "shaders\dequant.comp.glsl"; Output = "dequant.comp.spv" },
     @{ Source = "shaders\idwt53_1d.comp.glsl"; Output = "idwt53_1d.comp.spv" },
     @{ Source = "shaders\idwt53_offset_1d.comp.glsl"; Output = "idwt53_offset_1d.comp.spv" },
+    @{ Source = "shaders\idwt53_fused_2d.comp.glsl"; Output = "idwt53_fused_2d.comp.spv" },
     @{ Source = "shaders\idwt97_1d.comp.glsl"; Output = "idwt97_1d.comp.spv" },
     @{ Source = "shaders\color_convert.comp.glsl"; Output = "color_convert.comp.spv" },
     @{ Source = "shaders\color_convert_i32.comp.glsl"; Output = "color_convert_i32.comp.spv" },
