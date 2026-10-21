@@ -530,7 +530,8 @@ impl VulkanDecoder {
             cpu_coefficient_capacity: 0,
             // VK_J2K_GPU_TIMING=1 records per-stage GPU timestamps.
             gpu_timestamps: std::env::var_os("VK_J2K_GPU_TIMING").is_some(),
-            transfer_queue: true,
+            // VK_J2K_TRANSFER_QUEUE=0 keeps the readback copy on the compute queue (A/B testing).
+            transfer_queue: !std::env::var("VK_J2K_TRANSFER_QUEUE").is_ok_and(|mode| mode == "0"),
             export_rgb48: false,
             scatter_dequant_scales: scales.as_deref(),
         })
