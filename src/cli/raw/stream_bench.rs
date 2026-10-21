@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_void};
 use std::io::{BufReader, Write};
 use std::ptr;
+use std::sync::mpsc;
 use vk_j2k_dec::mxf::{MAX_FRAME_BYTES, MxfFrameReader};
 
 pub fn benchmark_mxf_stream(
@@ -154,27 +155,43 @@ fn run(
         .ok_or("MXF has no picture frames")?;
     let stream = Codestream::parse(&first).map_err(|e| e.to_string())?;
     let siz = stream.siz.as_ref().ok_or("missing SIZ")?;
+    let (width, height) = (siz.width, siz.height);
     let precision = siz.components.first().ok_or("missing component")?.precision;
-    let samples = siz.width as usize * siz.height as usize * 3;
-    let mut decoder = match backend {
-        "vulkan" => Backend::Vulkan(VulkanDecoder::new(&first, requested_batch)?),
-        _ => Backend::Nv(NvDecoder::new(
-            siz.width,
-            siz.height,
-            precision,
-            requested_batch,
-            samples,
-        )?),
+    let samples = width as usize * height as usize * 3;
+    let (mut decoder, prepare) = match backend {
+        "vulkan" => {
+            let (decoder, prepare) = VulkanDecoder::new(&first, requested_batch)?;
+            (Backend::Vulkan(decoder), Some(prepare))
+        }
+        _ => (
+            Backend::Nv(NvDecoder::new(width, height, precision, requested_batch, samples)?),
+            None,
+        ),
+    };
+    // Vulkan frames are parsed on worker threads ahead of the GPU; nvJPEG2000 parses inside its
+    // own submit, so one pass-through worker is enough there. VK_J2K_PREPARE_THREADS overrides.
+    let prepare_threads = if prepare.is_some() {
+        env_usize("VK_J2K_PREPARE_THREADS")
+            .filter(|threads| *threads > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(1, |threads| threads.get())
+                    .saturating_sub(2)
+                    .clamp(1, 4)
+            })
+    } else {
+        1
     };
     let batch_size = decoder.batch_size();
     let setup_ms = elapsed_ms(start);
     println!("bench-mxf-stream: backend {backend}, input {input}");
     println!("  device {}", decoder.device_name());
     println!(
-        "  format {}x{} {}-bit -> RGB48LE, sink {output}, raw_host_readback enabled",
-        siz.width, siz.height, precision
+        "  format {width}x{height} {precision}-bit -> RGB48LE, sink {output}, raw_host_readback enabled"
     );
-    println!("  demux MXF KLV sequential, batch {batch_size}, slots 2, cpu_codeblocks_per_frame 0");
+    println!(
+        "  demux MXF KLV sequential on a reader thread, prepare_threads {prepare_threads}, batch {batch_size}, slots 2, cpu_codeblocks_per_frame 0"
+    );
     println!(
         "  frame_limit {limit} (0=EOF), hash {}",
         if sink.hash.is_some() {
@@ -183,50 +200,96 @@ fn run(
             "disabled"
         }
     );
+    let prepare_frame = |frame: Vec<u8>| match &prepare {
+        Some(prepare) => {
+            prepare_stream_frame(&frame, &prepare.layout, &prepare.template, &prepare.scatter)
+                .map(PreparedFrame::Plan)
+        }
+        None => Ok(PreparedFrame::Raw(frame)),
+    };
     let loop_start = Instant::now();
-    let mut initial = Some(first);
-    let mut pending = VecDeque::new();
-    let mut batch_index = 0;
-    let mut submitted = 0;
-    let mut read_ms = 0.0;
-    let mut prepare_submit_ms = 0.0;
+    let mut prepare_wait_ms = 0.0;
+    let mut submit_ms = 0.0;
     let mut wait_write_ms = 0.0;
-    loop {
-        let read_start = Instant::now();
-        let mut frames = Vec::with_capacity(batch_size);
-        while frames.len() < batch_size && (limit == 0 || submitted + frames.len() < limit) {
-            let next = match initial.take() {
-                Some(frame) => Some(frame),
-                None => source.next_frame().map_err(|e| e.to_string())?,
-            };
-            match next {
-                Some(frame) => frames.push(frame),
-                None => break,
+    let (submitted, essence_bytes) = std::thread::scope(|scope| -> Result<(usize, u64), String> {
+        let mut inputs = Vec::with_capacity(prepare_threads);
+        let mut outputs = Vec::with_capacity(prepare_threads);
+        for _ in 0..prepare_threads {
+            let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(1);
+            let (output_tx, output_rx) = mpsc::sync_channel(2);
+            let prepare_frame = &prepare_frame;
+            scope.spawn(move || {
+                for frame in input_rx {
+                    if output_tx.send(prepare_frame(frame)).is_err() {
+                        break;
+                    }
+                }
+            });
+            inputs.push(input_tx);
+            outputs.push(output_rx);
+        }
+        // Frame i goes to worker i % n, so reading the workers in turn restores frame order.
+        // The reader dropping `inputs` (EOF, frame limit or read error) ends the workers.
+        let reader = scope.spawn(move || -> Result<u64, String> {
+            let mut initial = Some(first);
+            let mut index = 0;
+            while limit == 0 || index < limit {
+                let next = match initial.take() {
+                    Some(frame) => Some(frame),
+                    None => source.next_frame().map_err(|e| e.to_string())?,
+                };
+                let Some(frame) = next else { break };
+                if inputs[index % inputs.len()].send(frame).is_err() {
+                    break; // the main loop stopped early
+                }
+                index += 1;
             }
-        }
-        read_ms += elapsed_ms(read_start);
-        if frames.is_empty() {
-            break;
-        }
-        let slot = batch_index % 2;
-        if pending.len() == 2 {
-            let (old_slot, count) = pending.pop_front().unwrap();
+            Ok(source.essence_bytes)
+        });
+
+        let mut pending = VecDeque::new();
+        let mut batch_index = 0;
+        let mut submitted = 0;
+        loop {
             let wait_start = Instant::now();
-            decoder.consume(old_slot, count, &mut sink)?;
+            let mut frames = Vec::with_capacity(batch_size);
+            while frames.len() < batch_size {
+                match outputs[submitted % outputs.len()].recv() {
+                    Ok(frame) => {
+                        frames.push(frame?);
+                        submitted += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            prepare_wait_ms += elapsed_ms(wait_start);
+            if frames.is_empty() {
+                break;
+            }
+            let slot = batch_index % 2;
+            if pending.len() == 2 {
+                let (old_slot, count) = pending.pop_front().unwrap();
+                let wait_start = Instant::now();
+                decoder.consume(old_slot, count, &mut sink)?;
+                wait_write_ms += elapsed_ms(wait_start);
+            }
+            let submit_start = Instant::now();
+            decoder.submit(slot, &frames)?;
+            submit_ms += elapsed_ms(submit_start);
+            pending.push_back((slot, frames.len()));
+            batch_index += 1;
+        }
+        for (slot, count) in pending {
+            let wait_start = Instant::now();
+            decoder.consume(slot, count, &mut sink)?;
             wait_write_ms += elapsed_ms(wait_start);
         }
-        let submit_start = Instant::now();
-        decoder.submit(slot, &frames)?;
-        prepare_submit_ms += elapsed_ms(submit_start);
-        submitted += frames.len();
-        pending.push_back((slot, frames.len()));
-        batch_index += 1;
-    }
-    for (slot, count) in pending {
-        let wait_start = Instant::now();
-        decoder.consume(slot, count, &mut sink)?;
-        wait_write_ms += elapsed_ms(wait_start);
-    }
+        drop(outputs);
+        let essence_bytes = reader
+            .join()
+            .map_err(|_| "MXF reader thread panicked".to_string())??;
+        Ok((submitted, essence_bytes))
+    })?;
     sink.file.flush().map_err(|e| e.to_string())?;
     if submitted != sink.frames || (limit != 0 && submitted != limit) {
         return Err(format!(
@@ -257,10 +320,10 @@ fn run(
     let total_ms = elapsed_ms(start);
     println!(
         "  frames {} output_bytes {} essence_bytes {}",
-        sink.frames, sink.bytes, source.essence_bytes
+        sink.frames, sink.bytes, essence_bytes
     );
     println!(
-        "  setup_ms {setup_ms:.3} read_ms {read_ms:.3} prepare_submit_ms {prepare_submit_ms:.3} wait_write_ms {wait_write_ms:.3}"
+        "  setup_ms {setup_ms:.3} prepare_wait_ms {prepare_wait_ms:.3} submit_ms {submit_ms:.3} wait_write_ms {wait_write_ms:.3}"
     );
     println!(
         "  stream_loop_ms {loop_ms:.3} fps {:.3}",
@@ -274,6 +337,14 @@ fn run(
         println!("  frames_hash {hash:016x}");
     }
     Ok(())
+}
+
+/// A frame ready for `Backend::submit`.
+enum PreparedFrame {
+    /// Compressed codestream, for nvJPEG2000.
+    Raw(Vec<u8>),
+    /// Parsed, template-aligned Tier-1 work, for the Vulkan pipeline.
+    Plan(FastTier1Rgb48Frame),
 }
 
 enum Backend {
@@ -293,11 +364,27 @@ impl Backend {
             Self::Nv(n) => n.device.clone(),
         }
     }
-    fn submit(&mut self, slot: usize, frames: &[Vec<u8>]) -> Result<(), String> {
+    fn submit(&mut self, slot: usize, frames: &[PreparedFrame]) -> Result<(), String> {
         match self {
-            Self::Vulkan(v) => v.submit(slot, frames),
+            Self::Vulkan(v) => {
+                let batch = frames
+                    .iter()
+                    .map(|frame| match frame {
+                        PreparedFrame::Plan(plan) => Ok(Tier1BatchFrame {
+                            gpu_records: &plan.records,
+                            compressed_words: &plan.compressed_words,
+                            cpu_codeblocks: &[],
+                        }),
+                        PreparedFrame::Raw(_) => Err("Vulkan backend got an unparsed frame".to_string()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                v.pipeline.submit_batch(slot, &batch).map_err(|e| e.to_string())
+            }
             Self::Nv(n) => {
                 for (i, frame) in frames.iter().enumerate() {
+                    let PreparedFrame::Raw(frame) = frame else {
+                        return Err("nvJPEG2000 backend got a parsed frame".into());
+                    };
                     if unsafe {
                         (n.submit)(
                             n.session,
@@ -350,10 +437,14 @@ struct VulkanDecoder {
     pipeline: VulkanTier1Rgb48Pipeline,
     /// (frames, stage times) per read batch, with VK_J2K_GPU_TIMING=1.
     gpu_times: Vec<(usize, Tier1GpuStageTimes)>,
+}
+
+/// What the prepare workers need to turn a codestream into a submittable plan.
+struct StreamPrepare {
+    /// First frame's layout and quantization (records and words dropped); every frame must match.
+    layout: FastTier1Rgb48Frame,
     template: Vec<GpuTier1CodeblockRecord>,
     scatter: Vec<GpuTier1ScatterRecord>,
-    layout: FastTier1Rgb48Frame,
-    first: Option<FastTier1Rgb48Frame>,
 }
 
 /// The stream template comes from geometry, not the first frame's nonzero blocks.
@@ -439,19 +530,15 @@ fn complete_template(
     Ok((records, scatter, offset as usize))
 }
 
-/// Parses one frame (or takes the already parsed first frame), checks it against the stream
-/// layout and aligns its records to the template, ready for `submit_batch`.
+/// Parses one frame, checks it against the stream layout and aligns its records to the
+/// template, ready for `submit_batch`.
 fn prepare_stream_frame(
     frame: &[u8],
-    parsed: Option<FastTier1Rgb48Frame>,
     layout: &FastTier1Rgb48Frame,
     template: &[GpuTier1CodeblockRecord],
     scatter: &[GpuTier1ScatterRecord],
 ) -> Result<FastTier1Rgb48Frame, String> {
-    let mut plan = match parsed {
-        Some(plan) => plan,
-        None => build_fast_tier1_rgb48_frame(frame)?,
-    };
+    let mut plan = build_fast_tier1_rgb48_frame(frame)?;
     if plan.scatter_plan.planes != layout.scatter_plan.planes
         || plan.target_resolution != layout.target_resolution
         || plan.color_transform != layout.color_transform
@@ -468,7 +555,7 @@ fn prepare_stream_frame(
 }
 
 impl VulkanDecoder {
-    fn new(data: &[u8], batch: usize) -> Result<Self, String> {
+    fn new(data: &[u8], batch: usize) -> Result<(Self, StreamPrepare), String> {
         let mut layout = build_fast_tier1_rgb48_frame(data)?;
         let (template, scatter, flat_count) = complete_template(data, &layout)?;
         align_tier1_records_to_template(&template, &scatter, &mut layout)?;
@@ -536,58 +623,21 @@ impl VulkanDecoder {
             scatter_dequant_scales: scales.as_deref(),
         })
         .map_err(|e| e.to_string())?;
-        // Keep only the metadata/template after first-frame submission, not any movie-wide plan.
-        let first = FastTier1Rgb48Frame {
-            records: std::mem::take(&mut layout.records),
-            compressed_words: std::mem::take(&mut layout.compressed_words),
-            flat_coefficient_count: layout.flat_coefficient_count,
-            scatter_plan: layout.scatter_plan.clone(),
-            target_resolution: layout.target_resolution,
-            color_transform: layout.color_transform,
-            precision: layout.precision,
-            codeblock_style: layout.codeblock_style,
-            transform: layout.transform,
-            qcd: layout.qcd.clone(),
-            qccs: layout.qccs.clone(),
-        };
-        Ok(Self {
-            pipeline,
-            gpu_times: Vec::new(),
-            template,
-            scatter,
-            layout,
-            first: Some(first),
-        })
-    }
-
-    fn submit(&mut self, slot: usize, frames: &[Vec<u8>]) -> Result<(), String> {
-        // Frames are independent: parse and plan each one on its own thread.
-        let (layout, template, scatter) = (&self.layout, &self.template, &self.scatter);
-        let mut first = self.first.take();
-        let plans = std::thread::scope(|scope| {
-            let handles = frames
-                .iter()
-                .map(|frame| {
-                    let parsed = first.take();
-                    scope.spawn(move || prepare_stream_frame(frame, parsed, layout, template, scatter))
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().map_err(|_| "frame prepare thread panicked".to_string())?)
-                .collect::<Result<Vec<_>, String>>()
-        })?;
-        let batch = plans
-            .iter()
-            .map(|p| Tier1BatchFrame {
-                gpu_records: &p.records,
-                compressed_words: &p.compressed_words,
-                cpu_codeblocks: &[],
-            })
-            .collect::<Vec<_>>();
-        self.pipeline
-            .submit_batch(slot, &batch)
-            .map_err(|e| e.to_string())
+        // Workers only compare frames against the layout; the first frame is parsed again by
+        // them like any other, so its records and words are not kept.
+        layout.records = Vec::new();
+        layout.compressed_words = Vec::new();
+        Ok((
+            Self {
+                pipeline,
+                gpu_times: Vec::new(),
+            },
+            StreamPrepare {
+                layout,
+                template,
+                scatter,
+            },
+        ))
     }
 }
 
