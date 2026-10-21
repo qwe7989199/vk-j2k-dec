@@ -2747,6 +2747,8 @@ pub struct VulkanTier1Rgb48PipelineConfig<'a> {
     /// One-dispatch-per-level 2D IDWT; used instead of `idwt53_shader_path` when all
     /// components share subband geometry.
     pub idwt53_fused_shader_path: Option<&'a str>,
+    /// Output tile (width, height) one workgroup of the fused shader reconstructs.
+    pub idwt53_fused_tile: [u32; 2],
     pub color_shader_path: &'a str,
     pub codeblock_count: usize,
     pub compressed_word_capacity: usize,
@@ -2930,8 +2932,6 @@ struct Idwt53FusedPushConstants {
     out_offsets: [u32; 3],
 }
 
-/// Output tile edge of `idwt53_fused_2d.comp.glsl`.
-const IDWT53_FUSED_TILE: u32 = 32;
 
 /// Whether all three components share subband geometry at every level, as the fused 5/3 IDWT
 /// (one dispatch per level for all components) requires.
@@ -2985,7 +2985,11 @@ impl FusedIdwt53Levels {
         plane_buffer: &HostBuffer,
         planes: &[crate::gpu::GpuTier1ScatterPlane],
         target_resolution: u8,
+        tile: [u32; 2],
     ) -> Result<Self, VulkanError> {
+        if tile.contains(&0) {
+            return Err(VulkanError::new("fused GPU IDWT tile must be non-empty"));
+        }
         if !fused_idwt53_eligible(planes, target_resolution) {
             return Err(VulkanError::new(
                 "fused GPU IDWT requires three components with identical subband geometry",
@@ -3084,8 +3088,8 @@ impl FusedIdwt53Levels {
             );
             descriptor_sets.push(descriptor_set);
             groups.push([
-                (low_width + hl.width).div_ceil(IDWT53_FUSED_TILE),
-                (low_height + lh.height).div_ceil(IDWT53_FUSED_TILE),
+                (low_width + hl.width).div_ceil(tile[0]),
+                (low_height + lh.height).div_ceil(tile[1]),
                 3,
             ]);
         }
@@ -3221,6 +3225,7 @@ impl PipelineSlot {
                         &plane_buffer,
                         config.scatter_planes,
                         config.target_resolution,
+                        config.idwt53_fused_tile,
                     )?;
                     let packer = ReusableRgb48Packer::from_component_outputs(
                         device,

@@ -765,10 +765,11 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         idwt53_fused_shader_path: if std::env::var("VK_J2K_IDWT").is_ok_and(|mode| mode == "separable") {
             None
         } else if is_97 {
-            first_existing(&[r"target\shaders\idwt97_fused_2d.comp.spv"])
+            first_existing(&[IDWT97_FUSED_SHADER])
         } else {
-            first_existing(&[r"target\shaders\idwt53_fused_2d.comp.spv"])
+            first_existing(&[IDWT53_FUSED_SHADER])
         },
+        idwt53_fused_tile: IDWT_FUSED_TILE,
         color_shader_path,
         codeblock_count,
         compressed_word_capacity,
@@ -955,6 +956,11 @@ const TIER1_THREAD_SHADERS: &[&str] = &[
     r"target\shaders\tier1_cleanup_smoke_16.comp.spv",
 ];
 const TIER1_MAX_CPU_CODEBLOCKS_PER_FRAME: usize = 256;
+const IDWT53_FUSED_SHADER: &str = r"target\shaders\idwt53_fused_2d.comp.spv";
+const IDWT97_FUSED_SHADER: &str = r"target\shaders\idwt97_fused_2d.comp.spv";
+/// Output tile of both fused IDWT shaders (64x32, 32x64 and 64x64 measured slower for 9/7).
+const IDWT_FUSED_TILE: [u32; 2] = [32, 32];
+
 /// `tier1_packed` built with its column words in shared memory, 256 words per codeblock.
 const TIER1_PACKED_SHARED_SHADER: &str = r"target\shaders\tier1_packed_shared256.comp.spv";
 const TIER1_PACKED_SHARED_WORDS: u32 = 256;

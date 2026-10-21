@@ -597,10 +597,11 @@ impl VulkanDecoder {
             idwt53_fused_shader_path: if std::env::var("VK_J2K_IDWT").is_ok_and(|mode| mode == "separable") {
                 None
             } else if is_97 {
-                Some(r"target\shaders\idwt97_fused_2d.comp.spv")
+                Some(IDWT97_FUSED_SHADER)
             } else {
-                Some(r"target\shaders\idwt53_fused_2d.comp.spv")
+                Some(IDWT53_FUSED_SHADER)
             },
+            idwt53_fused_tile: IDWT_FUSED_TILE,
             color_shader_path: if is_97 {
                 r"target\shaders\color_convert_f32_packed.comp.spv"
             } else {

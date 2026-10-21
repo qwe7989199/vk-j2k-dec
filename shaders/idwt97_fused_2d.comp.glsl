@@ -2,14 +2,26 @@
 
 // One level of the irreversible 9/7 inverse DWT for three components in a single dispatch.
 //
-// Each workgroup reconstructs a 32x32 output tile of one component (gl_WorkGroupID.z): it stages
-// the LL/HL/LH/HH samples the tile depends on (including the lifting halo) in shared memory,
-// runs the horizontal lifting for every row the tile needs, then the vertical lifting. Each
-// lifting step updates one parity in place from the other, so a step reads values the previous
-// step finished. The float formulas, the K scaling of high samples and the edge clamping are
-// those of idwt97_offset_1d.comp.glsl (horizontal pass, then vertical).
+// Each workgroup reconstructs a TILE_X x TILE_Y output tile of one component (gl_WorkGroupID.z):
+// it stages the LL/HL/LH/HH samples the tile depends on (including the lifting halo) in shared
+// memory, reconstructs every staged row horizontally, then the tile's columns vertically. Each
+// work item produces one low/high output pair straight from the staged samples, running all four
+// lifting steps on a small register window (lows k-1..k+2, highs k-2..k+2), so a pass needs no
+// barrier between steps. Pairs whose window crosses a band edge use the clamped formulas instead.
+// The float formulas, the K scaling of high samples and the edge clamping are those of
+// idwt97_offset_1d.comp.glsl (horizontal pass, then vertical).
 //
 // Subbands start at even coordinates (low sample first), as in idwt97_offset_1d.
+//
+// TILE_X / TILE_Y default to 32 and must be even; the host dispatches
+// ceil(width / TILE_X) x ceil(height / TILE_Y) x 3 workgroups.
+
+#ifndef TILE_X
+#define TILE_X 32u
+#endif
+#ifndef TILE_Y
+#define TILE_Y 32u
+#endif
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -59,21 +71,29 @@ const float DWT97_GAMMA = 0.8829111;
 const float DWT97_DELTA = 0.44350687;
 const float DWT97_K = 1.2301741;
 
-const uint TILE = 32u;
 const uint THREADS = 256u;
 // A tile of 2n output samples starting at low index a needs low samples a-1..a+n+1 and high
 // samples a-2..a+n+1 along each axis (four lifting steps, one sample of reach each).
-const uint LOW_SLOTS = TILE / 2u + 3u;
-const uint HIGH_SLOTS = TILE / 2u + 4u;
+const uint LOW_X = TILE_X / 2u + 3u;
+const uint HIGH_X = TILE_X / 2u + 4u;
+const uint LOW_Y = TILE_Y / 2u + 3u;
+const uint HIGH_Y = TILE_Y / 2u + 4u;
 const int LOW_BASE = -1;
 const int HIGH_BASE = -2;
-// Staged rows: LOW_SLOTS rows from LL/HL (vertical lows), then HIGH_SLOTS rows from LH/HH.
-const uint ROWS = LOW_SLOTS + HIGH_SLOTS;
+// Staged rows: LOW_Y rows from LL/HL (vertical lows), then HIGH_Y rows from LH/HH.
+const uint ROWS = LOW_Y + HIGH_Y;
+const uint HIGH_ROW0 = LOW_Y * TILE_X;
+const uint PAIRS_X = TILE_X / 2u;
+const uint PAIRS_Y = TILE_Y / 2u;
 
-shared float s_low[ROWS * LOW_SLOTS];
-shared float s_high[ROWS * HIGH_SLOTS];
+shared float s_low[ROWS * LOW_X];
+shared float s_high[ROWS * HIGH_X];
 // Horizontally reconstructed rows, one entry per tile column, in the same row order.
-shared float s_rows[ROWS * TILE];
+shared float s_rows[ROWS * TILE_X];
+
+// First low sample of the tile along x / y.
+uint ax;
+uint ay;
 
 uint pick(uint c, uint v0, uint v1, uint v2) {
     return c == 0u ? v0 : (c == 1u ? v1 : v2);
@@ -84,7 +104,7 @@ uint slot_index(uint slot, uint origin, int base, uint count) {
     return uint(clamp(int(origin) + base + int(slot), 0, int(count) - 1));
 }
 
-// Slot of band index `index` (always inside the staged range for the slots a step reads).
+// Slot of band index `index` (always inside the staged range for the samples a pair reads).
 uint low_slot(uint index, uint origin) {
     return uint(int(index) - int(origin) - LOW_BASE);
 }
@@ -94,25 +114,95 @@ uint high_slot(uint index, uint origin) {
 }
 
 // High neighbours of low sample `index`: index-1 (index 0 uses 0) and index, clamped to the band.
-uvec2 high_neighbor_slots(uint index, uint high_count, uint origin) {
-    uint left = index == 0u ? 0u : min(index - 1u, high_count - 1u);
-    uint right = min(index, high_count - 1u);
-    return uvec2(high_slot(left, origin), high_slot(right, origin));
+uvec2 high_neighbors(uint index, uint high_count) {
+    return uvec2(index == 0u ? 0u : min(index - 1u, high_count - 1u), min(index, high_count - 1u));
 }
 
 // Low neighbours of high sample `index` (already clamped): index and index+1, clamped.
-uvec2 low_neighbor_slots(uint index, uint low_count, uint origin) {
-    return uvec2(low_slot(index, origin), low_slot(min(index + 1u, low_count - 1u), origin));
+uvec2 low_neighbors(uint index, uint low_count) {
+    return uvec2(index, min(index + 1u, low_count - 1u));
+}
+
+// All four lifting steps for the output pair at index k, from lows k-1..k+2 and highs k-2..k+2
+// with no clamping inside the window. Returns (low k, high k).
+vec2 lift_pair(float l0, float l1, float l2, float l3, float h0, float h1, float h2, float h3, float h4) {
+    float d0 = l0 - DWT97_DELTA * (h0 * DWT97_K + h1 * DWT97_K);
+    float d1 = l1 - DWT97_DELTA * (h1 * DWT97_K + h2 * DWT97_K);
+    float d2 = l2 - DWT97_DELTA * (h2 * DWT97_K + h3 * DWT97_K);
+    float d3 = l3 - DWT97_DELTA * (h3 * DWT97_K + h4 * DWT97_K);
+    float g0 = h1 * DWT97_K - DWT97_GAMMA * (d0 + d1);
+    float g1 = h2 * DWT97_K - DWT97_GAMMA * (d1 + d2);
+    float g2 = h3 * DWT97_K - DWT97_GAMMA * (d2 + d3);
+    float b0 = d1 - DWT97_BETA * (g0 + g1);
+    float b1 = d2 - DWT97_BETA * (g1 + g2);
+    return vec2(b0, g1 - DWT97_ALPHA * (b0 + b1));
+}
+
+// Clamped lifting along a staged row r, for pairs near a band edge. Indices are band indices.
+float row_low(uint r, uint index) {
+    return s_low[r * LOW_X + low_slot(index, ax)];
+}
+
+float row_high(uint r, uint index) {
+    return s_high[r * HIGH_X + high_slot(index, ax)] * DWT97_K;
+}
+
+float row_delta(uint r, uint index) {
+    uvec2 h = high_neighbors(index, pc.high_width);
+    return row_low(r, index) - DWT97_DELTA * (row_high(r, h.x) + row_high(r, h.y));
+}
+
+float row_gamma(uint r, uint index) {
+    uvec2 l = low_neighbors(index, pc.low_width);
+    return row_high(r, index) - DWT97_GAMMA * (row_delta(r, l.x) + row_delta(r, l.y));
+}
+
+float row_beta(uint r, uint index) {
+    uvec2 h = high_neighbors(index, pc.high_width);
+    return row_delta(r, index) - DWT97_BETA * (row_gamma(r, h.x) + row_gamma(r, h.y));
+}
+
+float row_alpha(uint r, uint index) {
+    uvec2 l = low_neighbors(index, pc.low_width);
+    return row_gamma(r, index) - DWT97_ALPHA * (row_beta(r, l.x) + row_beta(r, l.y));
+}
+
+// The same down tile column `col` of the reconstructed rows.
+float col_low(uint index, uint col) {
+    return s_rows[low_slot(index, ay) * TILE_X + col];
+}
+
+float col_high(uint index, uint col) {
+    return s_rows[HIGH_ROW0 + high_slot(index, ay) * TILE_X + col] * DWT97_K;
+}
+
+float col_delta(uint index, uint col) {
+    uvec2 h = high_neighbors(index, pc.high_height);
+    return col_low(index, col) - DWT97_DELTA * (col_high(h.x, col) + col_high(h.y, col));
+}
+
+float col_gamma(uint index, uint col) {
+    uvec2 l = low_neighbors(index, pc.low_height);
+    return col_high(index, col) - DWT97_GAMMA * (col_delta(l.x, col) + col_delta(l.y, col));
+}
+
+float col_beta(uint index, uint col) {
+    uvec2 h = high_neighbors(index, pc.high_height);
+    return col_delta(index, col) - DWT97_BETA * (col_gamma(h.x, col) + col_gamma(h.y, col));
+}
+
+float col_alpha(uint index, uint col) {
+    uvec2 l = low_neighbors(index, pc.low_height);
+    return col_gamma(index, col) - DWT97_ALPHA * (col_beta(l.x, col) + col_beta(l.y, col));
 }
 
 void main() {
     uint component = gl_WorkGroupID.z;
-    uint x0 = gl_WorkGroupID.x * TILE;
-    uint y0 = gl_WorkGroupID.y * TILE;
+    uint x0 = gl_WorkGroupID.x * TILE_X;
+    uint y0 = gl_WorkGroupID.y * TILE_Y;
     uint out_width = pc.low_width + pc.high_width;
-    uint out_height = pc.low_height + pc.high_height;
-    uint ax = x0 >> 1u;
-    uint ay = y0 >> 1u;
+    ax = x0 >> 1u;
+    ay = y0 >> 1u;
     uint lid = gl_LocalInvocationIndex;
 
     uint ll_offset = pick(component, pc.ll_offset0, pc.ll_offset1, pc.ll_offset2);
@@ -123,134 +213,80 @@ void main() {
 
     bool has_high_x = pc.high_width > 0u;
     bool has_high_y = pc.high_height > 0u;
-    uint rows = has_high_y ? ROWS : LOW_SLOTS;
+    uint rows = has_high_y ? ROWS : LOW_Y;
 
-    for (uint i = lid; i < rows * LOW_SLOTS; i += THREADS) {
-        uint r = i / LOW_SLOTS;
-        uint col = slot_index(i % LOW_SLOTS, ax, LOW_BASE, pc.low_width);
-        s_low[i] = r < LOW_SLOTS
+    for (uint i = lid; i < rows * LOW_X; i += THREADS) {
+        uint r = i / LOW_X;
+        uint col = slot_index(i % LOW_X, ax, LOW_BASE, pc.low_width);
+        s_low[i] = r < LOW_Y
             ? ll_band[ll_offset + slot_index(r, ay, LOW_BASE, pc.low_height) * pc.ll_stride + col]
-            : planes[lh_offset + slot_index(r - LOW_SLOTS, ay, HIGH_BASE, pc.high_height) * pc.lh_stride + col];
+            : planes[lh_offset + slot_index(r - LOW_Y, ay, HIGH_BASE, pc.high_height) * pc.lh_stride + col];
     }
     if (has_high_x) {
-        for (uint i = lid; i < rows * HIGH_SLOTS; i += THREADS) {
-            uint r = i / HIGH_SLOTS;
-            uint col = slot_index(i % HIGH_SLOTS, ax, HIGH_BASE, pc.high_width);
-            s_high[i] = r < LOW_SLOTS
+        for (uint i = lid; i < rows * HIGH_X; i += THREADS) {
+            uint r = i / HIGH_X;
+            uint col = slot_index(i % HIGH_X, ax, HIGH_BASE, pc.high_width);
+            s_high[i] = r < LOW_Y
                 ? planes[hl_offset + slot_index(r, ay, LOW_BASE, pc.low_height) * pc.hl_stride + col]
-                : planes[hh_offset + slot_index(r - LOW_SLOTS, ay, HIGH_BASE, pc.high_height) * pc.hh_stride + col];
+                : planes[hh_offset + slot_index(r - LOW_Y, ay, HIGH_BASE, pc.high_height) * pc.hh_stride + col];
         }
     }
     barrier();
 
-    // Horizontal lifting. Without high samples every step leaves the lows unchanged.
-    if (has_high_x) {
-        // Delta: lows from K-scaled highs, every low slot.
-        for (uint i = lid; i < rows * LOW_SLOTS; i += THREADS) {
-            uint r = i / LOW_SLOTS;
-            uint index = slot_index(i % LOW_SLOTS, ax, LOW_BASE, pc.low_width);
-            uvec2 h = high_neighbor_slots(index, pc.high_width, ax);
-            float left = s_high[r * HIGH_SLOTS + h.x] * DWT97_K;
-            float right = s_high[r * HIGH_SLOTS + h.y] * DWT97_K;
-            s_low[i] = s_low[i] - DWT97_DELTA * (left + right);
-        }
-        barrier();
-        // Gamma: highs, slots 1..HIGH_SLOTS-2.
-        for (uint i = lid; i < rows * (HIGH_SLOTS - 2u); i += THREADS) {
-            uint r = i / (HIGH_SLOTS - 2u);
-            uint slot = i % (HIGH_SLOTS - 2u) + 1u;
-            uint index = slot_index(slot, ax, HIGH_BASE, pc.high_width);
-            uvec2 l = low_neighbor_slots(index, pc.low_width, ax);
-            float high = s_high[r * HIGH_SLOTS + slot] * DWT97_K;
-            s_high[r * HIGH_SLOTS + slot] =
-                high - DWT97_GAMMA * (s_low[r * LOW_SLOTS + l.x] + s_low[r * LOW_SLOTS + l.y]);
-        }
-        barrier();
-        // Beta: lows, slots 1..LOW_SLOTS-2.
-        for (uint i = lid; i < rows * (LOW_SLOTS - 2u); i += THREADS) {
-            uint r = i / (LOW_SLOTS - 2u);
-            uint slot = i % (LOW_SLOTS - 2u) + 1u;
-            uint index = slot_index(slot, ax, LOW_BASE, pc.low_width);
-            uvec2 h = high_neighbor_slots(index, pc.high_width, ax);
-            uint s = r * LOW_SLOTS + slot;
-            s_low[s] = s_low[s] - DWT97_BETA * (s_high[r * HIGH_SLOTS + h.x] + s_high[r * HIGH_SLOTS + h.y]);
-        }
-        barrier();
-    }
-
-    // Horizontal alpha step and interleave: every tile column of each staged row.
-    for (uint i = lid; i < rows * TILE; i += THREADS) {
-        uint r = i / TILE;
-        uint x = x0 + i % TILE;
-        float value = 0.0;
-        if (x < out_width) {
-            uint index = x >> 1u;
-            if ((x & 1u) == 0u) {
-                value = s_low[r * LOW_SLOTS + low_slot(index, ax)];
+    // Horizontal: output pair (columns 2k, 2k+1) of every staged row. Columns past the band are
+    // zero. Without high samples the lows pass through unchanged.
+    for (uint i = lid; i < rows * PAIRS_X; i += THREADS) {
+        uint r = i / PAIRS_X;
+        uint pair = i % PAIRS_X;
+        uint k = ax + pair;
+        vec2 value = vec2(0.0);
+        if (k < pc.low_width) {
+            if (!has_high_x) {
+                value.x = row_low(r, k);
+            } else if (k >= 2u && k + 2u < pc.high_width) {
+                uint l = r * LOW_X + low_slot(k, ax);
+                uint h = r * HIGH_X + high_slot(k, ax);
+                value = lift_pair(s_low[l - 1u], s_low[l], s_low[l + 1u], s_low[l + 2u],
+                    s_high[h - 2u], s_high[h - 1u], s_high[h], s_high[h + 1u], s_high[h + 2u]);
             } else {
-                uvec2 l = low_neighbor_slots(index, pc.low_width, ax);
-                float high = s_high[r * HIGH_SLOTS + high_slot(index, ax)];
-                value = high - DWT97_ALPHA * (s_low[r * LOW_SLOTS + l.x] + s_low[r * LOW_SLOTS + l.y]);
+                value.x = row_beta(r, k);
+                if (k < pc.high_width) {
+                    value.y = row_alpha(r, k);
+                }
             }
         }
-        s_rows[i] = value;
+        s_rows[r * TILE_X + 2u * pair] = value.x;
+        s_rows[r * TILE_X + 2u * pair + 1u] = value.y;
     }
     barrier();
 
-    // Vertical lifting on the reconstructed rows: low rows first, then high rows.
-    const uint HIGH_ROW0 = LOW_SLOTS * TILE;
-    if (has_high_y) {
-        for (uint i = lid; i < LOW_SLOTS * TILE; i += THREADS) {
-            uint col = i % TILE;
-            uint index = slot_index(i / TILE, ay, LOW_BASE, pc.low_height);
-            uvec2 h = high_neighbor_slots(index, pc.high_height, ay);
-            float top = s_rows[HIGH_ROW0 + h.x * TILE + col] * DWT97_K;
-            float bottom = s_rows[HIGH_ROW0 + h.y * TILE + col] * DWT97_K;
-            s_rows[i] = s_rows[i] - DWT97_DELTA * (top + bottom);
+    // Vertical: output pair (rows 2k, 2k+1) of every tile column, written out.
+    for (uint i = lid; i < PAIRS_Y * TILE_X; i += THREADS) {
+        uint col = i % TILE_X;
+        uint k = ay + i / TILE_X;
+        uint x = x0 + col;
+        if (x >= out_width || k >= pc.low_height) {
+            continue;
         }
-        barrier();
-        for (uint i = lid; i < (HIGH_SLOTS - 2u) * TILE; i += THREADS) {
-            uint col = i % TILE;
-            uint slot = i / TILE + 1u;
-            uint index = slot_index(slot, ay, HIGH_BASE, pc.high_height);
-            uvec2 l = low_neighbor_slots(index, pc.low_height, ay);
-            uint s = HIGH_ROW0 + slot * TILE + col;
-            float high = s_rows[s] * DWT97_K;
-            s_rows[s] = high - DWT97_GAMMA * (s_rows[l.x * TILE + col] + s_rows[l.y * TILE + col]);
-        }
-        barrier();
-        for (uint i = lid; i < (LOW_SLOTS - 2u) * TILE; i += THREADS) {
-            uint col = i % TILE;
-            uint slot = i / TILE + 1u;
-            uint index = slot_index(slot, ay, LOW_BASE, pc.low_height);
-            uvec2 h = high_neighbor_slots(index, pc.high_height, ay);
-            uint s = slot * TILE + col;
-            s_rows[s] = s_rows[s]
-                - DWT97_BETA * (s_rows[HIGH_ROW0 + h.x * TILE + col] + s_rows[HIGH_ROW0 + h.y * TILE + col]);
-        }
-        barrier();
-    }
-
-    // Vertical alpha step and output.
-    uint tx = gl_LocalInvocationID.x;
-    uint ty = gl_LocalInvocationID.y;
-    for (uint dy = 0u; dy < TILE; dy += 16u) {
-        uint y = y0 + ty + dy;
-        for (uint dx = 0u; dx < TILE; dx += 16u) {
-            uint col = tx + dx;
-            uint x = x0 + col;
-            if (x < out_width && y < out_height) {
-                uint index = y >> 1u;
-                float value;
-                if ((y & 1u) == 0u) {
-                    value = s_rows[low_slot(index, ay) * TILE + col];
-                } else {
-                    uvec2 l = low_neighbor_slots(index, pc.low_height, ay);
-                    float high = s_rows[HIGH_ROW0 + high_slot(index, ay) * TILE + col];
-                    value = high - DWT97_ALPHA * (s_rows[l.x * TILE + col] + s_rows[l.y * TILE + col]);
-                }
-                output_band[out_offset + y * out_width + x] = value;
+        bool has_high = k < pc.high_height;
+        vec2 value = vec2(0.0);
+        if (!has_high_y) {
+            value.x = col_low(k, col);
+        } else if (k >= 2u && k + 2u < pc.high_height) {
+            uint l = low_slot(k, ay) * TILE_X + col;
+            uint h = HIGH_ROW0 + high_slot(k, ay) * TILE_X + col;
+            value = lift_pair(s_rows[l - TILE_X], s_rows[l], s_rows[l + TILE_X], s_rows[l + 2u * TILE_X],
+                s_rows[h - 2u * TILE_X], s_rows[h - TILE_X], s_rows[h], s_rows[h + TILE_X], s_rows[h + 2u * TILE_X]);
+        } else {
+            value.x = col_beta(k, col);
+            if (has_high) {
+                value.y = col_alpha(k, col);
             }
+        }
+        uint y = 2u * k;
+        output_band[out_offset + y * out_width + x] = value.x;
+        if (has_high) {
+            output_band[out_offset + (y + 1u) * out_width + x] = value.y;
         }
     }
 }
