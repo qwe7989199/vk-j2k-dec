@@ -145,6 +145,33 @@ profile-mxf-ffmpeg: mode cpu, 1920x1080 12-bit, discard 0, frames 10
   avg_skip_first_frame_ms decode_total 212.251 fps 4.71 tier1 56.190 reconstruct 143.518 pack 10.779
 ```
 
+## 4K RGB12 9/7 (2026-10-21)
+
+Sample: `s02e02_v261015.mxf`, 3840x2160 RGB12, BT.2020/PQ, irreversible 9/7, CPRL, 32x32
+codeblocks, ~1.18 MB/frame. `bench-mxf-stream <mxf> <backend> 240 <batch> NUL`, three
+interleaved rounds (main @ `ef13778`):
+
+| backend | fps |
+| --- | ---: |
+| vk-j2k-dec, batch 1 | 50.6-51.7 |
+| vk-j2k-dec, batch 2 | 50.1-51.5 |
+| nvjpeg2000, batch 2 | 62.3-64.0 |
+
+GPU time per frame at batch 1 (`VK_J2K_GPU_TIMING=1`): Tier-1 15.8-16.2 ms, IDWT 1.5, scatter +
+dequant 0.9, upload 0.5, color + pack 0.5; the 4.9 ms readback runs on the transfer queue,
+overlapped with the next batch. nvjpeg2000 (CUPTI): Tier-1 15.0 ms, IDWT 1.1.
+
+Correctness, first 24 frames (597,196,800 samples) against FFmpeg's `-pix_fmt rgb48le` decode,
+`diff-rgb48`. A difference of 16 is one 12-bit level (output is MSB-aligned):
+
+| decoder | differing samples | max_abs | mean_abs |
+| --- | ---: | ---: | ---: |
+| vk-j2k-dec | 444,113 (0.074%) | 16 | 0.0119 |
+| nvjpeg2000 | 2,457,965 (0.41%) | 16 | 0.0659 |
+
+The 240-frame hash (`VK_J2K_HASH_FRAMES=1`, default fused IDWT) is `b6f4991ef7f39435`. Batch 4 runs at 17-20 fps on this 6 GB card: other
+processes hold ~3 GB and the batch limit does not account for them, so the slots page.
+
 ## Notes
 
 - `readback` is ~0 in most gpu-tier1 rows because the profiler only copies out the last frame;
