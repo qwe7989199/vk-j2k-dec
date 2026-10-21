@@ -487,8 +487,12 @@ impl VulkanDecoder {
         } else {
             None
         };
+        let forced_shader = std::env::var("VK_J2K_TIER1_SHADER").ok();
         let pipeline = VulkanTier1Rgb48Pipeline::new(&VulkanTier1Rgb48PipelineConfig {
-            cleanup_shader_path: TIER1_WARP_SHADERS[0],
+            // VK_J2K_TIER1_SHADER forces a Tier-1 shader (A/B testing).
+            cleanup_shader_path: forced_shader
+                .as_deref()
+                .unwrap_or_else(|| packed_tier1_shader(&template)),
             thread_per_codeblock: false,
             scatter_shader_path: if is_97 {
                 r"target\shaders\tier1_scatter_dequant.comp.spv"

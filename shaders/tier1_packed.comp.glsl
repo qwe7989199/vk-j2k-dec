@@ -18,6 +18,10 @@
 //
 // A codeblock needs width * ceil(height / 4) words, which always fits in the
 // coefficient_count-sized region the warp shader uses at coefficient_offset.
+//
+// Built with -DTIER1_SHARED_STATE=<words>, the column words live in shared memory instead
+// (<words> per warp, binding 4 unused); the host uses that build only when every codeblock's
+// column words fit.
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -121,6 +125,13 @@ uint lane_id;
 uint ctx_base;
 
 #define ctx_at(i) s_context_packed[ctx_base + (i)]
+
+#ifdef TIER1_SHARED_STATE
+shared uint s_state[CODEBLOCKS_PER_WORKGROUP * TIER1_SHARED_STATE];
+#define STATE(i) s_state[i]
+#else
+#define STATE(i) state_data[i]
+#endif
 
 Tier1Codeblock codeblock;
 uint state_base;
@@ -334,24 +345,24 @@ void make_significant(uint x, uint s, uint r, uint bitplane) {
     }
     // Mirror into the adjacent stripe: row 0 is that stripe's row 4, row 3 its row -1.
     if (r == 0u && s > 0u) {
-        atomicOr(state_data[state_base + (s - 1u) * codeblock.width + x],
+        atomicOr(STATE(state_base + (s - 1u) * codeblock.width + x),
             (1u << 5u) | (sign_bit << (COL_SIGN_SHIFT + 5u)));
     }
     if (r == 3u && s + 1u < stripe_count) {
-        atomicOr(state_data[state_base + (s + 1u) * codeblock.width + x], 1u | (sign_bit << COL_SIGN_SHIFT));
+        atomicOr(STATE(state_base + (s + 1u) * codeblock.width + x), 1u | (sign_bit << COL_SIGN_SHIFT));
     }
 }
 
 void load_stripe(uint base) {
     col_left = 0u;
-    col_cur = state_data[base];
-    col_right = (codeblock.width > 1u) ? state_data[base + 1u] : 0u;
+    col_cur = STATE(base);
+    col_right = (codeblock.width > 1u) ? STATE(base + 1u) : 0u;
 }
 
 void advance_column(uint base, uint x) {
     col_left = col_cur;
     col_cur = col_right;
-    col_right = (x + 2u < codeblock.width) ? state_data[base + x + 2u] : 0u;
+    col_right = (x + 2u < codeblock.width) ? STATE(base + x + 2u) : 0u;
 }
 
 void decode_cleanup_sample(uint x, uint s, uint r, uint bitplane) {
@@ -388,7 +399,7 @@ void decode_cleanup_pass(uint bitplane) {
             // Cleanup ends the bitplane: drop this column's visited flags for the next one.
             col_cur &= ~COL_VISITED_MASK;
             if (col_cur != original) {
-                state_data[base + x] = col_cur;
+                STATE(base + x) = col_cur;
             }
             advance_column(base, x);
         }
@@ -421,7 +432,7 @@ void decode_significance_pass(uint bitplane) {
                 }
             }
             if (col_cur != original) {
-                state_data[base + x] = col_cur;
+                STATE(base + x) = col_cur;
             }
             advance_column(base, x);
         }
@@ -468,7 +479,7 @@ void decode_refinement_pass(uint bitplane) {
                 }
             }
             if (col_cur != original) {
-                state_data[base + x] = col_cur;
+                STATE(base + x) = col_cur;
             }
             advance_column(base, x);
         }
@@ -487,7 +498,11 @@ void main() {
     codeblock_index += pc.codeblock_offset;
 
     codeblock = codeblocks[codeblock_index];
+#ifdef TIER1_SHARED_STATE
+    state_base = warp_id * TIER1_SHARED_STATE;
+#else
     state_base = codeblock.coefficient_offset;
+#endif
     stripe_count = (codeblock.height + 3u) >> 2u;
     sig_stripes = 0u;
     stripe_skip = stripe_count <= 31u;
@@ -497,7 +512,7 @@ void main() {
     // written afterwards.
     uint state_words = stripe_count * codeblock.width;
     for (uint i = lane_id; i < state_words; i += 32u) {
-        state_data[state_base + i] = 0u;
+        STATE(state_base + i) = 0u;
     }
     for (uint i = lane_id; i < codeblock.coefficient_count; i += 32u) {
         output_coefficients[codeblock.coefficient_offset + i] = 0;

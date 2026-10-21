@@ -732,8 +732,10 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         && !Path::new(TIER1_WARP_SHADERS[0]).exists()
         && thread_per_codeblock_eligible(&template_records)
         && first_existing(TIER1_THREAD_SHADERS).is_some();
-    let cleanup_shader_path: &str = if is_97 { TIER1_WARP_SHADERS[0] } else if let Some(path) = forced_shader.as_deref() {
+    let cleanup_shader_path: &str = if let Some(path) = forced_shader.as_deref() {
         path
+    } else if is_97 || Path::new(TIER1_WARP_SHADERS[0]).exists() {
+        packed_tier1_shader(&template_records)
     } else if thread_per_codeblock {
         first_existing(TIER1_THREAD_SHADERS).unwrap_or(TIER1_WARP_SHADERS[TIER1_WARP_SHADERS.len() - 1])
     } else {
@@ -952,6 +954,22 @@ const TIER1_THREAD_SHADERS: &[&str] = &[
     r"target\shaders\tier1_cleanup_smoke_16.comp.spv",
 ];
 const TIER1_MAX_CPU_CODEBLOCKS_PER_FRAME: usize = 256;
+/// `tier1_packed` built with its column words in shared memory, 256 words per codeblock.
+const TIER1_PACKED_SHARED_SHADER: &str = r"target\shaders\tier1_packed_shared256.comp.spv";
+const TIER1_PACKED_SHARED_WORDS: u32 = 256;
+
+/// The packed warp shader to use: the shared-state build when every codeblock's column words
+/// (width * ceil(height / 4)) fit and the build exists, else the global-state one.
+fn packed_tier1_shader(records: &[GpuTier1CodeblockRecord]) -> &'static str {
+    let fits = records
+        .iter()
+        .all(|record| record.width * record.height.div_ceil(4) <= TIER1_PACKED_SHARED_WORDS);
+    if fits && Path::new(TIER1_PACKED_SHARED_SHADER).exists() {
+        TIER1_PACKED_SHARED_SHADER
+    } else {
+        TIER1_WARP_SHADERS[0]
+    }
+}
 
 fn first_existing(paths: &[&'static str]) -> Option<&'static str> {
     paths.iter().copied().find(|path| Path::new(path).exists())
