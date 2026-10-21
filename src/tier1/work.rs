@@ -406,7 +406,6 @@ impl Tier1WorkPlan {
         qcd: Option<&QcdSegment>,
         qccs: &[QccSegment],
     ) -> Result<Self, Tier1PlanError> {
-        let mut codeblocks = Vec::<CompressedCodeblock>::new();
         let default_quantization = qcd.map(QuantizationBitplanes::new).transpose()?;
         let qcc_quantizations = qccs
             .iter()
@@ -416,75 +415,79 @@ impl Tier1WorkPlan {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        for (packet_index, packet) in summary.packets.iter().enumerate() {
-            for segment in &packet.segments {
-                let id = CodeblockId {
-                    component: segment.component,
-                    resolution: segment.resolution,
-                    subband: segment.subband,
-                    codeblock_x: segment.codeblock_x,
-                    codeblock_y: segment.codeblock_y,
-                };
+        // Segments grouped by codeblock id; the stable sort keeps each codeblock's segments in
+        // packet order. (Inserting into a sorted Vec per new codeblock is quadratic.)
+        let mut ordered = summary
+            .packets
+            .iter()
+            .enumerate()
+            .flat_map(|(packet_index, packet)| {
+                packet.segments.iter().map(move |segment| {
+                    let id = CodeblockId {
+                        component: segment.component,
+                        resolution: segment.resolution,
+                        subband: segment.subband,
+                        codeblock_x: segment.codeblock_x,
+                        codeblock_y: segment.codeblock_y,
+                    };
+                    (id, packet_index, packet.layer, segment)
+                })
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(id, ..)| *id);
 
-                let index = match codeblocks.binary_search_by(|codeblock| codeblock.id.cmp(&id)) {
-                    Ok(index) => index,
-                    Err(index) => {
-                        let zero_bit_planes = segment.zero_bit_planes.ok_or_else(|| {
-                            Tier1PlanError::new(format!(
-                                "first segment for codeblock {:?} is missing zero bit-plane count",
-                                id
-                            ))
-                        })?;
-                        let quantization = qcc_quantizations
-                            .iter()
-                            .rev()
-                            .find(|(component, _)| *component == segment.component)
-                            .map(|(_, quantization)| quantization)
-                            .or(default_quantization.as_ref());
-                        let magnitude_bitplanes =
-                            magnitude_bitplanes_for_segment(segment, quantization)?;
-                        codeblocks.insert(
-                            index,
-                            CompressedCodeblock {
-                                id,
-                                width: segment.codeblock_width,
-                                height: segment.codeblock_height,
-                                magnitude_bitplanes,
-                                zero_bit_planes,
-                                segments: Vec::new(),
-                            },
-                        );
-                        index
-                    }
-                };
-
-                if segment.newly_included && !codeblocks[index].segments.is_empty() {
-                    return Err(Tier1PlanError::new(format!(
-                        "codeblock {:?} was marked newly included more than once",
+        let mut codeblocks = Vec::<CompressedCodeblock>::new();
+        for (id, packet_index, layer, segment) in ordered {
+            if codeblocks.last().is_none_or(|codeblock| codeblock.id != id) {
+                let zero_bit_planes = segment.zero_bit_planes.ok_or_else(|| {
+                    Tier1PlanError::new(format!(
+                        "first segment for codeblock {:?} is missing zero bit-plane count",
                         id
-                    )));
-                }
-                if codeblocks[index].width != segment.codeblock_width
-                    || codeblocks[index].height != segment.codeblock_height
-                {
-                    return Err(Tier1PlanError::new(format!(
-                        "codeblock {:?} changed dimensions from {}x{} to {}x{}",
-                        id,
-                        codeblocks[index].width,
-                        codeblocks[index].height,
-                        segment.codeblock_width,
-                        segment.codeblock_height
-                    )));
-                }
-
-                codeblocks[index].segments.push(CodeblockCompressedSegment {
-                    packet_index,
-                    layer: packet.layer,
-                    offset: segment.body_offset,
-                    byte_len: segment.byte_len,
-                    coding_passes: segment.coding_passes,
+                    ))
+                })?;
+                let quantization = qcc_quantizations
+                    .iter()
+                    .rev()
+                    .find(|(component, _)| *component == segment.component)
+                    .map(|(_, quantization)| quantization)
+                    .or(default_quantization.as_ref());
+                let magnitude_bitplanes = magnitude_bitplanes_for_segment(segment, quantization)?;
+                codeblocks.push(CompressedCodeblock {
+                    id,
+                    width: segment.codeblock_width,
+                    height: segment.codeblock_height,
+                    magnitude_bitplanes,
+                    zero_bit_planes,
+                    segments: Vec::new(),
                 });
             }
+            let codeblock = codeblocks.last_mut().expect("pushed above");
+            if segment.newly_included && !codeblock.segments.is_empty() {
+                return Err(Tier1PlanError::new(format!(
+                    "codeblock {:?} was marked newly included more than once",
+                    id
+                )));
+            }
+            if codeblock.width != segment.codeblock_width
+                || codeblock.height != segment.codeblock_height
+            {
+                return Err(Tier1PlanError::new(format!(
+                    "codeblock {:?} changed dimensions from {}x{} to {}x{}",
+                    id,
+                    codeblock.width,
+                    codeblock.height,
+                    segment.codeblock_width,
+                    segment.codeblock_height
+                )));
+            }
+
+            codeblock.segments.push(CodeblockCompressedSegment {
+                packet_index,
+                layer,
+                offset: segment.body_offset,
+                byte_len: segment.byte_len,
+                coding_passes: segment.coding_passes,
+            });
         }
 
         Ok(Self { codeblocks })

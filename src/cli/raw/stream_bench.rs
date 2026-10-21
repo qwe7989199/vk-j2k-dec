@@ -152,6 +152,24 @@ fn run(
         ));
     }
     let loop_ms = elapsed_ms(loop_start);
+    if let Backend::Vulkan(v) = &decoder {
+        let frames = v.gpu_times.iter().map(|(count, _)| count).sum::<usize>();
+        if frames > 0 {
+            let per_frame = |value: fn(&Tier1GpuStageTimes) -> f64| {
+                v.gpu_times.iter().map(|(_, times)| value(times)).sum::<f64>() / frames as f64
+            };
+            println!(
+                "  gpu_stage_ms_per_frame total {:.3} upload {:.3} tier1 {:.3} scatter {:.3} idwt {:.3} color {:.3} readback_copy {:.3}",
+                per_frame(Tier1GpuStageTimes::total_ms),
+                per_frame(|t| t.upload_ms),
+                per_frame(|t| t.tier1_ms),
+                per_frame(|t| t.scatter_ms),
+                per_frame(|t| t.idwt_ms),
+                per_frame(|t| t.color_ms),
+                per_frame(|t| t.readback_copy_ms),
+            );
+        }
+    }
     drop(decoder); // Include device teardown in the principal end-to-end timing.
     let total_ms = elapsed_ms(start);
     println!(
@@ -224,6 +242,9 @@ impl Backend {
                         }
                     })
                     .map_err(|e| e.to_string())?;
+                if let Some(times) = v.pipeline.last_gpu_stage_times(slot) {
+                    v.gpu_times.push((count, times));
+                }
                 failure.map_or(Ok(()), Err)
             }
             Self::Nv(n) => {
@@ -244,6 +265,8 @@ impl Backend {
 
 struct VulkanDecoder {
     pipeline: VulkanTier1Rgb48Pipeline,
+    /// (frames, stage times) per read batch, with VK_J2K_GPU_TIMING=1.
+    gpu_times: Vec<(usize, Tier1GpuStageTimes)>,
     template: Vec<GpuTier1CodeblockRecord>,
     scatter: Vec<GpuTier1ScatterRecord>,
     layout: FastTier1Rgb48Frame,
@@ -333,6 +356,34 @@ fn complete_template(
     Ok((records, scatter, offset as usize))
 }
 
+/// Parses one frame (or takes the already parsed first frame), checks it against the stream
+/// layout and aligns its records to the template, ready for `submit_batch`.
+fn prepare_stream_frame(
+    frame: &[u8],
+    parsed: Option<FastTier1Rgb48Frame>,
+    layout: &FastTier1Rgb48Frame,
+    template: &[GpuTier1CodeblockRecord],
+    scatter: &[GpuTier1ScatterRecord],
+) -> Result<FastTier1Rgb48Frame, String> {
+    let mut plan = match parsed {
+        Some(plan) => plan,
+        None => build_fast_tier1_rgb48_frame(frame)?,
+    };
+    if plan.scatter_plan.planes != layout.scatter_plan.planes
+        || plan.target_resolution != layout.target_resolution
+        || plan.color_transform != layout.color_transform
+        || plan.precision != layout.precision
+        || plan.transform != layout.transform
+        || plan.qcd != layout.qcd
+        || plan.qccs != layout.qccs
+    {
+        return Err("stream frame layout/quantization changed".into());
+    }
+    align_tier1_records_to_template(template, scatter, &mut plan)?;
+    sort_codeblock_records_by_descending_work(&mut plan.records);
+    Ok(plan)
+}
+
 impl VulkanDecoder {
     fn new(data: &[u8], batch: usize) -> Result<Self, String> {
         let mut layout = build_fast_tier1_rgb48_frame(data)?;
@@ -390,7 +441,8 @@ impl VulkanDecoder {
             precision: layout.precision,
             max_batch_frames: batch,
             cpu_coefficient_capacity: 0,
-            gpu_timestamps: false,
+            // VK_J2K_GPU_TIMING=1 records per-stage GPU timestamps.
+            gpu_timestamps: std::env::var_os("VK_J2K_GPU_TIMING").is_some(),
             transfer_queue: true,
             export_rgb48: false,
             scatter_dequant_scales: scales.as_deref(),
@@ -412,6 +464,7 @@ impl VulkanDecoder {
         };
         Ok(Self {
             pipeline,
+            gpu_times: Vec::new(),
             template,
             scatter,
             layout,
@@ -420,26 +473,22 @@ impl VulkanDecoder {
     }
 
     fn submit(&mut self, slot: usize, frames: &[Vec<u8>]) -> Result<(), String> {
-        let mut plans = Vec::with_capacity(frames.len());
-        for frame in frames {
-            let mut plan = match self.first.take() {
-                Some(first) => first,
-                None => build_fast_tier1_rgb48_frame(frame)?,
-            };
-            if plan.scatter_plan.planes != self.layout.scatter_plan.planes
-                || plan.target_resolution != self.layout.target_resolution
-                || plan.color_transform != self.layout.color_transform
-                || plan.precision != self.layout.precision
-                || plan.transform != self.layout.transform
-                || plan.qcd != self.layout.qcd
-                || plan.qccs != self.layout.qccs
-            {
-                return Err("stream frame layout/quantization changed".into());
-            }
-            align_tier1_records_to_template(&self.template, &self.scatter, &mut plan)?;
-            sort_codeblock_records_by_descending_work(&mut plan.records);
-            plans.push(plan);
-        }
+        // Frames are independent: parse and plan each one on its own thread.
+        let (layout, template, scatter) = (&self.layout, &self.template, &self.scatter);
+        let mut first = self.first.take();
+        let plans = std::thread::scope(|scope| {
+            let handles = frames
+                .iter()
+                .map(|frame| {
+                    let parsed = first.take();
+                    scope.spawn(move || prepare_stream_frame(frame, parsed, layout, template, scatter))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().map_err(|_| "frame prepare thread panicked".to_string())?)
+                .collect::<Result<Vec<_>, String>>()
+        })?;
         let batch = plans
             .iter()
             .map(|p| Tier1BatchFrame {
