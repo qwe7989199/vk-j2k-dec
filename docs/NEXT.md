@@ -275,6 +275,6 @@ target\release\vk-j2k-dec.exe profile-mxf-ffmpeg <test_j2k_rgb12_1080p24_3min.mx
 
 `target/shaders` is not in git, so the shader script must run first; the decoder silently falls
 back to older shaders when a `.spv` is missing (check the `tier1_shader`, `idwt` and `readback`
-lines of the output). The 240-frame `frames_hash` must be `47d938a71bb308e5` on any GPU. Useful
+lines of the output). The 240-frame `frames_hash` must be `b5f65290205ab325` on any GPU. Useful
 knobs: `VK_J2K_GPU_TIMING=1` (per-stage GPU time), `VK_J2K_BATCH=8 VK_J2K_CPU_CBLKS=0` (pure
 GPU, fixed batch). Compare changes with interleaved multi-round runs; single runs are noisy.

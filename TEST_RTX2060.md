@@ -21,7 +21,8 @@ FFmpeg: `C:/Users/zhangqingxuan/Desktop/Tools/ffmpeg/bin/ffmpeg.exe`
 gpu-tier1 rows are whole-loop averages over 240 frames with the current defaults: packed-state
 Tier-1 shader (`tier1_packed.comp.glsl`), fused 2D IDWT (`idwt53_fused_2d.comp.glsl`) and
 readback on the dedicated transfer queue. Every gpu-tier1 configuration produces the same
-240-frame hash (`VK_J2K_HASH_FRAMES=1` -> `47d938a71bb308e5`), and the last frame matches
+240-frame hash (`VK_J2K_HASH_FRAMES=1` -> `b5f65290205ab325`; the earlier `47d938a71bb308e5`
+came from a packet-header stuffing bug that corrupted frame 18), and the last frame matches
 FFmpeg's decode bit-exactly (`diff-rgb48`: 0 differing samples).
 
 Run-to-run spread on this machine is large: two identical shader builds measured back to back

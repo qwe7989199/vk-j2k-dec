@@ -759,8 +759,10 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
         scatter_shader_path,
         idwt53_shader_path,
         // VK_J2K_IDWT=separable keeps the three-pass-per-component IDWT (A/B testing).
-        idwt53_fused_shader_path: if is_97 || std::env::var("VK_J2K_IDWT").is_ok_and(|mode| mode == "separable") {
+        idwt53_fused_shader_path: if std::env::var("VK_J2K_IDWT").is_ok_and(|mode| mode == "separable") {
             None
+        } else if is_97 {
+            first_existing(&[r"target\shaders\idwt97_fused_2d.comp.spv"])
         } else {
             first_existing(&[r"target\shaders\idwt53_fused_2d.comp.spv"])
         },

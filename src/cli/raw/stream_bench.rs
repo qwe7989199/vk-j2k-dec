@@ -366,8 +366,11 @@ impl VulkanDecoder {
             } else {
                 r"target\shaders\idwt53_offset_1d.comp.spv"
             },
-            idwt53_fused_shader_path: if is_97 {
+            // VK_J2K_IDWT=separable keeps the three-pass-per-component IDWT (A/B testing).
+            idwt53_fused_shader_path: if std::env::var("VK_J2K_IDWT").is_ok_and(|mode| mode == "separable") {
                 None
+            } else if is_97 {
+                Some(r"target\shaders\idwt97_fused_2d.comp.spv")
             } else {
                 Some(r"target\shaders\idwt53_fused_2d.comp.spv")
             },
