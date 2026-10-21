@@ -2739,6 +2739,9 @@ pub struct VulkanTier1Rgb48PipelineConfig<'a> {
     /// `cleanup_shader_path` decodes one codeblock per invocation (codeblocks up to 16x16)
     /// instead of one codeblock per subgroup.
     pub thread_per_codeblock: bool,
+    /// `cleanup_shader_path` keeps its column state in shared memory (`tier1_packed` built with
+    /// TIER1_SHARED_STATE), so the global state buffer is not allocated.
+    pub tier1_shared_state: bool,
     pub scatter_shader_path: &'a str,
     pub idwt53_shader_path: &'a str,
     /// One-dispatch-per-level 2D IDWT; used instead of `idwt53_shader_path` when all
@@ -3176,8 +3179,8 @@ impl PipelineSlot {
         let frame_bytes = flat_stride * 4;
         let flat_coefficient_buffer =
             device.create_device_local_buffer(frame_bytes * batch_frames as u64, upload_usage)?;
-        // The thread-per-codeblock shader keeps codeblock state in private memory.
-        let state_bytes = if config.thread_per_codeblock {
+        // The thread-per-codeblock and shared-state shaders keep codeblock state on chip.
+        let state_bytes = if config.thread_per_codeblock || config.tier1_shared_state {
             16
         } else {
             frame_bytes * batch_frames as u64
@@ -3358,7 +3361,7 @@ fn tier1_pipeline_frame_device_bytes(
     flat_stride: u64,
 ) -> Result<u64, VulkanError> {
     let flat_bytes = flat_stride * 4;
-    let state_bytes = if config.thread_per_codeblock { 0 } else { flat_bytes };
+    let state_bytes = if config.thread_per_codeblock || config.tier1_shared_state { 0 } else { flat_bytes };
     let mut bytes = flat_bytes + state_bytes + bytes_len::<i32>(config.output_coefficients)?;
     let mut output_samples = 0u64;
     for component in scattered_component_ids(config.scatter_planes) {

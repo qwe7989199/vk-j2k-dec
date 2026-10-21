@@ -758,6 +758,7 @@ fn profile_mxf_ffmpeg_gpu_tier1_file(
     let mut pipeline = match VulkanTier1Rgb48Pipeline::new(&VulkanTier1Rgb48PipelineConfig {
         cleanup_shader_path,
         thread_per_codeblock,
+        tier1_shared_state: cleanup_shader_path == TIER1_PACKED_SHARED_SHADER,
         scatter_shader_path,
         idwt53_shader_path,
         // VK_J2K_IDWT=separable keeps the three-pass-per-component IDWT (A/B testing).
