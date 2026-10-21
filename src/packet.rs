@@ -1009,19 +1009,21 @@ impl TagTree {
             ));
         }
 
-        let mut path = Vec::with_capacity(self.levels.len());
+        // Leaf-to-root node indices; a u32-sized tree has at most 33 levels. A fixed array
+        // avoids a heap allocation per call (called per codeblock and per bitplane threshold).
+        let mut path = [0usize; 33];
+        let level_count = self.levels.len();
         let mut x = leaf_x;
         let mut y = leaf_y;
-        for level_index in 0..self.levels.len() {
-            let node_index = self.levels[level_index].node_index(x, y);
-            path.push((level_index, node_index));
+        for (level_index, slot) in path.iter_mut().enumerate().take(level_count) {
+            *slot = self.levels[level_index].node_index(x, y);
             x /= 2;
             y /= 2;
         }
 
         let mut lower_bound = 0;
-        for (level_index, node_index) in path.into_iter().rev() {
-            let node = &mut self.levels[level_index].nodes[node_index];
+        for level_index in (0..level_count).rev() {
+            let node = &mut self.levels[level_index].nodes[path[level_index]];
             if node.value < lower_bound {
                 node.value = lower_bound;
             }

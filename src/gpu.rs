@@ -3,7 +3,7 @@ use crate::codestream::{
 };
 use crate::tier1::{
     BoundCodeblockSegment, BoundCompressedCodeblock, CodeblockId, CoefficientReconstruction,
-    Tier1BoundWorkPlan, Tier1CodingMode, Tier1DecodeError,
+    Tier1BoundWorkPlan, Tier1DecodeError,
 };
 
 const DWT_LOCAL_SIZE_X: u32 = 16;
@@ -228,14 +228,16 @@ pub struct GpuTier1ScatterRecord {
 }
 
 pub fn sort_codeblock_records_by_descending_work(records: &mut [GpuTier1CodeblockRecord]) {
-    records.sort_by(|a, b| {
-        let a_work = u64::from(a.byte_len) * u64::from(a.pass_count);
-        let b_work = u64::from(b.byte_len) * u64::from(b.pass_count);
-        b_work
-            .cmp(&a_work)
-            .then_with(|| b.byte_len.cmp(&a.byte_len))
-            .then_with(|| b.pass_count.cmp(&a.pass_count))
-            .then_with(|| tier1_record_key(a).cmp(&tier1_record_key(b)))
+    // The key ends with the codeblock id, unique per record, so an unstable sort gives the
+    // same order as a stable one.
+    records.sort_unstable_by_key(|record| {
+        let work = u64::from(record.byte_len) * u64::from(record.pass_count);
+        (
+            std::cmp::Reverse(work),
+            std::cmp::Reverse(record.byte_len),
+            std::cmp::Reverse(record.pass_count),
+            tier1_record_key(record),
+        )
     });
 }
 
@@ -368,21 +370,21 @@ impl GpuTier1Plan {
         let mut output_coefficients = 0usize;
 
         for codeblock in &work_plan.codeblocks {
-            let execution = codeblock.execution_plan(codeblock_style)?;
             let byte_offset = checked_u32(compressed_bytes.len(), "Tier-1 byte offset")?;
             for segment in &codeblock.segments {
                 compressed_bytes.extend_from_slice(segment.data);
             }
             // Pad with 0xFF sentinels so the GPU shader can skip bounds checks
             compressed_bytes.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
-            let byte_len = checked_u32(execution.bytes, "Tier-1 byte length")?;
+            let byte_len = checked_u32(codeblock.total_bytes(), "Tier-1 byte length")?;
             let coefficient_offset = checked_u32(output_coefficients, "Tier-1 coefficient offset")?;
             let coefficient_count = codeblock
                 .width
                 .checked_mul(codeblock.height)
                 .ok_or_else(|| Tier1DecodeError::new("Tier-1 coefficient count overflow"))?;
             let pass_offset = total_passes;
-            let pass_count = checked_u32(execution.passes.len(), "Tier-1 pass count")?;
+            // One scheduled pass per signalled coding pass (as in `execution_plan`).
+            let pass_count = codeblock.total_coding_passes();
             total_passes = total_passes
                 .checked_add(pass_count)
                 .ok_or_else(|| Tier1DecodeError::new("Tier-1 pass count overflow"))?;
@@ -390,12 +392,9 @@ impl GpuTier1Plan {
                 .checked_add(coefficient_count as usize)
                 .ok_or_else(|| Tier1DecodeError::new("Tier-1 coefficient count overflow"))?;
 
-            for pass in execution.passes {
-                match pass.coding_mode {
-                    Tier1CodingMode::Arithmetic => arithmetic_passes += 1,
-                    Tier1CodingMode::RawBypass => raw_bypass_passes += 1,
-                }
-            }
+            let (arithmetic, raw_bypass) = codeblock.coding_mode_counts(codeblock_style);
+            arithmetic_passes += arithmetic;
+            raw_bypass_passes += raw_bypass;
 
             codeblocks.push(GpuTier1Codeblock {
                 component: codeblock.id.component,
@@ -486,16 +485,16 @@ impl GpuTier1Plan {
     }
 
     pub fn compressed_u32_words(&self) -> Vec<u32> {
-        self.compressed_bytes
-            .chunks(4)
-            .map(|chunk| {
-                let mut word = 0u32;
-                for (shift, byte) in chunk.iter().enumerate() {
-                    word |= u32::from(*byte) << (shift * 8);
-                }
-                word
-            })
-            .collect()
+        let chunks = self.compressed_bytes.chunks_exact(4);
+        let tail = chunks.remainder();
+        let mut words = Vec::with_capacity(self.compressed_bytes.len().div_ceil(4));
+        words.extend(chunks.map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])));
+        if !tail.is_empty() {
+            let mut last = [0u8; 4];
+            last[..tail.len()].copy_from_slice(tail);
+            words.push(u32::from_le_bytes(last));
+        }
+        words
     }
 
     pub fn codeblock_byte_checksum(&self, index: usize) -> Option<u32> {

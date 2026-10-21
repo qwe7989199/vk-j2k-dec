@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 mod stream_bench;
-pub use stream_bench::benchmark_mxf_stream;
+pub use stream_bench::{benchmark_mxf_stream, benchmark_prepare};
 
 use vk_j2k_dec::codestream::{CodeblockStyle, Codestream, SubbandKind, WaveletTransform};
 use vk_j2k_dec::decode::{
@@ -1336,14 +1336,31 @@ fn align_tier1_records_to_template(
     template_scatter_records: &[vk_j2k_dec::gpu::GpuTier1ScatterRecord],
     frame: &mut FastTier1Rgb48Frame,
 ) -> Result<(), String> {
-    let mut by_key = BTreeMap::new();
-    for record in frame.records.iter().copied() {
-        by_key.insert(tier1_record_key(&record), record);
+    // Frame records come out of the work plan sorted by codeblock id already; a sorted slice
+    // plus binary search is much cheaper than a map for ~25k records per 4K frame.
+    let mut frame_records = std::mem::take(&mut frame.records);
+    if !frame_records.is_sorted_by_key(tier1_record_key) {
+        frame_records.sort_unstable_by_key(tier1_record_key);
     }
+    if let Some(pair) = frame_records
+        .windows(2)
+        .find(|pair| tier1_record_key(&pair[0]) == tier1_record_key(&pair[1]))
+    {
+        return Err(format!(
+            "frame contains codeblock C{} R{} S{} {},{} twice",
+            pair[0].component, pair[0].resolution, pair[0].subband, pair[0].codeblock_x, pair[0].codeblock_y
+        ));
+    }
+    let mut matched = vec![false; frame_records.len()];
     let mut aligned = Vec::with_capacity(template.len());
     for template_record in template {
-        let mut record = match by_key.remove(&tier1_record_key(template_record)) {
-            Some(record) => record,
+        let key = tier1_record_key(template_record);
+        let found = frame_records.binary_search_by_key(&key, tier1_record_key).ok();
+        let mut record = match found {
+            Some(index) => {
+                matched[index] = true;
+                frame_records[index]
+            }
             None => {
                 let mut zero = *template_record;
                 zero.magnitude_bitplanes = 0;
@@ -1373,7 +1390,11 @@ fn align_tier1_records_to_template(
         record.coefficient_count = template_record.coefficient_count;
         aligned.push(record);
     }
-    if let Some(record) = by_key.values().next() {
+    if let Some(record) = frame_records
+        .iter()
+        .zip(&matched)
+        .find_map(|(record, matched)| (!matched).then_some(record))
+    {
         return Err(format!(
             "frame contains codeblock not present in frame 1 template: C{} R{} S{} {},{}",
             record.component,

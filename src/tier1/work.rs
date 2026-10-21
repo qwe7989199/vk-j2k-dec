@@ -96,6 +96,19 @@ impl BoundCompressedCodeblock<'_> {
             .sum()
     }
 
+    /// (arithmetic, raw bypass) pass counts of `execution_plan`, without building it.
+    pub fn coding_mode_counts(&self, codeblock_style: CodeblockStyle) -> (u32, u32) {
+        let mut counts = (0, 0);
+        for index in 0..self.total_coding_passes() {
+            let pass = tier1_pass_for_index(self.magnitude_bitplanes, self.zero_bit_planes, index);
+            match coding_mode_for_pass(pass, codeblock_style) {
+                Tier1CodingMode::Arithmetic => counts.0 += 1,
+                Tier1CodingMode::RawBypass => counts.1 += 1,
+            }
+        }
+        counts
+    }
+
     pub fn execution_plan(
         &self,
         codeblock_style: CodeblockStyle,

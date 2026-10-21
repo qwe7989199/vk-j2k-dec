@@ -30,6 +30,14 @@ pub fn run() -> ExitCode {
             };
             raw::benchmark_mxf_stream(&path, &backend, frames, batch, &output)
         }
+        (Some("bench-prepare"), Some(dir)) => {
+            let frames = args.next().unwrap_or_else(|| "240".into());
+            let Ok(frames) = frames.parse::<usize>() else {
+                eprintln!("usage: {program} bench-prepare <dir of .j2k frames> [frames]");
+                return ExitCode::FAILURE;
+            };
+            raw::benchmark_prepare(&dir, frames)
+        }
         (Some("decode-rgb48-full-gpu"), Some(path)) => {
             let Some(output) = args.next() else {
                 eprintln!("usage: {program} decode-rgb48-full-gpu <input.j2k> <output.rgb48le>");

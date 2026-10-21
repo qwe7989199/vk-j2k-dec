@@ -22,6 +22,89 @@ pub fn benchmark_mxf_stream(
     }
 }
 
+/// Single-threaded CPU cost of the per-frame stream prepare (parse, plan, align, sort) over
+/// demuxed `.j2k` frames, without GPU or MXF I/O.
+pub fn benchmark_prepare(dir: &str, limit: usize) -> ExitCode {
+    let run = || -> Result<(), String> {
+        let mut paths = fs::read_dir(dir)
+            .map_err(|e| e.to_string())?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "j2k"))
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.truncate(limit.max(1));
+        let frames = paths
+            .iter()
+            .map(|path| fs::read(path).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let first = frames.first().ok_or("no .j2k frames")?;
+        let mut layout = build_fast_tier1_rgb48_frame(first)?;
+        let (template, scatter, _) = complete_template(first, &layout)?;
+        align_tier1_records_to_template(&template, &scatter, &mut layout)?;
+        let (mut parse_ms, mut align_ms, mut sort_ms) = (0.0, 0.0, 0.0);
+        let mut checksum = 0u64;
+        for frame in &frames {
+            let start = Instant::now();
+            let mut plan = build_fast_tier1_rgb48_frame(frame)?;
+            parse_ms += elapsed_ms(start);
+            let start = Instant::now();
+            align_tier1_records_to_template(&template, &scatter, &mut plan)?;
+            align_ms += elapsed_ms(start);
+            let start = Instant::now();
+            sort_codeblock_records_by_descending_work(&mut plan.records);
+            sort_ms += elapsed_ms(start);
+            checksum = plan.records.iter().fold(checksum, |sum, record| {
+                let words: [u32; 16] = bytemuck_record(record);
+                words.iter().fold(sum, |sum, word| {
+                    (sum ^ u64::from(*word)).wrapping_mul(0x100000001b3)
+                })
+            });
+            checksum = plan.compressed_words.iter().fold(checksum, |sum, word| {
+                (sum ^ u64::from(*word)).wrapping_mul(0x100000001b3)
+            });
+        }
+        let n = frames.len() as f64;
+        println!(
+            "bench-prepare: {} frames, ms/frame parse {:.3} align {:.3} sort {:.3} total {:.3}, checksum {checksum:016x}",
+            frames.len(),
+            parse_ms / n,
+            align_ms / n,
+            sort_ms / n,
+            (parse_ms + align_ms + sort_ms) / n
+        );
+        Ok(())
+    };
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("bench-prepare failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Every field of a record, in declaration order.
+fn bytemuck_record(record: &GpuTier1CodeblockRecord) -> [u32; 16] {
+    [
+        record.component,
+        record.resolution,
+        record.subband,
+        record.codeblock_x,
+        record.codeblock_y,
+        record.width,
+        record.height,
+        record.magnitude_bitplanes,
+        record.zero_bit_planes,
+        record.byte_offset,
+        record.byte_len,
+        record.coefficient_offset,
+        record.coefficient_count,
+        record.pass_offset,
+        record.pass_count,
+        record.reconstruction_mode,
+    ]
+}
+
 struct Sink {
     file: fs::File,
     frames: usize,
